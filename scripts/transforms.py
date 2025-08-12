@@ -111,11 +111,11 @@ def log_transform(data, k=1, c=0):
 #     x = sign * (exp_term / k)
 #     return x
 
-def log_transform_tensor(data, k=1, c=0):
+def log_transform_tensor(data : torch.Tensor, k=1, c=0):
     return (torch.log1p(torch.abs(k * data) + c)) * torch.sign(data)
 
-def exp_transform(data, k=1, c=0):
-    return (np.expm1(np.abs(data)) - c) * np.sign(data) / k
+def exp_transform(data : torch.Tensor, k=1, c=0):
+    return (torch.expm1(torch.abs(data)) - c) * torch.sign(data) / k
 
 def tonumpy_denormalize(vid, vmin, vmax, exp=True, k=1, c=0, scale=2):
     if exp:
@@ -283,17 +283,11 @@ class InverseMinMaxNormalize:
         self.datamin, self.datamax, self.scale = datamin, datamax, scale
 
     def __call__(self, vid_norm):
-        # 1) 可选的反 scale
-        if self.scale == 2:
-            x = vid_norm / 2 + 0.5
-        else:
-            x = vid_norm
-        # 2) 反线性归一化
-        return x * (self.datamax - self.datamin) + self.datamin
+        return minmax_denormalize(vid_norm, self.datamin, self.datamax, self.scale)
 
-# class InverseLogTransform:
-#     def __init__(self, k=1, c=0):
-#         self.k, self.c = k, c
+class InverseLogTransform:
+    def __init__(self, k=1, c=0):
+        self.k, self.c = k, c
 
-#     def __call__(self, y):
-#         return log_inverse_transform(y, self.k, self.c)
+    def __call__(self, y):
+        return exp_transform(y, self.k, self.c)

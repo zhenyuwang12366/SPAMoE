@@ -101,26 +101,6 @@ def visualize_results(inputs, targets, predictions, save_dir='./results', max_sa
         axes[2].set_title('predictions model')
         plt.colorbar(im2, ax=axes[2])
         
-        # # 绘制目标地震数据（选择第一个通道）
-        # # 如果目标数据是多维的，我们只显示第一个通道
-        # if len(targets[i].shape) > 2:
-        #     target_data = targets[i, 0].cpu().numpy()
-        # else:
-        #     target_data = targets[i].cpu().numpy()
-        # im1 = axes[1].imshow(target_data, cmap='viridis')
-        # axes[1].set_title('目标地震数据')
-        # plt.colorbar(im1, ax=axes[1])
-        
-        # # 绘制预测地震数据
-        # # 如果预测数据是多维的，我们只显示第一个通道
-        # if len(predictions[i].shape) > 2:
-        #     pred_data = predictions[i, 0].cpu().numpy()
-        # else:
-        #     pred_data = predictions[i].cpu().numpy()
-        # im2 = axes[2].imshow(pred_data, cmap='viridis')
-        # axes[2].set_title('预测地震数据')
-        # plt.colorbar(im2, ax=axes[2])
-        
         # 保存图像
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f'sample_{i}.png'), dpi=300)
@@ -337,10 +317,10 @@ def run_training(args):
     output_transform = Compose([
         T.MinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
     ]) # model
-    # input_inverse_transform = Compose([
-    #     T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k)),
-    #     T.InverseLogTransform(k=args.k)
-    # ])
+    input_inverse_transform = Compose([
+        T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k)),
+        T.InverseLogTransform(k=args.k)
+    ])
     output_inverse_transform = Compose([
         T.InverseMinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
     ])
@@ -576,6 +556,8 @@ def run_training(args):
         
         with tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs}", leave=False, disable=not is_logger) as pbar:
             for batch in pbar:
+                if pbar.n == 3:
+                    pass
                 # 每个epoch要训练n个batch，每个batch的batch_size为m，则总样本数约为n*m
                 # 获取数据
                 inputs = batch['input'].to(device)
@@ -596,7 +578,14 @@ def run_training(args):
                 train_loss += loss.item()
                 if is_logger:
                     pbar.set_postfix({"train_loss": f"{loss.item():.6f}"})
-        
+
+                # if (pbar.n + 1) % 5 == 0:
+                #     with torch.no_grad():
+                #         visualize_results(
+                #             inputs, targets, predictions,
+                #             save_dir=results_dir / f"vis_batch_{pbar.n+1}"
+                #         )
+                
         # 计算平均训练损失
         train_loss /= len(train_loader)
         
@@ -696,6 +685,7 @@ def run_training(args):
                 predictions = model(inputs)
             
             # 反归一化
+            inputs = input_inverse_transform(inputs)
             predictions = output_inverse_transform(predictions)
             targets = output_inverse_transform(targets)
             
@@ -799,21 +789,22 @@ class TransformedSubset(Subset):
             # 如果不是Subset类型，则使用传入的dataset和其默认索引
             super().__init__(dataset, list(range(len(dataset))))
         self.transform = transform
-        self.logger = None
+        # self.logger = None
         
     def __getitems__(self, idx):
         # 这个idx是一个batch中各个数据在总数据集中的索引，是一个列表
-        if self.logger is None:
-            self.logger = logging.getLogger(f"Worker-{os.getpid()}")
-            if not self.logger.hasHandlers():
-                handler = logging.FileHandler(f"/root/autodl-tmp/FWINO/workers_logs/worker_{os.getpid()}.log")
-                handler.setFormatter(logging.Formatter('[%(asctime)s][%(levelname)s] %(message)s'))
-                self.logger.addHandler(handler)
-                self.logger.setLevel(logging.DEBUG)
-        self.logger.info(f"Loading indices: {idx[0]}-{idx[-1]}")
+        # if self.logger is None:
+        #     self.logger = logging.getLogger(f"Worker-{os.getpid()}")
+        #     if not self.logger.hasHandlers():
+        #         handler = logging.FileHandler(f"/root/autodl-tmp/FWINO/workers_logs/worker_{os.getpid()}.log")
+        #         handler.setFormatter(logging.Formatter('[%(asctime)s][%(levelname)s] %(message)s'))
+        #         self.logger.addHandler(handler)
+        #         self.logger.setLevel(logging.DEBUG)
+        # self.logger.info(f"Loading indices: {idx[0]}-{idx[-1]}")
         batch_sample = []
         for index in idx:
             sample = self.dataset[self.indices[index]]
+            sample['idx'] = index
             if self.transform:
                 batch_sample.append(self.transform(sample))
         return batch_sample

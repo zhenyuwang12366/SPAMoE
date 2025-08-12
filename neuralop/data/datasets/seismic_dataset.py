@@ -215,17 +215,16 @@ class SeismicDataset(Dataset):
             if self.split == 'train': # 训练集和验证集
                 # 返回配对的输入和输出
                 sample = {
-                    'input': self.input_tensors[idx],
-                    'output': self.output_tensors[idx],
+                    'input': self.input_tensors[idx].clone(),
+                    'output': self.output_tensors[idx].clone(),
                     'input_file': input_filename
                 }
             else:  # 测试集
                 # 只返回输入数据
                 sample = {
-                    'input': self.input_tensors[idx],
+                    'input': self.input_tensors[idx].clone(),
                     'input_file': input_filename.split('.')[0]  # 去除扩展名
                 }
-            
             return sample
             
         except Exception as e:
