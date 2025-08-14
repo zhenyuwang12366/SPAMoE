@@ -105,9 +105,9 @@ class SeismicDataset(Dataset):
                                     # 注意：这里vel_file是输出，seis_file是输入
                                     self.input_files.append(seis_file)
                                     self.output_files.append(vel_file)
-                else:
-                    # 处理其他目录，这些目录有data和model子目录
-                    if self.family in ['vel', 'style', 'all']:
+                elif subdir.endswith("Vel_A") or subdir.endswith("Vel_B"):
+                    # 处理vel目录，这些目录有data和model子目录
+                    if self.family in ['vel' , 'all']:
                         data_dir = os.path.join(subdir_path, 'data')
                         model_dir = os.path.join(subdir_path, 'model')
                         
@@ -127,7 +127,28 @@ class SeismicDataset(Dataset):
                                         # 注意：这里model_file是输出，data_file是输入
                                         self.input_files.append(data_file)
                                         self.output_files.append(model_file)
-        
+                else:
+                    # 处理style目录，这些目录有data和model子目录
+                    if self.family in ['style' , 'all']:
+                        data_dir = os.path.join(subdir_path, 'data')
+                        model_dir = os.path.join(subdir_path, 'model')
+                        
+                        if os.path.exists(data_dir) and os.path.exists(model_dir):
+                            # 获取所有数据文件
+                            data_files = sorted(glob.glob(os.path.join(data_dir, '*.npy')))
+                            
+                            for data_file in data_files:
+                                # 从data{i}.npy提取i
+                                base_name = os.path.basename(data_file)
+                                parts = base_name.split('.')
+                                if len(parts) >= 2:
+                                    file_num = parts[0].replace('data', '')
+                                    model_file = os.path.join(model_dir, f"model{file_num}.npy")
+                                    
+                                    if os.path.exists(model_file):
+                                        # 注意：这里model_file是输出，data_file是输入
+                                        self.input_files.append(data_file)
+                                        self.output_files.append(model_file)
         else:  # test
             test_dir = os.path.join(self.data_dir, 'test')
             # 测试集不需要配对，只需加载输入文件

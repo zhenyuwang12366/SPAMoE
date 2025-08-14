@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../results"
+		},
+		{
+			"path": "../FWINO"
+		}
+	],
+	"settings": {}
+}

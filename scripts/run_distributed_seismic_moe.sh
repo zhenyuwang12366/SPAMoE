@@ -28,6 +28,7 @@ SEED=42
 K=1
 HIDDEN_CHANNELS=64
 LEARNING_RATE=0.001
+RESUME_PATH="./results/distributed_seismic_moe"
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -58,6 +59,7 @@ while [[ $# -gt 0 ]]; do
     --k) K="$2"; shift 2 ;;
     --hidden_channels) HIDDEN_CHANNELS="$2"; shift 2 ;;
     --learning_rate) LEARNING_RATE="$2"; shift 2 ;;
+    --resume_path) RESUME_PATH="$2"; shift 2 ;;
     *)
       echo "未知参数: $1"
       exit 1 ;;
@@ -96,6 +98,7 @@ echo "LNO 每个尺度使用的神经网络层数: $LNO_LAYERS"
 echo "Num Workers: $NUM_WORKERS"
 echo "Seed: $SEED"
 echo "数据预处理缩放因子: $K"
+echo "ResumePath: $RESUME_PATH"
 
 # 启动分布式训练
 torchrun \
@@ -129,7 +132,7 @@ torchrun \
   --k "$K" \
   --hidden_channels "$HIDDEN_CHANNELS" \
   --learning_rate "$LEARNING_RATE" \
-
+  --resume_path "$RESUME_PATH" \
 
   $WANDB_ARG
 

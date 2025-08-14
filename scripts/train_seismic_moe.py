@@ -556,8 +556,6 @@ def run_training(args):
         
         with tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs}", leave=False, disable=not is_logger) as pbar:
             for batch in pbar:
-                if pbar.n == 3:
-                    pass
                 # 每个epoch要训练n个batch，每个batch的batch_size为m，则总样本数约为n*m
                 # 获取数据
                 inputs = batch['input'].to(device)
@@ -580,12 +578,18 @@ def run_training(args):
                     pbar.set_postfix({"train_loss": f"{loss.item():.6f}"})
 
                 # if (pbar.n + 1) % 5 == 0:
-                #     with torch.no_grad():
-                #         visualize_results(
-                #             inputs, targets, predictions,
-                #             save_dir=results_dir / f"vis_batch_{pbar.n+1}"
-                #         )
+                # with torch.no_grad():
+                #     visualize_results(
+                #         inputs, targets, predictions,
+                #         save_dir=results_dir / f"vis_batch_{pbar.n+1}"
+                #     )
                 
+        # with torch.no_grad():
+        #     visualize_results(
+        #         inputs, targets, predictions,
+        #         save_dir=results_dir / f"vis_train_epoch_{epoch+1}"
+        #     )        
+            
         # 计算平均训练损失
         train_loss /= len(train_loader)
         
@@ -764,6 +768,265 @@ def run_training(args):
             wandb.finish()
     
     return model, best_val_loss
+
+def run_overfit_one_sample(args):
+    """
+    单样本过拟合：用训练集中的 1 个样本训练到极低误差。
+    - 损失：L1 + Sobel梯度一致性(逐步加权) + 极小MSE(仅稳定/提升PSNR)
+    - 评估：PSNR(反归一化)、corr(pred,input)、grad_norm、LR 变化等
+    """
+    import copy
+    from itertools import cycle
+    import torch.nn.functional as F
+    from neuralop.training.torch_setup import setup as setup_env
+    from neuralop.data.datasets.seismic_dataset import SeismicDataProcessor
+
+    # ===== 0) 配置与设备 =====
+    config = SeismicMOEConfig()
+    if args.data_dir:
+        config.data_dir = args.data_dir
+    else:
+        config.data_dir = r"/root/autodl-tmp/FWINO/FWINO_data"
+    if args.family:
+        config.family = args.family
+    if args.hidden_channels:
+        config.hidden_channels = args.hidden_channels
+    if args.learning_rate:
+        config.learning_rate = args.learning_rate
+    if args.top_k:
+        config.top_k = args.top_k
+
+    # 选用的专家
+    config.expert_configs[0]['n_modes_height'] = args.FNO_n_modes_height
+    config.expert_configs[0]['n_modes_width']  = args.FNO_n_modes_width
+    config.expert_configs[0]['n_layers']       = args.FNO_n_layers
+    config.expert_configs[1]['n_levels_height']= args.WNO_n_levels_height
+    config.expert_configs[1]['n_levels_width'] = args.WNO_n_levels_width
+    config.expert_configs[2]['n_scales']       = args.MNO_n_scales
+    config.expert_configs[2]['scale_factors']  = args.MNO_scale_factors
+    config.expert_configs[2]['n_layers']       = args.MNO_n_layers
+    config.expert_configs[3]['n_modes']        = tuple(args.LNO_n_modes)
+    config.expert_configs[3]['n_layers']       = args.LNO_n_layers
+    config.expert_configs = [config.expert_configs[i] for i in args.choose_experts]
+
+    experts_name = '_'.join([f"{config.expert_configs[i]['domain_type']}_{i}" if i in (0,1)
+                             else f"{config.expert_configs[i]['type']}_{i}" for i in args.choose_experts])
+
+    # 设备/日志开关（与主训练一致）
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    device, is_logger = setup_env(config)
+
+    # 结果与日志
+    results_dir = Path(args.output_dir) / f"overfit1_{experts_name}"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    log_file = results_dir / "training_log.txt"
+    with open(log_file, "w") as f:
+        f.write("Epoch,Total,L1,Grad,MSE_mon,PSNR_inv,Corr,GradNorm,LR,w_grad\n")
+
+    # ===== 1) 数据与相同变换 =====
+    full_dataset = SeismicDataset(data_dir=config.data_dir, family=config.family, split='train')
+    data_dict = full_dataset.getStats()
+
+    input_transform = Compose([
+        T.LogTransform(k=args.k),
+        T.MinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k),
+                          T.log_transform(data_dict['input_max'], k=args.k))
+    ])
+    output_transform = Compose([
+        T.MinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
+    ])
+    input_inverse_transform = Compose([
+        T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k),
+                                 T.log_transform(data_dict['input_max'], k=args.k)),
+        T.InverseLogTransform(k=args.k)
+    ])
+    output_inverse_transform = Compose([
+        T.InverseMinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
+    ])
+    data_processor = SeismicDataProcessor(
+        input_transform=input_transform,
+        output_transform=output_transform,
+        channel_dim=config.channel_dim
+    )
+
+    # 取一个样本（你可改 one_idx）
+    one_idx = 0
+    sample = data_processor(full_dataset[one_idx])
+
+    class OneSampleDataset(torch.utils.data.Dataset):
+        def __init__(self, s): self.s = s
+        def __len__(self): return 1
+        def __getitem__(self, i): return self.s
+
+    train_loader = DataLoader(OneSampleDataset(sample), batch_size=1, shuffle=False, num_workers=0)
+    loader_iter = cycle(train_loader)
+
+    # ===== 2) 模型构建 =====
+    config.in_channels = sample['input'].shape[0]
+    if getattr(args, "use_moe", False) and args.use_experts_path:
+        experts = load_moe_experts(
+            expert_configs=config.expert_configs,
+            in_channels=config.in_channels,
+            out_channels=config.out_channels,
+            hidden_channels=config.hidden_channels,
+            model_path=args.use_experts_path
+        )
+        # 如需解冻专家训练，取消下面注释
+        # for e in experts:
+        #     for p in e.parameters(): p.requires_grad = True
+    else:
+        experts = ExpertFactory.create_expert_ensemble(
+            expert_configs=config.expert_configs,
+            in_channels=config.in_channels,
+            out_channels=config.out_channels,
+            hidden_channels=config.hidden_channels
+        )
+
+    model = MOEOperator(
+        experts=experts,
+        in_channels=config.in_channels,
+        out_channels=config.out_channels,
+        hidden_channels=config.hidden_channels,
+        top_k=config.top_k,
+        noisy_gating=config.noisy_gating,
+        fusion_type=config.fusion_type,
+        router_hidden_dim=config.router_hidden_dim
+    ).to(device)
+
+    # ===== 3) 优化器/调度/损失 =====
+    # 单样本建议 LR=1e-3 起步；如想严格沿用传参，保留 config.learning_rate
+    lr = max(1e-3, float(config.learning_rate))
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=0.0)
+    sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=50)
+
+    def sobel_grad(x):
+        kx = torch.tensor([[1,0,-1],[2,0,-2],[1,0,-1]], dtype=x.dtype, device=x.device).view(1,1,3,3)
+        ky = torch.tensor([[1,2,1],[0,0,0],[-1,-2,-1]], dtype=x.dtype, device=x.device).view(1,1,3,3)
+        gx = F.conv2d(x, kx, padding=1); gy = F.conv2d(x, ky, padding=1)
+        return gx, gy
+
+    def grad_loss_sobel(pred, gt):
+        gx1, gy1 = sobel_grad(pred); gx2, gy2 = sobel_grad(gt)
+        return (gx1-gx2).abs().mean() + (gy1-gy2).abs().mean()
+
+    def criterion(pred, gt, epoch):
+        # 梯度项权重：每50个epoch增加0.05，上限0.25；MSE只给很小权重稳态
+        w_g = min(0.25, 0.05 * (epoch // 50))
+        loss_l1 = F.l1_loss(pred, gt)
+        loss_g  = grad_loss_sobel(pred, gt)
+        loss_m  = F.mse_loss(pred, gt) * 0.05
+        total   = loss_l1 + w_g*loss_g + loss_m
+        return total, loss_l1, loss_g, w_g
+
+    def psnr_after_inv(pred, tgt):
+        p = output_inverse_transform(pred.detach().cpu())
+        t = output_inverse_transform(tgt.detach().cpu())
+        mse_val = F.mse_loss(p, t).item()
+        if mse_val <= 1e-12: return 99.0
+        tmax, tmin = t.max().item(), t.min().item()
+        MAX = max(abs(tmax), abs(tmin), 1.0)
+        return 10.0 * np.log10((MAX*MAX) / mse_val)
+
+    def corr_pred_input(pred, inp):
+        # 输入降维至输出分辨率后计算相关
+        x = inp.mean(dim=1, keepdim=True) if inp.dim()==4 else inp
+        x = F.interpolate(x, size=pred.shape[-2:], mode='bilinear', align_corners=False)
+        p = pred.detach().flatten(); q = x.detach().flatten()
+        p = p - p.mean(); q = q - q.mean()
+        return (p*q).sum().item() / (p.norm().item()*q.norm().item() + 1e-8)
+
+    # ===== 4) 训练循环 =====
+    MAX_EPOCHS = max(2000, args.epochs or 500)
+    EARLY_PATIENCE = 100
+    best_total = float('inf')
+    best_state = None
+    bad = 0
+
+    for epoch in range(1, MAX_EPOCHS+1):
+        model.train()
+        batch = next(loader_iter)
+        inp = batch['input'].to(device)   # [1,C,T,R]
+        tgt = batch['output'].to(device)  # [1,1,H,W]
+        assert inp.dim()==4 and tgt.dim()==4, f"Bad shapes: inp={tuple(inp.shape)}, tgt={tuple(tgt.shape)}"
+        if epoch == 1:
+            print(f"[overfit1] inp: {tuple(inp.shape)} (expect [1,C,T,R]) | tgt: {tuple(tgt.shape)} (expect [1,1,H,W])")
+
+        opt.zero_grad(set_to_none=True)
+        pred = model(inp)
+        total, loss_l1, loss_g, w_g = criterion(pred, tgt, epoch)
+
+        # 非有限守护
+        if not torch.isfinite(total):
+            print(f"[overfit1] non-finite loss at epoch {epoch}: {total.item()}")
+            break
+
+        total.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+
+        # 指标统计
+        with torch.no_grad():
+            mae_val  = float(loss_l1.item())
+            grad_val = float(loss_g.item())
+            mse_mon  = float(F.mse_loss(pred, tgt).item())  # 仅记录
+            psnr_val = float(psnr_after_inv(pred, tgt))
+            corr_val = float(corr_pred_input(pred, inp))
+
+        # 调度器（用 L1 更稳定）
+        old_lr = opt.param_groups[0]['lr']
+        sch.step(mae_val)
+        new_lr = opt.param_groups[0]['lr']
+        if new_lr != old_lr:
+            print(f"[LR] {old_lr:.2e} → {new_lr:.2e}")
+
+        # 保存最优（以 total 为准）
+        improved = total.item() < best_total - 1e-10
+        if improved:
+            best_total = total.item()
+            best_state = {
+                k: (v.detach().cpu().clone() if torch.is_tensor(v) else copy.deepcopy(v))
+                for k, v in model.state_dict().items()
+            }
+            bad = 0
+        else:
+            bad += 1
+
+        if epoch % 10 == 0 or epoch == 1:
+            print(f"[overfit1 {epoch:04d}] Total={total.item():.6f} | L1={mae_val:.6f} | Grad={grad_val:.6f} "
+                  f"| MSE(mon)={mse_mon:.6f} | PSNR(inv)={psnr_val:.3f} | corr={corr_val:.3f} "
+                  f"| grad_norm={grad_norm:.3e} | lr={new_lr:.2e} | w_g={w_g:.3f}")
+
+        with open(log_file, "a") as f:
+            f.write(f"{epoch},{total.item():.6f},{mae_val:.6f},{grad_val:.6f},{mse_mon:.6f},"
+                    f"{psnr_val:.3f},{corr_val:.3f},{grad_norm:.3e},{new_lr:.2e},{w_g:.3f}\n")
+
+        if bad >= EARLY_PATIENCE:
+            print(f"Early stop at epoch {epoch}, best Total={best_total:.6e}")
+            break
+
+    # ===== 5) 保存最佳与可视化 =====
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        torch.save(best_state, results_dir / f"best_overfit1_{experts_name}.pt")
+
+    model.eval()
+    with torch.no_grad():
+        pred = model(inp)
+        pred_inv = output_inverse_transform(pred.detach().cpu())
+        tgt_inv  = output_inverse_transform(tgt.detach().cpu())
+        inp_inv  = input_inverse_transform(inp.detach().cpu())
+
+        np.save(results_dir/'pred_overfit_inv.npy', pred_inv.numpy())
+        np.save(results_dir/'tgt_overfit_inv.npy',  tgt_inv.numpy())
+
+        visualize_results(
+            inputs=inp_inv,
+            targets=tgt_inv,
+            predictions=pred_inv,
+            save_dir=str(results_dir / "vis")
+        )
+
+    print(f"[overfit1] Done. Artifacts saved at: {results_dir.resolve()}")
 
 
 # 定义一个TransformedSubset类，用于对Subset应用变换
@@ -978,7 +1241,7 @@ def load_moe_experts(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="地震数据MOE训练和推理")
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'inference'],
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'inference','overfit1'],
                         help='运行模式: 训练或推理')
     parser.add_argument('--data_dir', type=str, default=None,
                         help='数据目录路径')
@@ -1051,5 +1314,7 @@ if __name__ == '__main__':
         if not args.model_path:
             raise ValueError("推理模式需要指定模型路径 --model_path")
         run_inference(args)
+    elif args.mode == 'overfit1':
+        run_overfit_one_sample(args)
     else:
         raise ValueError(f"不支持的运行模式: {args.mode}") 
