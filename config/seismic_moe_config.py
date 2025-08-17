@@ -84,8 +84,8 @@ class SeismicMOEConfig(Default):
     learning_rate = 1e-4
     weight_decay = 1e-4
     epochs = 100
-    milestones = [30, 60, 90]
-    scheduler_gamma = 0.5
+    milestones = [60,90,110]
+    scheduler_gamma = 0.3
     lambda_g1v = 1.0
     lambda_g2v = 1.0
     output_dir = './results'
