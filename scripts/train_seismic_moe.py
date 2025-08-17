@@ -33,6 +33,7 @@ from neuralop.data.datasets import SeismicDataset, create_seismic_dataloader
 from neuralop.utils import get_wandb_api_key, count_model_params
 from config.seismic_moe_config import SeismicMOEConfig
 import neuralop.mpu.comm as comm
+from scripts.scheduler import WarmupMultiStepLR
 print("-----------------------------------------------------------")
 
 class SeismicMetrics:
@@ -449,20 +450,31 @@ def run_training(args):
         model = DDP(
             model, device_ids=[device.index], output_device=device.index, static_graph=True
         )
+        
+    # Scale lr according to effective batch size
+    lr = config.learning_rate * world_size
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=config.weight_decay)
+
+    # Convert scheduler to be per iteration instead of per epoch
+    warmup_iters = config.lr_warmup_epochs * len(train_loader)
+    lr_milestones = [len(train_loader) * m for m in config.milestones]
+    lr_scheduler = WarmupMultiStepLR(
+        optimizer, milestones=lr_milestones, gamma=config.scheduler_gamma,
+        warmup_iters=warmup_iters, warmup_factor=1e-5)
     
-    # 优化器
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay
-    )
+    # # 优化器
+    # optimizer = torch.optim.Adam(
+    #     model.parameters(),
+    #     lr=config.learning_rate,
+    #     weight_decay=config.weight_decay
+    # )
     
-    # 学习率调度器
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(
-        optimizer,
-        milestones=config.milestones,
-        gamma=config.scheduler_gamma
-    )
+    # # 学习率调度器
+    # scheduler = torch.optim.lr_scheduler.MultiStepLR(
+    #     optimizer,
+    #     milestones=config.milestones,
+    #     gamma=config.scheduler_gamma
+    # )
     
     # Define loss function
     l1loss = nn.L1Loss() # MAE
@@ -537,7 +549,6 @@ def run_training(args):
         if is_logger:
             print("未提供 resume 路径，或路径无效，将从头开始训练。")
 
-    
 #以上全是准备工作，下面是核心循环
 
     # 训练循环
@@ -576,14 +587,17 @@ def run_training(args):
                 train_loss += loss.item()
                 if is_logger:
                     pbar.set_postfix({"train_loss": f"{loss.item():.6f}"})
-
+                
+                # 更新学习率
+                lr_scheduler.step()
+                
                 # if (pbar.n + 1) % 5 == 0:
                 # with torch.no_grad():
                 #     visualize_results(
                 #         inputs, targets, predictions,
                 #         save_dir=results_dir / f"vis_batch_{pbar.n+1}"
                 #     )
-                
+
         # with torch.no_grad():
         #     visualize_results(
         #         inputs, targets, predictions,
@@ -624,9 +638,6 @@ def run_training(args):
         val_loss /= len(val_loader)
         for metric in all_metrics:
             all_metrics[metric] /= len(val_loader)
-        
-        # 更新学习率
-        scheduler.step()
         
         # 保存日志
         if is_logger:
@@ -1255,6 +1266,12 @@ if __name__ == '__main__':
                         help='数据加载工作进程数')
     parser.add_argument('--seed', type=int, default=42,
                         help='随机种子')
+    parser.add_argument('--lr_warmup_epochs', type=int, default=5,
+                        help='学习率预热轮数')
+    parser.add_argument('--milestones', nargs='+', type=int, default=[30, 60, 90],
+                        help='学习率衰减里程碑')
+    parser.add_argument('--scheduler_gamma', type=float, default=0.3,
+                        help='学习率衰减因子')
     parser.add_argument('--output_dir', type=str, default='./results',
                         help='结果保存目录')
     parser.add_argument('--model_path', type=str, default=None,

@@ -89,6 +89,7 @@ class SeismicMOEConfig(Default):
     lambda_g1v = 1.0
     lambda_g2v = 1.0
     output_dir = './results'
+    lr_warmup_epochs = 5
     
     # 分布式训练配置
     distributed = DistributedConfig(
