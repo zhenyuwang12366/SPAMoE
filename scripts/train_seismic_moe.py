@@ -5,6 +5,7 @@
 
 import os
 import sys
+import math
 import logging
 import numpy as np
 import torch
@@ -76,29 +77,31 @@ class SeismicMetrics:
 def plot_loss_curve(log_file, save_path=None):
     """
     从日志文件中解析并绘制 Train Loss 和 Val Loss 曲线
-
-    参数:
-        log_file: 日志文件路径 (内容类似 "Epoch | Train Loss | Val Loss | ...")
-        save_path: 若提供路径，会保存图像；否则直接 plt.show()
     """
-    # 读取日志
     with open(log_file, "r") as f:
         text = f.read()
     
-    # 用正则提取 epoch, train loss, val loss
     pattern = re.compile(
-        r"(\d+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|"
+        r"""^                                   # 行首
+            \s*(\d+)\s*\|\s*                    # Epoch（整数）
+            (\d+(?:\.\d+)?)\s*\|\s*             # Train Loss（浮点）
+            (\d+(?:\.\d+)?)\s*\|\s*             # Val Loss（浮点）
+            (\d+(?:\.\d+)?)\s*\|\s*             # MAE（浮点）
+            (\d+(?:\.\d+)?)\s*\|\s*             # MSE（浮点）
+            ([+-]?\d+(?:\.\d+)?)\s*\|           # PSNR（可为负）
+            \s*$                                # 行尾
+        """,
+        re.MULTILINE | re.VERBOSE
     )
-    rows = pattern.findall(text)
+
+    rows = [m.groups() for m in pattern.finditer(text)]
     
     if not rows:
         raise ValueError("日志格式不匹配，请检查 log_file 格式")
     
-    # 转 DataFrame
-    df = pd.DataFrame(rows, columns=["Epoch", "Train Loss", "Val Loss"]).astype(float)
-    df_grouped = df.groupby("Epoch").mean().reset_index()  # 每个 epoch 取平均
+    df = pd.DataFrame(rows, columns=["Epoch", "Train Loss", "Val Loss", "MAE", "MSE", "PSNR"]).astype(float)
+    df_grouped = df.groupby("Epoch").mean().reset_index()
     
-    # 画图
     plt.figure(figsize=(10, 6))
     plt.plot(df_grouped["Epoch"], df_grouped["Train Loss"], label="Train Loss", lw=2)
     plt.plot(df_grouped["Epoch"], df_grouped["Val Loss"], label="Val Loss", lw=2)
@@ -502,7 +505,10 @@ def run_training(args):
         )
         
     # Scale lr according to effective batch size
-    lr = config.learning_rate * world_size
+    if args.distributed:
+        lr = config.learning_rate * math.sqrt(world_size)
+    else:
+        lr = config.learning_rate
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=config.weight_decay)
 
     # Convert scheduler to be per iteration instead of per epoch
@@ -823,6 +829,9 @@ def run_training(args):
         
         print(f"训练完成！最佳模型保存在: {best_model_path}")
         print(f"最终模型保存在: {final_model_path}")
+        
+        # 绘制loss曲线
+        plot_loss_curve(log_file, results_dir)
         
         # 关闭WandB
         if args.use_wandb:
