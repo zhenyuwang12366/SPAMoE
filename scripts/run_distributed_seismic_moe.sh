@@ -29,7 +29,9 @@ K=1
 HIDDEN_CHANNELS=64
 LEARNING_RATE=0.001
 RESUME_PATH="./results/distributed_seismic_moe"
-
+WEIGHT_DECAY=0.05
+LR_WARMUP=5
+SCHEDULER_GAMMA=0.2
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -60,6 +62,9 @@ while [[ $# -gt 0 ]]; do
     --hidden_channels) HIDDEN_CHANNELS="$2"; shift 2 ;;
     --learning_rate) LEARNING_RATE="$2"; shift 2 ;;
     --resume_path) RESUME_PATH="$2"; shift 2 ;;
+    --weight_decay) WEIGHT_DECAY="$2"; shift 2 ;;
+    --lr_warmup_epochs) LR_WARMUP="$2"; shift 2 ;;
+    --scheduler_gamma) SCHEDULER_GAMMA="$2"; shift 2 ;;
     *)
       echo "未知参数: $1"
       exit 1 ;;
@@ -99,7 +104,9 @@ echo "Num Workers: $NUM_WORKERS"
 echo "Seed: $SEED"
 echo "数据预处理缩放因子: $K"
 echo "ResumePath: $RESUME_PATH"
-
+echo "WeightDecay: $WEIGHT_DECAY"
+echo "lr_warmup_epochs: $LR_WARMUP"
+echo "scheduler_gamma: $SCHEDULER_GAMMA"
 # 启动分布式训练
 torchrun \
   --standalone \
@@ -133,7 +140,10 @@ torchrun \
   --hidden_channels "$HIDDEN_CHANNELS" \
   --learning_rate "$LEARNING_RATE" \
   --resume_path "$RESUME_PATH" \
-
+  --weight_decay "$WEIGHT_DECAY" \
+  --lr_warmup_epochs "$LR_WARMUP" \
+  --scheduler_gamma "$SCHEDULER_GAMMA" \
+  
   $WANDB_ARG
 
 echo "分布式训练完成！"

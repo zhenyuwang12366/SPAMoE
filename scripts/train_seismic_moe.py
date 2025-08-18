@@ -8,6 +8,9 @@ import sys
 import logging
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
+import pandas as pd
+import re
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Any, List, Union, Optional
@@ -70,6 +73,47 @@ class SeismicMetrics:
         psnr = 20 * np.log10(data_range) - 10 * np.log10(mse)
         return psnr
 
+def plot_loss_curve(log_file, save_path=None):
+    """
+    从日志文件中解析并绘制 Train Loss 和 Val Loss 曲线
+
+    参数:
+        log_file: 日志文件路径 (内容类似 "Epoch | Train Loss | Val Loss | ...")
+        save_path: 若提供路径，会保存图像；否则直接 plt.show()
+    """
+    # 读取日志
+    with open(log_file, "r") as f:
+        text = f.read()
+    
+    # 用正则提取 epoch, train loss, val loss
+    pattern = re.compile(
+        r"(\d+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|"
+    )
+    rows = pattern.findall(text)
+    
+    if not rows:
+        raise ValueError("日志格式不匹配，请检查 log_file 格式")
+    
+    # 转 DataFrame
+    df = pd.DataFrame(rows, columns=["Epoch", "Train Loss", "Val Loss"]).astype(float)
+    df_grouped = df.groupby("Epoch").mean().reset_index()  # 每个 epoch 取平均
+    
+    # 画图
+    plt.figure(figsize=(10, 6))
+    plt.plot(df_grouped["Epoch"], df_grouped["Train Loss"], label="Train Loss", lw=2)
+    plt.plot(df_grouped["Epoch"], df_grouped["Val Loss"], label="Val Loss", lw=2)
+    
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Train vs Validation Loss")
+    plt.legend()
+    plt.grid(True)
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"保存曲线到 {save_path}")
+    else:
+        plt.show()
 
 def visualize_results(inputs, targets, predictions, save_dir='./results', max_samples=4):
     """可视化地震数据和预测结果"""
@@ -170,7 +214,13 @@ def run_training(args):
         config.learning_rate = args.learning_rate
     if args.hidden_channels:
         config.hidden_channels = args.hidden_channels
-
+    if args.lr_warmup_epochs:
+        config.lr_warmup_epochs = args.lr_warmup_epochs
+    if args.weight_decay:
+        config.weight_decay = args.weight_decay
+    if args.scheduler_gamma:
+        config.scheduler_gamma = args.scheduler_gamma
+    
     print(f'batch_size:{config.batch_size}')
     print(f'epochs:{config.epochs}')
     print(f'learning_rate:{config.learning_rate}')
@@ -1266,12 +1316,16 @@ if __name__ == '__main__':
                         help='数据加载工作进程数')
     parser.add_argument('--seed', type=int, default=42,
                         help='随机种子')
+    
+    
     parser.add_argument('--lr_warmup_epochs', type=int, default=5,
                         help='学习率预热轮数')
     parser.add_argument('--milestones', nargs='+', type=int, default=[30, 60, 90],
                         help='学习率衰减里程碑')
     parser.add_argument('--scheduler_gamma', type=float, default=0.3,
                         help='学习率衰减因子')
+    parser.add_argument('--weight_decay', type=float, default=0.05)
+    
     parser.add_argument('--output_dir', type=str, default='./results',
                         help='结果保存目录')
     parser.add_argument('--model_path', type=str, default=None,
