@@ -1,6 +1,6 @@
 import torch
 import neuralop.mpu.comm as comm
-
+import numpy as np
 
 def setup(config):
     """A convenience function to intialize the device, setup torch settings and
@@ -63,6 +63,7 @@ def setup(config):
 
         if seed is not None:
             torch.cuda.manual_seed(seed)
+            np.random.seed(seed)
         increase_l2_fetch_granularity()
         try:
             torch.set_float32_matmul_precision('high')

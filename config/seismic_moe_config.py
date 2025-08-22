@@ -91,6 +91,17 @@ class SeismicMOEConfig(Default):
     output_dir = './results'
     lr_warmup_epochs = 5
     
+    use_onecycle = True
+    
+    accum_steps = 1
+    use_amp = True
+    
+    early_stop = False
+    early_stop_patience = 30
+    early_stop_min_delta = 0.001
+    early_stop_warmup_epochs = 10
+    
+    
     # 分布式训练配置
     distributed = DistributedConfig(
         use_distributed=False,

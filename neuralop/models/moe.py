@@ -202,6 +202,7 @@ class MOEOperator(BaseModel, name='MOE'):
         router_type: str = 'basic',
         task_dim: int = 0,
         routing_mode: str = 'input',
+        is_logger: bool = False,
         **kwargs
     ):
         super().__init__()
@@ -339,6 +340,9 @@ class MOEOperator(BaseModel, name='MOE'):
         # 注册钩子函数
         self.time_to_space_projection[-2].register_forward_hook(self.hook_fn)
         
+        # is_logger
+        self.is_logger = is_logger
+        
     def hook_fn(self, module: nn.Module, input: tuple[torch.Tensor], output: torch.Tensor):
         features = input[0].detach()
         features = F.interpolate(features, size=(70, 70), mode='bilinear', align_corners=True)
@@ -426,9 +430,10 @@ class MOEOperator(BaseModel, name='MOE'):
             expert_outputs_collection.append((batch_expert_outputs, weights))
         
         # 打印调试信息
-        print("专家输出形状:")
-        for expert_idx, shapes in expert_shapes.items():
-            print(f"专家 {expert_idx}: {shapes}")
+        if self.is_logger:
+            print("专家输出形状:")
+            for expert_idx, shapes in expert_shapes.items():
+                print(f"专家 {expert_idx}: {shapes}")
         
         # 分析阶段：收集所有输出的形状信息
         output_shapes = []
@@ -461,7 +466,8 @@ class MOEOperator(BaseModel, name='MOE'):
             target_shape.append(target_size)
         
         target_shape = tuple(target_shape)
-        print(f"目标形状: {target_shape}")
+        if self.is_logger:
+            print(f"目标形状: {target_shape}")
         
         # 处理每个专家的输出
         outputs = []
@@ -471,7 +477,8 @@ class MOEOperator(BaseModel, name='MOE'):
             for i, output in enumerate(batch_outputs):
                 # 检查形状是否需要调整
                 if output.dim() >= 4 and output.shape[2:] != target_shape:
-                    print(f"调整输出形状: {output.shape[2:]} -> {target_shape}")
+                    if self.is_logger:
+                        print(f"调整输出形状: {output.shape[2:]} -> {target_shape}")
                     # 使用插值调整大小
                     try:
                         # 对于2D和3D输入，使用适当的插值模式
@@ -497,7 +504,8 @@ class MOEOperator(BaseModel, name='MOE'):
             
             # 检查调整后的形状是否一致
             shapes_after_adjustment = [out.shape for out in adjusted_batch_outputs]
-            print(f"调整后形状: {shapes_after_adjustment}")
+            if self.is_logger:
+                print(f"调整后形状: {shapes_after_adjustment}")
             
             try:
                 # 合并这个专家的所有样本输出

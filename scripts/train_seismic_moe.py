@@ -12,11 +12,13 @@ import torch
 import matplotlib.pyplot as plt
 import pandas as pd
 import re
+import copy
+from contextlib import nullcontext
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Any, List, Union, Optional
+from typing import Dict, Any, List, Union, Optional, Callable
 import argparse
-from tqdm import tqdm
+import tqdm
 import matplotlib.pyplot as plt
 from pathlib import Path
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -38,6 +40,7 @@ from neuralop.utils import get_wandb_api_key, count_model_params
 from config.seismic_moe_config import SeismicMOEConfig
 import neuralop.mpu.comm as comm
 from scripts.scheduler import WarmupMultiStepLR
+import neuralop.mpu.comm as comm
 print("-----------------------------------------------------------")
 
 class SeismicMetrics:
@@ -73,6 +76,47 @@ class SeismicMetrics:
         mse = F.mse_loss(pred, target).item()
         psnr = 20 * np.log10(data_range) - 10 * np.log10(mse)
         return psnr
+    
+class EarlyStopping:
+    """
+    监控 val 指标，当连续 patience 次没有超过 min_delta 的改善时，触发早停。
+    mode='min'：指标越小越好（如 val_loss）
+    """
+    def __init__(self, patience=20, min_delta=0.0, warmup_epochs=0, mode='min'):
+        assert mode in ('min', 'max')
+        self.patience = int(patience)
+        self.min_delta = float(min_delta)
+        self.warmup_epochs = int(warmup_epochs)
+        self.mode = mode
+
+        self.best = math.inf if mode == 'min' else -math.inf
+        self.num_bad = 0
+        self.should_stop = False
+        self.best_epoch = -1
+
+    def _is_improved(self, value):
+        if self.mode == 'min':
+            return value < (self.best - self.min_delta)
+        else:
+            return value > (self.best + self.min_delta)
+
+    def step(self, value, epoch):
+        """
+        返回是否应停止（仅供主进程用于判定）。内部更新最佳值和坏轮计数。
+        """
+        # warmup 阶段不计入早停
+        if epoch < self.warmup_epochs:
+            return False
+
+        if self._is_improved(value):
+            self.best = value
+            self.best_epoch = epoch
+            self.num_bad = 0
+        else:
+            self.num_bad += 1
+            if self.num_bad >= self.patience:
+                self.should_stop = True
+        return self.should_stop
 
 def plot_loss_curve(log_file, save_path=None):
     """
@@ -185,6 +229,279 @@ def safe_random_split(dataset_size, ratios : list):
         val_size = sizes[1]
         return train_size, val_size
 
+@torch.no_grad()
+def _evaluate_one_epoch(
+    model,
+    val_loader,
+    device,
+    criterion,
+    metrics_module,  # 需有 calculate_psnr(pred, tgt)
+):
+    model.eval()
+    val_loss = 0.0
+    mse_sum, mae_sum, psnr_sum = 0.0, 0.0, 0.0
+
+    for batch in val_loader:
+        inputs  = batch['input'].to(device, non_blocking=True)
+        targets = batch['output'].to(device, non_blocking=True)
+
+        preds = model(inputs)
+
+        # 兼容 criterion 返回 (loss, loss_g1v, loss_g2v)
+        loss_tuple = criterion(preds, targets)
+        if isinstance(loss_tuple, (tuple, list)) and len(loss_tuple) >= 3:
+            loss, loss_g1v, loss_g2v = loss_tuple[0], loss_tuple[1], loss_tuple[2]
+        else:
+            loss, loss_g1v, loss_g2v = loss_tuple, torch.tensor(0.), torch.tensor(0.)
+
+        val_loss += loss.item()
+        mse_sum  += loss_g2v.item()
+        mae_sum  += loss_g1v.item()
+        psnr_sum += metrics_module.calculate_psnr(preds, targets)
+
+    n = max(1, len(val_loader))
+    return {
+        "val_loss": val_loss / n,
+        "mse": mse_sum / n,
+        "mae": mae_sum / n,
+        "psnr": psnr_sum / n
+    }
+
+
+def train_one_epoch(
+    *,
+    model,
+    optimizer,
+    criterion,
+    train_loader,
+    val_loader,
+    device,
+    epoch: int,
+    config,
+    is_logger: bool,
+    log_file: Optional[str],
+    results_dir,
+    # 学习率调度器
+    lr_scheduler=None,
+    scheduler_step_mode: str = "per_step",   # "per_step" 或 "per_epoch"
+    # 梯度累计
+    accum_steps: int = 1,
+    # 可视化 & 反归一化
+    vis_now: bool = False,                   # 是否在本 epoch 可视化
+    visualize_results: Optional[Callable] = None,
+    input_inverse_transform: Optional[Callable] = None,
+    output_inverse_transform: Optional[Callable] = None,
+    # WandB
+    use_wandb: bool = False,
+    wandb_module=None,
+    # 早停
+    early_stopper=None,                      # 需有 step(val_loss, epoch)->bool
+    # 最佳模型保存
+    best_val_loss: float = float("inf"),
+    best_model_path: Optional[str] = None,
+    best_expert_path: Optional[str] = None,
+    experts_name: Optional[list] = None,
+    experts_name_str: Optional[str] = None,
+    data_dict: Optional[dict] = None,
+    # 其他工具
+    metrics_module=None,
+    tqdm_module=None,                        # 传入 tqdm（避免在函数内硬依赖）
+):
+    """
+    进行一个 epoch 的完整训练与验证，返回 (stats_dict, best_val_loss, stop_flag)
+    - 等效全局 batch = per_gpu_batch * world_size * accum_steps
+    - 若使用 DDP，前 accum_steps-1 次 micro step 用 no_sync() 以减少通信
+    - 调度器：per_step 在“优化步”后 step；per_epoch 在 epoch 末 step
+    """
+    assert metrics_module is not None, "metrics_module 需提供 calculate_psnr(pred, tgt)"
+    tqdm = tqdm_module.tqdm if tqdm_module is not None else None
+
+    start_time = time.time()
+    model.train()
+    running_train_loss = 0.0
+    micro_count = 0
+    optim_count = 0
+    num_steps = len(train_loader)
+    
+    # DDP 判断
+    is_ddp = hasattr(model, "no_sync")
+
+    # 分布式 sampler 设 epoch
+    if getattr(config, "distributed", None) and getattr(config.distributed, "use_distributed", False):
+        if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+            train_loader.sampler.set_epoch(epoch)
+ 
+    optimizer.zero_grad(set_to_none=True)
+
+    pbar_iter = train_loader
+    if tqdm is not None:
+        pbar_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs}", leave=False, disable=not is_logger)
+
+    for step, batch in enumerate(pbar_iter):
+        inputs  = batch['input'].to(device, non_blocking=True)
+        targets = batch['output'].to(device, non_blocking=True)
+
+        last_micro = ((step + 1) % accum_steps == 0) or ((step + 1) == num_steps)
+        sync_ctx = (model.no_sync() if (is_ddp and not last_micro) else nullcontext())
+
+        with sync_ctx:
+            preds = model(inputs)
+            loss_tuple = criterion(preds, targets)
+            loss = loss_tuple[0] if isinstance(loss_tuple, (tuple, list)) else loss_tuple
+            # —— 核心：为梯度累计缩放 loss，保证等效大 batch ——
+            loss = loss / accum_steps
+            loss.backward()
+            running_train_loss += loss.item()
+            micro_count += 1
+
+        if last_micro:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            optim_count += 1
+
+            # 学习率调度（按步）
+            if lr_scheduler is not None and scheduler_step_mode == "per_step":
+                lr_scheduler.step()
+
+        # 进度条显示
+        if is_logger and tqdm is not None:
+            pbar_iter.set_postfix({"train_loss": f"{loss.item():.6f}"})
+
+    # —— 训练集 loss（micro-step 平均）——
+    avg_train_loss = running_train_loss / max(1, micro_count)
+
+    # —— 验证 —— #
+    val_stats = _evaluate_one_epoch(model, val_loader, device, criterion, metrics_module)
+    val_loss = val_stats["val_loss"]
+
+    # —— 日志输出 & WandB —— #
+    if is_logger and log_file is not None:
+        with open(log_file, "a") as f:
+            f.write(
+                f"    {epoch+1}    |    {avg_train_loss:.6f}    |    {val_loss:.6f}    |    "
+                f"{val_stats['mae']:.6f}    |    {val_stats['mse']:.6f}    |    {val_stats['psnr']:.6f}    |\n"
+            )
+
+    if use_wandb and wandb_module is not None:
+        wandb_log = {
+            "epoch": epoch + 1,
+            "train_loss": avg_train_loss,
+            "val_loss": val_loss,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+            "val/psnr": val_stats["psnr"],
+            "val/mse": val_stats["mse"],
+            "val/mae": val_stats["mae"],
+            "optim_steps_in_epoch": optim_count,
+        }
+        wandb_module.log(wandb_log)
+
+    # —— 保存最佳模型（仅主进程）—— #
+    if is_logger and (val_loss < best_val_loss):
+        best_val_loss = val_loss
+        model_to_save = model.module if (getattr(config, "distributed", None) and getattr(config.distributed, "use_distributed", False) and hasattr(model, "module")) else model
+
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model_to_save.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'val_loss': val_loss,
+            'metrics': {"psnr": val_stats["psnr"], "mse": val_stats["mse"], "mae": val_stats["mae"]},
+            'data_dict': data_dict
+        }, best_model_path)
+
+        if experts_name is not None and len(experts_name) == 1 and best_expert_path is not None:
+            # 仅示例：若你的模型结构中存在 experts[0]
+            if hasattr(model_to_save, "experts") and len(model_to_save.experts) > 0:
+                torch.save({
+                    'expert_state_dict': model_to_save.experts[0].state_dict()
+                }, best_expert_path)
+
+    # —— 打印本 epoch 概要（仅主进程）—— #
+    if is_logger:
+        print(f"Epoch {epoch+1}/{config.epochs}:")
+        print(f"  Train Loss: {avg_train_loss:.6f}")
+        print(f"  Val   Loss: {val_loss:.6f}")
+        print(f"  PSNR: {val_stats['psnr']:.2f} dB")
+        print(f"  MSE : {val_stats['mse']:.6f}")
+        print(f"  MAE : {val_stats['mae']:.6f}")
+
+    # —— 可视化（仅主进程 & 触发时）—— #
+    if is_logger and vis_now and visualize_results is not None:
+        vis_batch = next(iter(val_loader))
+        inputs = vis_batch['input'].to(device, non_blocking=True)
+        targets = vis_batch['output'].to(device, non_blocking=True)
+        with torch.no_grad():
+            preds = model(inputs)
+
+        if input_inverse_transform is not None:
+            inputs_v = input_inverse_transform(inputs)
+        else:
+            inputs_v = inputs
+
+        if output_inverse_transform is not None:
+            preds_v = output_inverse_transform(preds)
+            targets_v = output_inverse_transform(targets)
+        else:
+            preds_v, targets_v = preds, targets
+
+        visualize_results(inputs_v, targets_v, preds_v, save_dir=results_dir / f"vis_epoch_{epoch+1}")
+
+        if use_wandb and wandb_module is not None:
+            # 只示例记录前三个
+            for i in range(min(3, inputs_v.shape[0])):
+                in_img  = inputs_v[i, 0].detach().float().cpu().numpy()
+                tgt_img = (targets_v[i, 0] if targets_v.dim() > 3 else targets_v[i]).detach().float().cpu().numpy()
+                prd_img = (preds_v[i, 0]   if preds_v.dim()   > 3 else preds_v[i]).detach().float().cpu().numpy()
+                wandb_module.log({
+                    f"sample_{i}/input_velocity": wandb_module.Image(in_img),
+                    f"sample_{i}/target_seismic": wandb_module.Image(tgt_img),
+                    f"sample_{i}/prediction_seismic": wandb_module.Image(prd_img),
+                })
+
+    # —— 早停（仅主进程判定，后广播）—— #
+    stop_flag = 0
+    if getattr(config, "early_stop", False):
+        if is_logger and early_stopper is not None:
+            if early_stopper.step(val_loss, epoch):
+                stop_flag = 1
+
+        if getattr(config, "distributed", None) and getattr(config.distributed, "use_distributed", False):
+            device_for_flag = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+            flag_tensor = torch.tensor([stop_flag], device=device_for_flag, dtype=torch.int32)
+            torch.distributed.broadcast(flag_tensor, src=0)
+            stop_flag = int(flag_tensor.item())
+
+        if stop_flag == 1 and is_logger:
+            print(f"[EARLY STOP] stop at epoch={epoch+1}, best_val_loss={best_val_loss:.6f}")
+
+    # —— 调度器（按 epoch）—— #
+    if lr_scheduler is not None and scheduler_step_mode == "per_epoch":
+        lr_scheduler.step()
+
+    # —— 分布式 barrier（可选，与日志输出顺序相关）—— #
+    if getattr(config, "distributed", None) and getattr(config.distributed, "use_distributed", False):
+        torch.distributed.barrier()
+
+    # —— 耗时 —— #
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    if is_logger:
+        print('Training time', total_time_str)
+
+    # 返回统计与状态
+    stats = {
+        "epoch": epoch,
+        "train_loss": avg_train_loss,
+        "val_loss": val_stats["val_loss"],
+        "psnr": val_stats["psnr"],
+        "mse": val_stats["mse"],
+        "mae": val_stats["mae"],
+        "optim_steps": optim_count,
+        "micro_steps": micro_count,
+        "time_sec": total_time
+    }
+    return stats, best_val_loss, stop_flag
+
 def run_training(args):
     """
     训练地震数据的MOE模型
@@ -199,6 +516,21 @@ def run_training(args):
     
     # 更新配置
     # 代码解释：如果用户在命令行中传入了参数 --data_dir，那就用用户的这个路径；否则，就使用默认路径 "/data1/wuruoyu/waveform-inversion"。
+    
+    # 设置随机种子
+    config.distributed.seed = args.seed
+    
+    # 启用分布式训练
+    if args.distributed:
+        config.distributed.use_distributed = True
+        device, is_logger = setup(config)
+    else:
+        device, is_logger = setup(config)
+    
+    local_rank = comm.get_local_rank()
+    global_rank = comm.get_global_rank()
+    world_size = comm.get_world_size()
+    
     if args.data_dir:
         config.data_dir = args.data_dir
     else:
@@ -223,34 +555,21 @@ def run_training(args):
         config.weight_decay = args.weight_decay
     if args.scheduler_gamma:
         config.scheduler_gamma = args.scheduler_gamma
+    if args.accum_steps is not None:
+        config.accum_steps = args.accum_steps
+    accum_steps = config.accum_steps
+    use_amp = config.use_amp
+    
+    config.lr_warmup_epochs = int(config.epochs * 0.05)
     
     print(f'batch_size:{config.batch_size}')
+    print(f'effective_batch_size:{world_size * config.batch_size * config.accum_steps}')
     print(f'epochs:{config.epochs}')
     print(f'learning_rate:{config.learning_rate}')
     print(f'hidden_channels:{config.hidden_channels}')
 
     # 设置验证集比例
     val_ratio = args.val_ratio if args.val_ratio is not None else 0.2
-    
-    # 设置设备并初始化分布式环境。详细解释见OneNote4
-    device, is_logger = setup(config)
-    
-    # 启用分布式训练
-    if args.distributed:
-        config.distributed.use_distributed = True
-        
-        local_rank = int(os.environ["LOCAL_RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        torch.cuda.set_device(local_rank)
-        
-        import torch.distributed as dist
-        dist.init_process_group(backend="nccl")
-
-        device = torch.device(f"cuda:{local_rank}")
-    
-    # 设置随机种子
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
     
     # 设置WandB日志记录
     if args.use_wandb and is_logger:
@@ -312,8 +631,9 @@ def run_training(args):
         config.use_experts_path = args.use_experts_path
 
     # 这两行代码解释见OneNote3，不过我想知道为什么这两段代码在我们单个模型训练过程中没有起作用
-    experts_name = '_'.join([f"{config.expert_configs[i]['domain_type']}_{i}" if i == 0 or i == 1 else  f"{config.expert_configs[i]['type']}_{i}" for i in args.choose_experts ])
-    config.output_dir = os.path.join(config.output_dir, experts_name)   
+    experts_name = [f"{config.expert_configs[i]['domain_type']}_{i}" if i == 0 or i == 1 else  f"{config.expert_configs[i]['type']}_{i}" for i in args.choose_experts ]
+    experts_name_str = '_'.join(experts_name)
+    config.output_dir = os.path.join(config.output_dir, experts_name_str)   
     
     # 设置损失函数加权系数
     config.lambda_g1v = args.lambda_g1v
@@ -390,19 +710,31 @@ def run_training(args):
     
     # 创建数据加载器
     if args.distributed:
-        train_sampler = DistributedSampler(train_dataset_with_transform, num_replicas=world_size, rank=local_rank)
+        train_sampler = DistributedSampler(
+            train_dataset_with_transform, 
+            num_replicas=world_size, 
+            rank=local_rank,
+            drop_last = True,
+            shuffle = True
+        )
         train_loader = DataLoader(
             train_dataset_with_transform,
             sampler=train_sampler,
             batch_size=config.batch_size,
             shuffle=False,
             num_workers=int(args.num_workers/2),
-            pin_memory=True
+            pin_memory=True,
+            persistent_workers=True
         )
 
         print(f'prefetch_factor={train_loader.prefetch_factor}')
         
-        val_sampler = DistributedSampler(val_dataset_with_transform, num_replicas=world_size, rank=local_rank)
+        val_sampler = DistributedSampler(
+            val_dataset_with_transform, 
+            num_replicas=world_size, 
+            rank=local_rank,
+            drop_last = True
+        )
         val_loader = DataLoader(
             val_dataset_with_transform,
             sampler = val_sampler,
@@ -432,7 +764,7 @@ def run_training(args):
             pin_memory=True,
             persistent_workers=True
         )
-        
+    
     # 检查数据形状
     if is_logger:
         sample_batch = next(iter(train_loader))
@@ -492,7 +824,8 @@ def run_training(args):
             top_k=config.top_k,
             noisy_gating=config.noisy_gating,
             fusion_type=config.fusion_type,
-            router_hidden_dim=config.router_hidden_dim
+            router_hidden_dim=config.router_hidden_dim,
+            is_logger=is_logger
         )
     
     # 移动模型到设备
@@ -501,37 +834,27 @@ def run_training(args):
     # 使用分布式数据并行
     if config.distributed.use_distributed:
         model = DDP(
-            model, device_ids=[device.index], output_device=device.index, static_graph=True
+            model, device_ids=[device.index], 
+            output_device=device.index, 
+            static_graph=False,
+            find_unused_parameters=True,
+            gradient_as_bucket_view=True,
         )
         
     # Scale lr according to effective batch size
-    if args.distributed:
+    if config.distributed.use_distributed and world_size > 2:
         lr = config.learning_rate * math.sqrt(world_size)
     else:
         lr = config.learning_rate
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=config.weight_decay)
-
+    
     # Convert scheduler to be per iteration instead of per epoch
     warmup_iters = config.lr_warmup_epochs * len(train_loader)
     lr_milestones = [len(train_loader) * m for m in config.milestones]
     lr_scheduler = WarmupMultiStepLR(
         optimizer, milestones=lr_milestones, gamma=config.scheduler_gamma,
         warmup_iters=warmup_iters, warmup_factor=1e-5)
-    
-    # # 优化器
-    # optimizer = torch.optim.Adam(
-    #     model.parameters(),
-    #     lr=config.learning_rate,
-    #     weight_decay=config.weight_decay
-    # )
-    
-    # # 学习率调度器
-    # scheduler = torch.optim.lr_scheduler.MultiStepLR(
-    #     optimizer,
-    #     milestones=config.milestones,
-    #     gamma=config.scheduler_gamma
-    # )
-    
+     
     # Define loss function
     l1loss = nn.L1Loss() # MAE
     l2loss = nn.MSELoss()
@@ -557,12 +880,25 @@ def run_training(args):
     
     # 最佳模型保存
     best_val_loss = float("inf")
-    best_model_path = results_dir / f"best_model_{experts_name}.pt"
+    best_model_path = results_dir / f"best_model_{experts_name_str}.pt"
     if len(experts_name) == 1:
-        best_expert_path = results_dir / f"best_expert_{experts_name}.pt"
+        best_expert_path = results_dir / f"best_expert_{experts_name_str}.pt"
     
     # 指标计算器
     metrics = SeismicMetrics()
+    
+    if config.early_stop:
+        # ---- 早停参数（可放到 config / args）----
+        early_patience = getattr(config, "early_stop_patience", 20)
+        early_min_delta = getattr(config, "early_stop_min_delta", 0.0)  # 例如 0.001
+        early_warmup   = getattr(config, "early_stop_warmup_epochs", 10)
+
+        early_stopper = EarlyStopping(
+            patience=early_patience,
+            min_delta=early_min_delta,
+            warmup_epochs=early_warmup,
+            mode="min"  # 监控 val_loss
+        )
     
     # 记录参数数量
     if is_logger:
@@ -604,239 +940,51 @@ def run_training(args):
     else:
         if is_logger:
             print("未提供 resume 路径，或路径无效，将从头开始训练。")
+    
+    scaler = torch.amp.GradScaler(device=device,enabled=use_amp)
+    optimizer.zero_grad(set_to_none=True)
 
 #以上全是准备工作，下面是核心循环
-
     # 训练循环
     for epoch in range(start_epoch, config.epochs):
-        start_time = time.time()
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
-            val_sampler.set_epoch(epoch)
-        # 训练
-        model.train()
-        train_loss = 0.0
-        
-        # 在分布式环境中设置sampler的epoch
-        if config.distributed.use_distributed and hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
-            train_loader.sampler.set_epoch(epoch)
-        
-        with tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs}", leave=False, disable=not is_logger) as pbar:
-            for batch in pbar:
-                # 每个epoch要训练n个batch，每个batch的batch_size为m，则总样本数约为n*m
-                # 获取数据
-                inputs = batch['input'].to(device)
-                targets = batch['output'].to(device)
-                
-                # 前向传播
-                predictions = model(inputs)
-                
-                # 计算损失
-                loss, loss_g1v, loss_g2v = criterion(predictions, targets)
-                
-                # 反向传播
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                
-                # 更新统计信息
-                train_loss += loss.item()
-                if is_logger:
-                    pbar.set_postfix({"train_loss": f"{loss.item():.6f}"})
-                
-                # 更新学习率
-                lr_scheduler.step()
-                
-                # if (pbar.n + 1) % 5 == 0:
-                # with torch.no_grad():
-                #     visualize_results(
-                #         inputs, targets, predictions,
-                #         save_dir=results_dir / f"vis_batch_{pbar.n+1}"
-                #     )
-
-        # with torch.no_grad():
-        #     visualize_results(
-        #         inputs, targets, predictions,
-        #         save_dir=results_dir / f"vis_train_epoch_{epoch+1}"
-        #     )        
-            
-        # 计算平均训练损失
-        train_loss /= len(train_loader)
-        
-        # 验证
-        model.eval()
-        val_loss = 0.0
-        all_metrics = {
-            'mse': 0.0,
-            'mae': 0.0,
-            'psnr': 0.0
-        }
-        
-        with torch.no_grad():
-            for batch in val_loader:
-                # 获取数据
-                inputs = batch['input'].to(device)
-                targets = batch['output'].to(device)
-                
-                # 前向传播
-                predictions = model(inputs)
-                
-                # 计算损失
-                loss, loss_g1v, loss_g2v = criterion(predictions, targets)
-                val_loss += loss.item()
-                
-                # 计算其他指标
-                all_metrics['mse'] += loss_g1v.item()
-                all_metrics['mae'] += loss_g2v.item()
-                all_metrics['psnr'] += metrics.calculate_psnr(predictions, targets)
-        
-        # 计算平均验证损失和指标
-        val_loss /= len(val_loader)
-        for metric in all_metrics:
-            all_metrics[metric] /= len(val_loader)
-        
-        # 保存日志
-        if is_logger:
-            with open(log_file, "a") as f:
-                f.write(f"    {epoch+1}    |    {train_loss:.6f}    |    {val_loss:.6f}    |    {all_metrics['mae']:.6f}    |    {all_metrics['mse']:.6f}    |    {all_metrics['psnr']:.6f}    |\n")
-            
-            # 记录到WandB
-            if args.use_wandb:
-                wandb_log = {
-                    "epoch": epoch + 1,
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "learning_rate": optimizer.param_groups[0]["lr"],
-                }
-                wandb_log.update(all_metrics)
-                wandb.log(wandb_log)
-        
-        # 保存最佳模型 (只在主进程上保存)
-        if is_logger and val_loss < best_val_loss:
-            best_val_loss = val_loss
-            
-            # 保存模型
-            if config.distributed.use_distributed:
-                # 保存DDP模型的module部分
-                model_to_save = model.module
-            else:
-                model_to_save = model
-                
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model_to_save.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_loss,
-                'metrics': all_metrics,
-                # 保存归一化参数，用于推理
-                'data_dict' : data_dict
-            }, best_model_path)
-            if len(experts_name) == 1:
-                torch.save({
-                    'expert_state_dict': model_to_save.experts[0].state_dict()
-                }, best_expert_path)
-        
-        # 打印进度 (只在主进程上打印)
-        if is_logger:
-            print(f"Epoch {epoch+1}/{config.epochs}:")
-            print(f"  Train Loss: {train_loss:.6f}")
-            print(f"  Val Loss: {val_loss:.6f}")
-            print(f"  PSNR: {all_metrics['psnr']:.2f} dB")
-            print(f"  MSE: {all_metrics['mse']:.6f}")
-            print(f"  MAE: {all_metrics['mae']:.6f}")
-        
-        # 可视化验证结果 (只在主进程上可视化)
-        if is_logger and (epoch + 1) % args.vis_freq == 0:
-            # 选择一个批次进行可视化
-            vis_batch = next(iter(val_loader))
-            inputs = vis_batch['input'].to(device)
-            targets = vis_batch['output'].to(device)
-            
-            with torch.no_grad():
-                predictions = model(inputs)
-            
-            # 反归一化
-            inputs = input_inverse_transform(inputs)
-            predictions = output_inverse_transform(predictions)
-            targets = output_inverse_transform(targets)
-            
-            # 可视化
-            visualize_results(
-                inputs, targets, predictions,
-                save_dir=results_dir / f"vis_epoch_{epoch+1}"
-            )
-            
-            # 将可视化结果记录到WandB
-            if args.use_wandb:
-                # 选择前3个样本进行可视化
-                for i in range(min(3, inputs.shape[0])):
-                    # 处理输入（速度图/模型）
-                    input_img = inputs[i, 0].cpu().numpy()
-                    
-                    # 处理目标（地震数据）
-                    if len(targets[i].shape) > 2:
-                        target_img = targets[i, 0].cpu().numpy()
-                    else:
-                        target_img = targets[i].cpu().numpy()
-                        
-                    # 处理预测（地震数据）
-                    if len(predictions[i].shape) > 2:
-                        pred_img = predictions[i, 0].cpu().numpy()
-                    else:
-                        pred_img = predictions[i].cpu().numpy()
-                    
-                    wandb.log({
-                        f"sample_{i}/input_velocity": wandb.Image(input_img),
-                        f"sample_{i}/target_seismic": wandb.Image(target_img),
-                        f"sample_{i}/prediction_seismic": wandb.Image(pred_img)
-                    })
-        
-        # 在分布式环境中同步进程
-        if config.distributed.use_distributed:
-            torch.distributed.barrier()
-        total_time = time.time() - start_time
-        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print('Training time {}'.format(total_time_str))
-        
+        vis_now = (is_logger and ((epoch + 1) % args.vis_freq == 0))
+        stats, best_val_loss, stop_flag = train_one_epoch(
+            model=model,
+            optimizer=optimizer,
+            criterion=criterion,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            device=device,
+            epoch=epoch,
+            config=config,
+            is_logger=is_logger,
+            log_file=log_file,
+            results_dir=results_dir,
+            lr_scheduler=lr_scheduler,
+            scheduler_step_mode=("per_step" if config.use_onecycle else "per_epoch"),
+            accum_steps=config.accum_steps,
+            vis_now=vis_now,
+            visualize_results=visualize_results,
+            input_inverse_transform=input_inverse_transform,
+            output_inverse_transform=output_inverse_transform,
+            use_wandb=args.use_wandb,
+            wandb_module=wandb if args.use_wandb else None,
+            early_stopper=early_stopper if config.early_stop else None,
+            best_val_loss=best_val_loss,
+            best_model_path=best_model_path,
+            best_expert_path=best_expert_path,
+            experts_name=experts_name,
+            experts_name_str=experts_name_str,
+            data_dict=data_dict,
+            metrics_module=metrics,
+            tqdm_module=tqdm,   
+        )
+        if stop_flag == 1:
+            break
     
-    # 保存最终模型 (只在主进程上保存)
     if is_logger:
-        final_model_path = results_dir / f"final_model_{experts_name}.pt"
+        plot_loss_curve(log_file, save_path=results_dir)
         
-        # 保存模型
-        if config.distributed.use_distributed:
-            # 保存DDP模型的module部分
-            model_to_save = model.module
-        else:
-            model_to_save = model
-        
-        if len(experts_name) == 1:
-            final_expert_path = results_dir / f"final_expert_{experts_name}.pt"
-            torch.save({
-                'expert_state_dict': model_to_save.experts[0].state_dict()
-            }, final_expert_path)
-            print(f"训练完成！单一专家{experts_name}保存在: {best_expert_path}")
-            print(f"最终单一专家{experts_name}保存在: {final_expert_path}")
-            
-        torch.save({
-            'epoch': config.epochs,
-            'model_state_dict': model_to_save.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_loss': val_loss,
-            'metrics': all_metrics,
-            'data_dict' : data_dict
-        }, final_model_path)
-        
-        print(f"训练完成！最佳模型保存在: {best_model_path}")
-        print(f"最终模型保存在: {final_model_path}")
-        
-        # 绘制loss曲线
-        plot_loss_curve(log_file, results_dir)
-        
-        # 关闭WandB
-        if args.use_wandb:
-            wandb.finish()
-    
     return model, best_val_loss
 
 def run_overfit_one_sample(args):
@@ -1333,7 +1481,10 @@ if __name__ == '__main__':
                         help='学习率衰减里程碑')
     parser.add_argument('--scheduler_gamma', type=float, default=0.3,
                         help='学习率衰减因子')
-    parser.add_argument('--weight_decay', type=float, default=0.05)
+    parser.add_argument('--weight_decay', type=float, default=0.05,
+                        help='L2正则化')
+    parser.add_argument('--accum_steps', type=int, default=1,
+                        help='梯度累计步数')
     
     parser.add_argument('--output_dir', type=str, default='./results',
                         help='结果保存目录')

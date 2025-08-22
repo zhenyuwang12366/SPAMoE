@@ -10,6 +10,7 @@ OUTPUT_DIR="./results/distributed_seismic_moe"
 VIS_FREQ=5
 USE_WANDB=0
 VAL_RATIO=0.2
+ACCUM_STEPS=1
 
 TOP_K=1
 CHOOSE_EXPERTS=(0)
@@ -65,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     --weight_decay) WEIGHT_DECAY="$2"; shift 2 ;;
     --lr_warmup_epochs) LR_WARMUP="$2"; shift 2 ;;
     --scheduler_gamma) SCHEDULER_GAMMA="$2"; shift 2 ;;
+    --accum_steps) ACCUM_STEPS="$2"; shift 2 ;;
     *)
       echo "未知参数: $1"
       exit 1 ;;
@@ -107,6 +109,7 @@ echo "ResumePath: $RESUME_PATH"
 echo "WeightDecay: $WEIGHT_DECAY"
 echo "lr_warmup_epochs: $LR_WARMUP"
 echo "scheduler_gamma: $SCHEDULER_GAMMA"
+echo "accum_steps: $ACCUM_STEPS"
 # 启动分布式训练
 torchrun \
   --standalone \
@@ -143,7 +146,8 @@ torchrun \
   --weight_decay "$WEIGHT_DECAY" \
   --lr_warmup_epochs "$LR_WARMUP" \
   --scheduler_gamma "$SCHEDULER_GAMMA" \
-  
+  --accum_steps "$ACCUM_STEPS" \
+
   $WANDB_ARG
 
 echo "分布式训练完成！"
