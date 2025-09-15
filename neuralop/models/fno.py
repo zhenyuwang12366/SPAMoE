@@ -392,8 +392,8 @@ class FNO(BaseModel, name='FNO'):
             output_shape = [None]*(self.n_layers - 1) + [output_shape]
 
         # append spatial pos embedding if set
-        #如果positional_embedding不是None，则对数据的每个空间位置编码其物理位置
-        #常见的实现包括： 将(x, y) 网格坐标拼接到输入通道中使用GridEmbeddingND
+        # 如果positional_embedding不是None，则对数据的每个空间位置编码其物理位置
+        # 常见的实现包括： 将(x, y) 网格坐标拼接到输入通道中使用GridEmbeddingND
         # 或FourierFeatures 对位置做正弦编码
         if self.positional_embedding is not None:
             x = self.positional_embedding(x)

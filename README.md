@@ -3,7 +3,8 @@
 本指南详细介绍了如何使用、配置和修改seismic_moe代码，以便于处理地震数据的神经算子模型训练和推理。
 
 ## 目录
-0. [工作分配](#)
+
+0. [工作分配](#工作分配)
 1. [环境配置](#环境配置)
 2. [数据集格式](#数据集格式)
 3. [代码使用方法](#代码使用方法)
@@ -12,9 +13,10 @@
 6. [修改指南](#修改指南)
 7. [分布式训练](#分布式训练)
 8. [结果评估](#结果评估)
-9. [常见问题](#常见问题)
+9. [常见问题]
 
 ## 工作分配
+
 <a id="工作分配"></a>
 
 第一阶段: 单个专家模型性能测试, 特点分析
@@ -31,34 +33,63 @@
 
 第二阶段: 模型融合与数学方法(待定)
 
+文件命名协议
+normal(未细化):
+
+- 模型分为vel, fault, style三类
+- 命名约定：best\_expert\_{experts\_name}\_{i}\_{vel/fault/style}.pt
+  
+specific(细化)：
+
+- 模型分为curve_vel, curve_fault, flat_vel, flat_fault, style五类
+- 命名约定：best_expert_{experts_name}\_{i}\_{curve/flat/style}_{vel/fault/style}.pt
+
+新增功能以及相关参数
+
+In MOEOperator
+
+1. router_type —— adamv, 自适应专家数量选择
+2. fusion_type —— str, 输出融合模式，'linear'/'attention'/'swa', 新增强弱激活模式
+3. s_processor_type —— 强专家输出融合器种类 'linear'/'atten'/'mean'/'sum'
+4. w_processor_type —— 弱专家输出融合器种类
+5. beta —— 强弱激活参数，beta越大，弱激活影响越大
+6. is_specific —— 文件名命名协议选择
+7. is_classier —— 是否使用分组专家网络 GMoE
+
 ## 环境配置
+
 <a id="环境配置"></a>
 
 ### 系统要求
-- Python 3.7+
+
+- Python 3.10+
 - CUDA 10.2+ (推荐使用GPU进行训练)
 - 充足的存储空间用于数据集
 
 ### 安装步骤
 
 1. 克隆仓库并进入项目目录
+
 ```bash
 git clone https://github.com/GrinchWumath/FWINO.git
 cd neuraloperator
 ```
 
 2. 创建虚拟环境(可选)
+
 ```bash
 conda create -n seismic_moe python=3.8
 conda activate seismic_moe
 ```
 
 3. 安装依赖包
+
 ```bash
 pip install -r requirements.txt
 ```
 
 主要依赖包包括：
+
 - torch >= 1.10.0
 - numpy
 - matplotlib
@@ -67,9 +98,11 @@ pip install -r requirements.txt
 - wandb (可选，用于实验追踪)
 
 ## 数据集格式
+
 <a id="数据集格式"></a>
 
 ### 数据集结构
+
 seismic_moe代码支持处理地震数据集，其目录结构应如下：
 
 ```
@@ -105,6 +138,7 @@ data_dir/
 ### 自定义数据集
 
 如需使用自定义数据集，应确保：
+
 1. 遵循上述目录结构
 2. 数据格式为NumPy `.npy`文件
 3. 数据维度与上述描述一致
@@ -112,9 +146,11 @@ data_dir/
 如果数据格式不同，需要修改`neuralop/data/datasets/seismic_dataset.py`文件中的`_load_data`和`__getitem__`方法。
 
 ## 代码使用方法
+
 <a id="代码使用方法"></a>
 
 ### MoE架构训练
+
 当且仅当命令行中给出了 `--use_moe` `--use_experts_path` 且 `--top_k` > 1 且 `--choose_experts` 选择了多个专家，才会进行专家模型参数的冻结, 否则都是重新训练
 
 当单个专家模型训练好后, 将其放入一个专门的文件夹, 文件夹内, 四个专家四个pt文件, 将文件夹路径作为参数输入命令行
@@ -174,6 +210,7 @@ python scripts/evaluate_moe.py \
 ```
 
 ## 参数说明
+
 <a id="参数说明"></a>
 
 <!-- 设置跳转目标锚点 -->
@@ -210,6 +247,7 @@ python scripts/evaluate_moe.py \
 | `--lambda_g2v` | float | 1.0 | L2损失函数的加权系数 |
 | `--use_experts_path` | str | None | moe使用的专家模型存放路径 |
 | `--use_moe` | bool | False | 是否使用moe, 使用会冻结专家模型 |
+
 ---
 
 ### 配置文件参数 (config/seismic_moe_config.py)
@@ -241,6 +279,7 @@ python scripts/evaluate_moe.py \
 |  | seed | 42 | 随机种子 |
 
 ## 模型架构
+
 <a id="模型架构"></a>
 
 seismic_moe模型是基于混合专家神经算子（Mixture of Experts Neural Operator）架构，包含以下主要组件：
@@ -260,16 +299,19 @@ seismic_moe模型是基于混合专家神经算子（Mixture of Experts Neural O
 4. **Time-to-Space Projection（时间-空间转换）**: 将时间-偏移表示表示转换为空间表示，适用于输入为速度模型数据。
 
 ## 修改指南
+
 <a id="修改指南"></a>
 
 ### 修改网络架构
 
 1. **调整专家配置**:
+
 - 基本参数调整
     
     直接通过修改脚本中的命令参数来调整，详细参数设置可以参考上方<a href="#args-table">训练脚本参数表格</a>
 
     实例：
+
     ```bash
     bash scripts/run_distributed_seismic_moe.sh --num_gpus 2 --data_dir ../FWINO_data --family all --batch_size 1000 --epochs 100 --output_dir ../results/seismic_moe_${SLURM_JOB_NAME}_${SLURM_JOB_ID}  --top_k 2 --choose_experts 0 2 --MNO_n_scales 5
     ```
@@ -296,7 +338,7 @@ expert_configs = [
 ]
 ```
 
-2. **修改路由器**:
+1. **修改路由器**:
    调整`MOEOperator`初始化参数：
 
 ```python

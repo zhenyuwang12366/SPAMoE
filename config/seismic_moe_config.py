@@ -29,6 +29,7 @@ class SeismicMOEConfig(Default):
     noisy_gating = True  # 是否使用噪声门控
     fusion_type = 'linear'  # 专家输出融合方式
     router_hidden_dim = 256  # 路由器隐藏层维度
+    router_type = 'basic' # 路由形式 basic,adamv
     
     # 专家配置
     expert_configs = [
@@ -100,6 +101,24 @@ class SeismicMOEConfig(Default):
     early_stop_patience = 30
     early_stop_min_delta = 0.001
     early_stop_warmup_epochs = 10
+    
+    # v_type_id dict
+    type_id_specific = {
+        'curve_vel': 0,
+        'curve_fault': 1,
+        'flat_vel': 2,
+        'flat_fault': 3,
+        'style_style': 4,
+    }
+    type_id_normal = {
+        'vel': 0,
+        'fault': 1,
+        'style': 2,
+    }
+    type_id = {
+        'specific': type_id_specific,
+        'normal': type_id_normal,
+    }
     
     
     # 分布式训练配置

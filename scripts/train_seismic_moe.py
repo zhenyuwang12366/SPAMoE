@@ -22,13 +22,14 @@ import tqdm
 import matplotlib.pyplot as plt
 from pathlib import Path
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 import wandb
 from torch.utils.data import DataLoader, random_split, Subset, DistributedSampler
-import torchvision
 from torchvision.transforms import Compose
 import transforms as T
 import time
 import datetime
+from collections import defaultdict, OrderedDict
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -269,7 +270,7 @@ def _evaluate_one_epoch(
 
 
 def train_one_epoch(
-    *,
+    *args,
     model,
     optimizer,
     criterion,
@@ -305,7 +306,8 @@ def train_one_epoch(
     data_dict: Optional[dict] = None,
     # 其他工具
     metrics_module=None,
-    tqdm_module=None,                        # 传入 tqdm（避免在函数内硬依赖）
+    tqdm_module=None,   # 传入 tqdm（避免在函数内硬依赖）
+    **kwargs,
 ):
     """
     进行一个 epoch 的完整训练与验证，返回 (stats_dict, best_val_loss, stop_flag)
@@ -323,6 +325,12 @@ def train_one_epoch(
     optim_count = 0
     num_steps = len(train_loader)
     
+    # router type判断
+    router_type = model.module.router_type if hasattr(model, "module") else model.router_type
+    if "adamv" == router_type:
+        router = model.module.router if hasattr(model, "module") else model.router
+        assert hasattr(router, "step_validation"), "adamv router must impl. function step_validation"
+    
     # DDP 判断
     is_ddp = hasattr(model, "no_sync")
 
@@ -333,6 +341,8 @@ def train_one_epoch(
  
     optimizer.zero_grad(set_to_none=True)
 
+    val_loss = float("inf")
+    
     pbar_iter = train_loader
     if tqdm is not None:
         pbar_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs}", leave=False, disable=not is_logger)
@@ -345,9 +355,10 @@ def train_one_epoch(
         sync_ctx = (model.no_sync() if (is_ddp and not last_micro) else nullcontext())
 
         with sync_ctx:
-            preds = model(inputs)
+            preds, aux_loss = model(inputs)
             loss_tuple = criterion(preds, targets)
             loss = loss_tuple[0] if isinstance(loss_tuple, (tuple, list)) else loss_tuple
+            loss += aux_loss
             # —— 核心：为梯度累计缩放 loss，保证等效大 batch ——
             loss = loss / accum_steps
             loss.backward()
@@ -373,7 +384,29 @@ def train_one_epoch(
     # —— 验证 —— #
     val_stats = _evaluate_one_epoch(model, val_loader, device, criterion, metrics_module)
     val_loss = val_stats["val_loss"]
-
+    if router_type == 'adamv':
+        signal = router.step_validation(val_loss)
+        # 多进程之间同步信号
+        if is_ddp:
+            signal = torch.tensor([1 if signal == "should_break" else 0]
+                                  , device=device, dtype=torch.int64) # bool信号常用int64
+            dist.all_reduce(signal, op=dist.ReduceOp.MAX)
+            should_break = bool(signal.item())
+        else:
+            should_break = (signal == "should_break")
+        
+        if should_break:
+            router.k = max(1, router.k - 1)
+            router.fixed = True
+            
+            if is_ddp:
+                k_tensor = torch.tensor([router.k], device=device)
+                dist.broadcast(k_tensor, src=0) # broadcast包含同步原语
+                router.k = int(k_tensor.item())
+        
+            if is_logger:
+                print(f'epoch: {epoch} AES probe failed -> fix top_k = {router.k}')
+                    
     # —— 日志输出 & WandB —— #
     if is_logger and log_file is not None:
         with open(log_file, "a") as f:
@@ -595,6 +628,11 @@ def run_training(args):
     # LNO config setting
     config.expert_configs[3]['n_modes'] = tuple(args.LNO_n_modes)
     config.expert_configs[3]['n_layers'] = args.LNO_n_layers
+    
+    print(f'FNO:n_modes_height:{config.expert_configs[0]["n_modes_height"]}')
+    print(f'FNO:n_modes_width:{config.expert_configs[0]["n_modes_width"]}')
+    print(f'FNO:n_layers:{config.expert_configs[0]["n_layers"]}')
+    
     # 设置专家数
     config.top_k = args.top_k
     # 选择专家，这里后面的config.expert_configs就是config文件中所创建的字典列表，
@@ -602,9 +640,7 @@ def run_training(args):
     #config.expert_configs列表中
     config.expert_configs = [config.expert_configs[i] for i in args.choose_experts]
     #这里的config.expert_configs就是seismic_moe_config中的“字典列表”，关于“字典列表”结构的解释详见OneNote3
-    print(f'FNO:n_modes_height:{config.expert_configs[0]["n_modes_height"]}')
-    print(f'FNO:n_modes_width:{config.expert_configs[0]["n_modes_width"]}')
-    print(f'FNO:n_layers:{config.expert_configs[0]["n_layers"]}')
+    
     # 训练moe架构
          #下面两段代码的解释见OneNote2,意义是：
          # 在使用 Mixture of Experts 模型时，如果用户已经训练并保存了若干个“专家模型”（模型文件保存在某个文件夹中），那么这两段代码就是要：
@@ -638,6 +674,9 @@ def run_training(args):
     # 设置损失函数加权系数
     config.lambda_g1v = args.lambda_g1v
     config.lambda_g2v = args.lambda_g2v
+    
+    # 设置路由形式
+    config.router_type = args.router_type
     
     #-------------- 设置完毕 -----------#
     # 创建完整数据集
@@ -799,12 +838,16 @@ def run_training(args):
             if 'in_channels' in expert_config and expert_config['in_channels'] != in_channels:
                 print(f"警告：专家 {i+1} 的输入通道数 {expert_config['in_channels']} 与实际输入通道数 {in_channels} 不匹配")
     
-    if config.use_moe:
+    if config.use_moe and config.use_experts_path:
         experts = load_moe_experts(
             expert_configs=config.expert_configs,
             in_channels=config.in_channels,
             out_channels=config.out_channels,
-            hidden_channels=config.hidden_channels
+            hidden_channels=config.hidden_channels,
+            model_path=config.use_experts_path,
+            is_specific=False,
+            map_location=device,
+            type_dict=config.type_id
         )
     else:
         # 创建专家模型
@@ -815,24 +858,32 @@ def run_training(args):
             hidden_channels=config.hidden_channels
         )
     
-        # 创建MOE模型
-        model = MOEOperator(
-            experts=experts,
-            in_channels=config.in_channels,
-            out_channels=config.out_channels,
-            hidden_channels=config.hidden_channels,
-            top_k=config.top_k,
-            noisy_gating=config.noisy_gating,
-            fusion_type=config.fusion_type,
-            router_hidden_dim=config.router_hidden_dim,
-            is_logger=is_logger
-        )
+    # 创建MOE模型
+    model = MOEOperator(
+        experts=experts,
+        in_channels=config.in_channels,
+        out_channels=config.out_channels,
+        hidden_channels=config.hidden_channels,
+        top_k=config.top_k,
+        noisy_gating=config.noisy_gating,
+        fusion_type=config.fusion_type,
+        router_hidden_dim=config.router_hidden_dim,
+        is_logger=is_logger,
+        router_type=config.router_type,
+        use_SWA = False,
+        s_processor_type = 'sum',
+        w_processor_type = 'sum',
+        beta = 0.5,
+        is_specific = False,
+        is_classier = False,
+    )
     
     # 移动模型到设备
     model = model.to(device)
     
     # 使用分布式数据并行
     if config.distributed.use_distributed:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         model = DDP(
             model, device_ids=[device.index], 
             output_device=device.index, 
@@ -840,7 +891,7 @@ def run_training(args):
             find_unused_parameters=True,
             gradient_as_bucket_view=True,
         )
-        
+ 
     # Scale lr according to effective batch size
     if config.distributed.use_distributed and world_size > 2:
         lr = config.learning_rate * math.sqrt(world_size)
@@ -1409,53 +1460,200 @@ def run_inference(args):
     
     print(f"推理完成！结果保存在: {results_dir}")
 
-def load_moe_experts(
-    expert_configs: List[Dict[str, Any]],
+def get_expert_dict(full_sd, i: int=0, ddp_prefix='module.'):
+    def strip_dp(k):
+        return k[len(ddp_prefix):] if k.startswith(ddp_prefix) else k
+    
+    sub: Dict[str, torch.Tensor] = {}
+    prefix = f'experts.{i}'
+    for k, v in full_sd.items():
+        k2 = strip_dp(k)
+        if k2.startswith(prefix):
+            sub[k2[len(prefix):]] = v
+    
+    if not sub:
+        # 回退
+        sub = {strip_dp(k): v for k, v in full_sd.items()}
+    return sub
+
+def load_factory(
+    experts_config: List[Dict[str, Any]],
     in_channels: int,
     out_channels: int,
     hidden_channels: int,
-    model_path: str
-    ) -> List[nn.Module]:
+    model_dict: OrderedDict,
+) -> List[nn.Module]: 
+    """专家融合工厂
+
+    Args:
+        experts_config (List[Dict[str, Any]]): 专家配置字典
+        model_dict (Dict): 专家模型参数字典, experts_type == 'math' 
+        --> Dict[expert_id, List[Dict[v_type_id, sd]]]
+
+    Returns:
+        List[nn.Module]: 返回专家模型列表
     """
-    从 model_path 文件夹中加载所有专家模型，每个模型一个 .pt 文件。
     
-    参数：
-    - expert_configs: List[Dict[str, Any]],
-    - in_channels: int,
-    - out_channels: int,
-    - hidden_channels: int,
-    - model_path: 包含多个专家模型 .pth 文件的目录路径
+    experts: List[nn.Module] = []
     
-    返回：
-    - experts: List[nn.Module]
+    for k, v in model_dict.items():
+        # k: expert_id
+        # v: List[Dict[v_type_id, sd]]
+        try:
+            expert_id = int(k)
+        except Exception:
+            raise ValueError(f"expert_id 非整数: {k}")
+        
+        if not (0 <= expert_id < len(experts_config)):
+            raise IndexError(f"experts_config 下标越界: {expert_id}")
+        
+        expert_config = experts_config[expert_id]
+        
+        # 按v_type升序排列
+        try:
+            sorted_dict_list = sorted(
+            v,
+            key = lambda d: next(iter(d.keys())),
+        )
+        except Exception as e:
+            raise RuntimeError(f"对 v_type 列表排序失败 (可能有 None 键): {e}")
+        
+        for type_expert_sd in sorted_dict_list:
+            v_type_id, expert_sd = next(iter(type_expert_sd.items()))
+            
+            # 创建专家骨架
+            expert_raw_model = ExpertFactory.create_expert_ensemble(
+                [expert_config],
+                in_channels,
+                out_channels,
+                hidden_channels,
+            )[0]
+            
+            # 加载权重
+            missing, unexpected = expert_raw_model.load_state_dict(expert_sd, strict=False)
+            if missing or unexpected:
+                print(f"[expert {expert_id}] missing: {missing}, unexpected: {unexpected}")
+
+            # 冻结
+            for p in expert_raw_model.parameters():
+                p.requires_grad = False
+            expert_raw_model.eval()
+            
+            experts.append(expert_raw_model)
+            
+    return experts # [FNO0, FNO1, FNO2, FNO3, FNO4, WNO0,...., MNO4,..., LNO4]
+
+_SPECIFIC_PAT = re.compile(
+    r'best_expert_(?P<name>\w+)_(?P<i>\d+)_(?P<shape>\w+)_(?P<label>\w+)\.pt$'
+)
+_NORMAL_PAT = re.compile(
+    r'best_expert_(?P<name>\w+)_(?P<i>\d+)_(?P<label>\w+)\.pt$'
+)
+def load_moe_experts(
+    experts_config: List[Dict[str, Any]],
+    in_channels: int,
+    out_channels: int,
+    hidden_channels: int,
+    model_path: str,
+    is_specific: bool,
+    map_location,
+    type_dict: Dict[str, Dict[str, int]],
+) -> List[nn.Module]:
+    """读取融合专家参数
+
+    Args:
+        model_path (str): 专家保存的文件路径,
+            保存的文件名：不细化版本: best_expert_{experts_name}_{i}_{vel/fault/style}.pt\
+                        细化版本: best_expert_{experts_name}_{i}_{curve/flat/style}_{vel/fault/style}.pt
+            
+            按math分成FNO, WNO, MNO, LNO四类，每类有多种速度图类型, 直接读取, 每类以\
+            
+        is_specific (bool): 速度图是否细分
+        
+    Returns:
+        experts (List[nn.Module]): 输出专家列表
     """
     if not os.path.isdir(model_path):
-        raise ValueError(f"{model_path} 不是有效的目录路径")
-
-    # 获取所有 .pt 文件，best_expert_{experts_name}_{i}.pt
-    expert_files = sorted([
-        f for f in os.listdir(model_path)
-        if f.split('_')[1] == 'expert' and f.endswith('.pt')
-    ], key=lambda x : x.split('_')[-1].split('.')[0])
-
-    experts = []
-    new_experts = ExpertFactory.create_expert_ensemble(
-            expert_configs=expert_configs,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            hidden_channels=hidden_channels
-        )
-    for i, file_name in enumerate(expert_files):
-        full_path = os.path.join(model_path, file_name)
-        state_dict = torch.load(full_path, map_location='cpu')
-        expert = new_experts[i]
-        expert.load_state_dict(state_dict)
-        for param in expert.parameters():
-            param.requires_grad = False
-        experts.append(expert)
-
-    return experts
+        raise ValueError(f"{model_path}不是有效路径")
     
+    # 只取 .pt
+    experts_file = [f for f in os.listdir(model_path) if f.endswith('.pt')]
+    
+    # 组装: expert_id -> List[{v_type_id: sd}]
+    grouped: Dict[str, List[Dict[int, Dict[str, torch.Tensor]]]] = defaultdict(list) #Dict[str(type), list]
+    
+    if(is_specific):
+        id_map = type_dict.get('specific', {})
+        # 获取所有.pt文件, best_expert_{experts_name}_{i}_{curve/flat/style}_{vel/fault/style}.pt
+        for f in experts_file:
+            m = _SPECIFIC_PAT.match(f)
+            if not m:
+                # 兼容 split 解析
+                parts = f.split('_')
+                if len(parts) >= 6 and parts[0] == 'best' and parts[1] == 'expert':
+                    expert_id = parts[3]
+                    shape = parts[4]
+                    label = parts[5].split('.')[0]
+                else:
+                    print(f"[WARN] 文件名不匹配 specific 模式, 跳过: {f}")
+                    continue
+            else:
+                expert_id = m.group('i')
+                shape = m.group('shape')
+                label = m.group('label')
+            
+            key = f"{shape}_{label}"
+            if key not in id_map:
+                print(f"[WARN] specific 类型映射缺失 {key}, 跳过: {f}")
+                continue
+            v_type = id_map[key]
+            
+            ckpt = torch.load(os.path.join(model_path, f), map_location=map_location)
+            full_sd = ckpt.get('state_dict', ckpt.get('model_state_dict', ckpt))
+            expert_sd = get_expert_dict(full_sd, i=0)
+            grouped[expert_id].append({v_type: expert_sd})            
+    else:
+        id_map = type_dict.get('normal', {})
+        for f in experts_file:
+            m = _NORMAL_PAT.match(f)
+            if not m:
+                # 兼容 split 解析（宽松）
+                parts = f.split('_')
+                if len(parts) >= 5 and parts[0] == 'best' and parts[1] == 'expert':
+                    expert_id = parts[3]
+                    label = parts[4].split('.')[0]
+                else:
+                    print(f"[WARN] 文件名不匹配 normal 模式，跳过：{f}")
+                    continue
+            else:
+                expert_id = m.group('i')
+                label = m.group('label')
+
+            if label not in id_map:
+                print(f"[WARN] normal 类型映射缺失 {label}，跳过：{f}")
+                continue
+            v_type = id_map[label]
+
+            ckpt = torch.load(os.path.join(model_path, f), map_location=map_location)
+            full_sd = ckpt.get('state_dict', ckpt.get('model_state_dict', ckpt))
+            expert_sd = get_expert_dict(full_sd, i=0)
+            grouped[expert_id].append({v_type: expert_sd}) # [FNO(3), WNO(3), MNO(3), LNO(3)]
+    
+    # 对 expert_id 做数字序排序, 保证顺序稳定  
+    try:
+        ordered = OrderedDict(sorted(grouped.items(), key=lambda kv: int(kv[0])))
+    except Exception:
+        ordered = OrderedDict(sorted(grouped.items(), key=lambda kv: kv[0]))
+    
+    loaded_experts = load_factory(
+        experts_config,
+        in_channels,
+        out_channels,
+        hidden_channels,
+        ordered, 
+    )
+    
+    return loaded_experts
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="地震数据MOE训练和推理")
