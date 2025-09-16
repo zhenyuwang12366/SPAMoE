@@ -30,6 +30,11 @@ class SeismicMOEConfig(Default):
     fusion_type = 'linear'  # 专家输出融合方式
     router_hidden_dim = 256  # 路由器隐藏层维度
     router_type = 'basic' # 路由形式 basic,adamv
+    s_processor_type = 'linear'
+    w_processor_type = 'linear'
+    beta = 0.5
+    is_specific = False
+    is_classier = False
     
     # 专家配置
     expert_configs = [

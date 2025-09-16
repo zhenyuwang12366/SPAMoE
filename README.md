@@ -48,7 +48,7 @@ specific(细化)：
 
 In MOEOperator
 
-1. router_type —— adamv, 自适应专家数量选择
+1. router_type —— adamv, 自适应专家数量选择 'basic'/'adamv'
 2. fusion_type —— str, 输出融合模式，'linear'/'attention'/'swa', 新增强弱激活模式
 3. s_processor_type —— 强专家输出融合器种类 'linear'/'atten'/'mean'/'sum'
 4. w_processor_type —— 弱专家输出融合器种类

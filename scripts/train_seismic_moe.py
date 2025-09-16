@@ -590,6 +590,7 @@ def run_training(args):
         config.scheduler_gamma = args.scheduler_gamma
     if args.accum_steps is not None:
         config.accum_steps = args.accum_steps
+  
     accum_steps = config.accum_steps
     use_amp = config.use_amp
     
@@ -676,7 +677,30 @@ def run_training(args):
     config.lambda_g2v = args.lambda_g2v
     
     # 设置路由形式
-    config.router_type = args.router_type
+    if args.router_type:
+        config.router_type = args.router_type
+    
+    # 设置专家组间融合方式
+    if args.fusion_type:
+        config.fusion_type = args.fusion_type
+    
+    # 设置强弱专家组内融合方式
+    if args.s_processor_type:
+        config.s_processor_type = args.s_processor_type
+    if args.w_processor_type:
+        config.w_processor_type = args.w_processor_type
+        
+    # 设置强弱激活参数
+    if args.beta:
+        config.beta = args.beta
+    
+    # 设置细化种类
+    if args.is_specific:
+        config.is_specific = args.is_specific
+    
+    # 设置是否使用分组专家网络
+    if args.is_classier:
+        config.is_classier = args.is_classier
     
     #-------------- 设置完毕 -----------#
     # 创建完整数据集
@@ -870,12 +894,11 @@ def run_training(args):
         router_hidden_dim=config.router_hidden_dim,
         is_logger=is_logger,
         router_type=config.router_type,
-        use_SWA = False,
-        s_processor_type = 'sum',
-        w_processor_type = 'sum',
-        beta = 0.5,
-        is_specific = False,
-        is_classier = False,
+        s_processor_type = config.s_processor_type,
+        w_processor_type = config.w_processor_type,
+        beta = config.beta,
+        is_specific = config.is_specific,
+        is_classier = config.is_classier,
     )
     
     # 移动模型到设备
@@ -1696,12 +1719,14 @@ if __name__ == '__main__':
                         help='是否使用WandB记录训练过程')
     parser.add_argument('--val_ratio', type=float, default=0.2,
                         help='验证集比例，默认为0.2（20%）')
+    
     parser.add_argument('--k', type=int, default=1,
                         help='预处理缩放比例')
     parser.add_argument('--top_k', type=int, default=1,
                         help='选择前k个专家')
     parser.add_argument('--choose_experts',nargs='+', type=int, default=[0],
                         help='专家选择, FNO:0, WNO:1, MNO:2, LNO:3')
+    
     parser.add_argument('--FNO_n_modes_height', type=int, default=16,
                         help='高度傅里叶变换后保留的模态数量')
     parser.add_argument('--FNO_n_modes_width', type=int, default=16,
@@ -1722,16 +1747,34 @@ if __name__ == '__main__':
                         help='局部变换后保留的模态数量')
     parser.add_argument('--LNO_n_layers', type=int, default=3,
                         help='每个尺度使用的神经网络层数')
+    
+    # MoE融合参数配置
     parser.add_argument('--use_experts_path', type=str, default=None,
                         help='moe使用的专家模型存放路径')
     parser.add_argument('--use_moe', action='store_true',
                         help='是否使用moe, 使用会冻结专家模型')
+    parser.add_argument('--router_type', type=str, default='basic',
+                        help='路由器类型: \'basic\'/\'adamv\'')
+    parser.add_argument('--fusion_type', type=str, default='linear',
+                        help='专家组间融合方式: \'linear\'/\'attention\'/\'swa\'')
+    parser.add_argument('--s_processor_type', type=str, default='linear',
+                        help='强专家组内融合方式: \'linear\'/\'atten\'/\'mean\'/\'sum\'')
+    parser.add_argument('--w_processor_type', type=str, default='linear',
+                        help='弱专家组内融合方式: \'linear\'/\'atten\'/\'mean\'/\'sum\'')
+    parser.add_argument('--beta', type=float, default=0.5,
+                        help='强弱激活参数，beta越大，弱激活影响越大')
+    parser.add_argument('--is_specific', action='store_true',
+                        help='是否细化种类')
+    parser.add_argument('--is_classier', action='store_true',
+                        help='是否使用分组专家网络')
+    
     parser.add_argument('--hidden_channels', type=int, default=128,
                         help='隐藏通道数（默认值由配置文件决定，可通过此参数覆盖）')
     parser.add_argument('--learning_rate', type=float, default=1e-4,
                         help='学习率（默认值由配置文件决定，可通过此参数覆盖）')
     parser.add_argument('--resume_path', type=str, default=None,
                         help='恢复训练的checkpoint路径，如 best_model_xxx.pt')
+    
     # Loss related
     parser.add_argument('-g1v', '--lambda_g1v', type=float, default=1.0)
     parser.add_argument('-g2v', '--lambda_g2v', type=float, default=1.0)
