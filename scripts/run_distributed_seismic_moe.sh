@@ -35,8 +35,15 @@ CHOOSE_EXPERTS=(0)
 FNO_H=16
 FNO_W=16
 FNO_N_LAYERS=8
+
 WNO_H=2
 WNO_W=2
+# —— WNO 结构新增 ——
+WNO_N_LAYERS=4
+WNO_BLOCK_N_LAYERS=2
+WNO_DROPOUT_RATE=0.1
+WAVELET_TYPE="haar"   # haar | db4
+
 MNO_SCALES=3
 MNO_FACTORS=(1.0 0.5 0.25)
 MNO_LAYERS=3
@@ -55,9 +62,12 @@ BETA=0.5
 IS_SPECIFIC=0                   # flag -> --is_specific
 IS_CLASSIER=0                   # flag -> --is_classier
 
-# 推理相关
+# 推理/恢复
 MODEL_PATH=""                   # inference 时常用
 RESUME_PATH="./results/distributed_seismic_moe"
+
+# 性能统计
+PROFILE_TIMING=0                # flag -> --profile_timing
 
 # ================================
 # 解析命令行参数
@@ -94,8 +104,14 @@ while [[ $# -gt 0 ]]; do
     --FNO_n_modes_height) FNO_H="$2"; shift 2 ;;
     --FNO_n_modes_width) FNO_W="$2"; shift 2 ;;
     --FNO_n_layers) FNO_N_LAYERS="$2"; shift 2 ;;
+
     --WNO_n_levels_height) WNO_H="$2"; shift 2 ;;
     --WNO_n_levels_width) WNO_W="$2"; shift 2 ;;
+    --WNO_n_layers) WNO_N_LAYERS="$2"; shift 2 ;;
+    --WNO_block_n_layers) WNO_BLOCK_N_LAYERS="$2"; shift 2 ;;
+    --WNO_dropout_rate) WNO_DROPOUT_RATE="$2"; shift 2 ;;
+    --wavelet_type) WAVELET_TYPE="$2"; shift 2 ;;
+
     --MNO_n_scales) MNO_SCALES="$2"; shift 2 ;;
     --MNO_scale_factors) shift; MNO_FACTORS=(); while [[ $# -gt 0 && $1 != --* ]]; do MNO_FACTORS+=("$1"); shift; done ;;
     --MNO_n_layers) MNO_LAYERS="$2"; shift 2 ;;
@@ -115,6 +131,8 @@ while [[ $# -gt 0 ]]; do
 
     --model_path) MODEL_PATH="$2"; shift 2 ;;
     --resume_path) RESUME_PATH="$2"; shift 2 ;;
+
+    --profile_timing) PROFILE_TIMING=1; shift ;;
 
     *)
       echo "未知参数: $1"
@@ -173,6 +191,7 @@ echo "Top-K 专家数: $TOP_K"
 echo "专家选择: ${CHOOSE_EXPERTS[*]}"
 echo "FNO(H,W,layers): ($FNO_H, $FNO_W, $FNO_N_LAYERS)"
 echo "WNO(levels H,W): ($WNO_H, $WNO_W)"
+echo "WNO(n_layers, block_layers, dropout, wavelet): ($WNO_N_LAYERS, $WNO_BLOCK_N_LAYERS, $WNO_DROPOUT_RATE, $WAVELET_TYPE)"
 echo "MNO(scales,layers,factors): ($MNO_SCALES, $MNO_LAYERS, ${MNO_FACTORS[*]})"
 echo "LNO(modes H W, layers): (${LNO_MODES[*]}, $LNO_LAYERS)"
 echo "Hidden Channels: $HIDDEN_CHANNELS"
@@ -186,6 +205,7 @@ echo "Beta(强弱激活): $BETA"
 echo "is_specific: $IS_SPECIFIC, is_classier: $IS_CLASSIER"
 echo "Model Path(仅 inference 用): ${MODEL_PATH:-<None>}"
 echo "ResumePath: $RESUME_PATH"
+echo "Profile Timing: $PROFILE_TIMING"
 
 # ================================
 # 启动 torchrun
@@ -214,6 +234,10 @@ ARGS=(
   --FNO_n_layers "$FNO_N_LAYERS"
   --WNO_n_levels_height "$WNO_H"
   --WNO_n_levels_width "$WNO_W"
+  --WNO_n_layers "$WNO_N_LAYERS"
+  --WNO_block_n_layers "$WNO_BLOCK_N_LAYERS"
+  --WNO_dropout_rate "$WNO_DROPOUT_RATE"
+  --wavelet_type "$WAVELET_TYPE"
   --MNO_n_scales "$MNO_SCALES"
   --MNO_scale_factors "${MNO_FACTORS[@]}"
   --MNO_n_layers "$MNO_LAYERS"
@@ -242,6 +266,7 @@ ARGS=(
 [[ "$USE_MOE" -eq 1 ]]     && ARGS+=( --use_moe )
 [[ "$IS_SPECIFIC" -eq 1 ]] && ARGS+=( --is_specific )
 [[ "$IS_CLASSIER" -eq 1 ]] && ARGS+=( --is_classier )
+[[ "$PROFILE_TIMING" -eq 1 ]] && ARGS+=( --profile_timing )
 
 # 可选路径参数（非空才追加）
 [[ -n "$USE_EXPERTS_PATH" ]] && ARGS+=( --use_experts_path "$USE_EXPERTS_PATH" )
