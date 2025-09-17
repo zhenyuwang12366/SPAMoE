@@ -865,7 +865,7 @@ def _evaluate_one_epoch(
         inputs  = batch['input'].to(device, non_blocking=True)
         targets = batch['output'].to(device, non_blocking=True)
 
-        preds = model(inputs)
+        preds, aux_loss = model(inputs)
 
         # 兼容 criterion 返回 (loss, loss_g1v, loss_g2v)
         loss_tuple = criterion(preds, targets)
@@ -901,6 +901,8 @@ def train_one_epoch(
     is_logger: bool,
     log_file: Optional[str],
     results_dir,
+    # MoE负载均衡因子
+    coef: float = 0.01,
     # 学习率调度器
     lr_scheduler=None,
     scheduler_step_mode: str = "per_step",   # "per_step" 或 "per_epoch"
@@ -978,7 +980,7 @@ def train_one_epoch(
             preds, aux_loss = model(inputs)
             loss_tuple = criterion(preds, targets)
             loss = loss_tuple[0] if isinstance(loss_tuple, (tuple, list)) else loss_tuple
-            loss += aux_loss
+            loss += coef * aux_loss
             # —— 核心：为梯度累计缩放 loss，保证等效大 batch ——
             loss = loss / accum_steps
             loss.backward()
@@ -1077,6 +1079,7 @@ def train_one_epoch(
         print(f"  PSNR: {val_stats['psnr']:.2f} dB")
         print(f"  MSE : {val_stats['mse']:.6f}")
         print(f"  MAE : {val_stats['mae']:.6f}")
+        print(f"  AuxLoss : {aux_loss:.2f}")
 
     # —— 可视化（仅主进程 & 触发时）—— #
     if is_logger and vis_now and visualize_results is not None:
@@ -1084,7 +1087,7 @@ def train_one_epoch(
         inputs = vis_batch['input'].to(device, non_blocking=True)
         targets = vis_batch['output'].to(device, non_blocking=True)
         with torch.no_grad():
-            preds = model(inputs)
+            preds, _ = model(inputs)
 
         if input_inverse_transform is not None:
             inputs_v = input_inverse_transform(inputs)
