@@ -4,6 +4,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from typing import Dict, List, Tuple, Union, Optional
+import re
+from pathlib import Path
 
 class SeismicDataset(Dataset):
     """
@@ -17,6 +19,8 @@ class SeismicDataset(Dataset):
         数据目录路径
     family : str
         数据集系列，可选 'vel', 'style', 'fault' 或 'all'
+    is_specific : bool
+        是否细化分类, 细化后: 'curve_vel', 'flat_vel', 'curve_fault', 'flat_fault', 'style_style'
     split : str
         数据集分割，可选 'train' 或 'test'
     """
@@ -24,6 +28,7 @@ class SeismicDataset(Dataset):
         self,
         data_dir: str,
         family: str = 'all',
+        is_specific: bool = False,
         split: str = 'train',
     ):
         self.data_dir = data_dir
@@ -34,11 +39,15 @@ class SeismicDataset(Dataset):
         self.output_tensors = []
         
         # 验证参数
-        if self.family not in ['vel', 'style', 'fault', 'all']:
-            raise ValueError(f"不支持的数据集系列: {self.family}")
+        if not is_specific:
+            if self.family not in ['vel', 'style', 'fault', 'all']:
+                raise ValueError(f"不支持的数据集系列: {self.family}")
+        else:
+            if self.family not in ['curve_vel', 'flat_vel', 'curve_fault', 'flat_fault', 'style_style']:
+                raise ValueError(f"不支持的数据集系列: {self.family}")
+            
         if self.split not in ['train', 'test']:
             raise ValueError(f"不支持的数据集分割: {self.split}")
-            
         # 加载数据
         self._load_data()
         
@@ -73,94 +82,115 @@ class SeismicDataset(Dataset):
                 print(f"读取第{i}个文件失败: {e}")
                 
     def _load_data(self):
-        """加载数据文件路径"""
+        """
+        加载数据文件路径  
+        """
         self.input_files = []
         self.output_files = []
-        
-        if self.split == 'train': 
+
+        def want_family(group: str, variant: str | None) -> bool:
+            """根据 family / is_specific 判定是否保留该目录"""
+            if not getattr(self, 'is_specific', False):
+                if self.family == 'all':
+                    return True
+                return self.family == group
+            else:
+                if group == 'style':
+                    return self.family == 'style_style'
+                if variant is None:
+                    return False
+                return self.family == f"{variant}_{group}"
+
+        if self.split == 'train':
             train_dir = os.path.join(self.data_dir, 'train_samples')
-            
-            # 获取所有子目录
-            subdirs = [d for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))]
-            
-            for subdir in subdirs:
-                subdir_path = os.path.join(train_dir, subdir)
-                
-                # 检查是否是以Fault_A或Fault_B结尾的目录
-                if subdir.endswith("Fault_A") or subdir.endswith("Fault_B"):
-                    if self.family in ['fault', 'all']:
-                        # 处理Fault系列数据
-                        fault_seis_files = sorted(glob.glob(os.path.join(subdir_path, 'seis_*.npy')))
-                        
-                        # 生成对应的速度图文件路径
-                        for seis_file in fault_seis_files:
-                            # 从seis_{n}_1_{i}.npy格式提取n和i
-                            base_name = os.path.basename(seis_file)
-                            parts = base_name.split('_')
-                            if len(parts) >= 4:
-                                n = parts[1]
-                                i = parts[3].split('.')[0]
-                                vel_file = os.path.join(subdir_path, f"vel_{n}_1_{i}.npy")
-                                if os.path.exists(vel_file):
-                                    # 注意：这里vel_file是输出，seis_file是输入
-                                    self.input_files.append(seis_file)
-                                    self.output_files.append(vel_file)
-                elif subdir.endswith("Vel_A") or subdir.endswith("Vel_B"):
-                    # 处理vel目录，这些目录有data和model子目录
-                    if self.family in ['vel' , 'all']:
-                        data_dir = os.path.join(subdir_path, 'data')
-                        model_dir = os.path.join(subdir_path, 'model')
-                        
-                        if os.path.exists(data_dir) and os.path.exists(model_dir):
-                            # 获取所有数据文件
-                            data_files = sorted(glob.glob(os.path.join(data_dir, '*.npy')))
-                            
-                            for data_file in data_files:
-                                # 从data{i}.npy提取i
-                                base_name = os.path.basename(data_file)
-                                parts = base_name.split('.')
-                                if len(parts) >= 2:
-                                    file_num = parts[0].replace('data', '')
-                                    model_file = os.path.join(model_dir, f"model{file_num}.npy")
-                                    
-                                    if os.path.exists(model_file):
-                                        # 注意：这里model_file是输出，data_file是输入
-                                        self.input_files.append(data_file)
-                                        self.output_files.append(model_file)
+            if not os.path.isdir(train_dir):
+                raise RuntimeError(f"训练目录不存在: {train_dir}")
+
+            subdirs = [d for d in os.listdir(train_dir)
+                    if os.path.isdir(os.path.join(train_dir, d))]
+
+            for sub in sorted(subdirs):
+                sub_path = os.path.join(train_dir, sub)
+
+                # 目录名到 (group, variant) 的判定
+                group = None
+                variant = None
+                if sub.startswith("CurveFault_"):
+                    group, variant = 'fault', 'curve'
+                elif sub.startswith("FlatFault_"):
+                    group, variant = 'fault', 'flat'
+                elif sub.startswith("FlatVel_"):
+                    group, variant = 'vel', 'flat'     
+                elif sub.startswith("Style_"):
+                    group, variant = 'style', None
+                elif sub.startswith("CurveVel_"):
+                    group, variant = 'vel', 'curve'
                 else:
-                    # 处理style目录，这些目录有data和model子目录
-                    if self.family in ['style' , 'all']:
-                        data_dir = os.path.join(subdir_path, 'data')
-                        model_dir = os.path.join(subdir_path, 'model')
-                        
-                        if os.path.exists(data_dir) and os.path.exists(model_dir):
-                            # 获取所有数据文件
-                            data_files = sorted(glob.glob(os.path.join(data_dir, '*.npy')))
-                            
-                            for data_file in data_files:
-                                # 从data{i}.npy提取i
-                                base_name = os.path.basename(data_file)
-                                parts = base_name.split('.')
-                                if len(parts) >= 2:
-                                    file_num = parts[0].replace('data', '')
-                                    model_file = os.path.join(model_dir, f"model{file_num}.npy")
-                                    
-                                    if os.path.exists(model_file):
-                                        # 注意：这里model_file是输出，data_file是输入
-                                        self.input_files.append(data_file)
-                                        self.output_files.append(model_file)
-        else:  # test
+                    # 未知命名，跳过（也可选择 raise）
+                    continue
+
+                if not want_family(group, variant):
+                    continue
+
+                if group == 'fault':
+                    # Fault：同目录下 seis_?{n}_1_{i}.npy ↔ vel_{n}_1_{i}.npy
+                    pattern = re.compile(r"seis_?(\d+)_1_(\d+)\.npy")
+                    seis_files = sorted(glob.glob(os.path.join(sub_path, 'seis*.npy')))
+                    for seis_file in seis_files:
+                        stem = Path(seis_file).name
+                        m = pattern.fullmatch(stem)
+                        if m:
+                            n = int(m.group(1))
+                            i = int(m.group(2))
+                        else:
+                            print(f"{stem} 跳过")
+                            continue
+                        try:
+                            vel_file = os.path.join(sub_path, f"vel_{n}_1_{i}.npy")
+                        except Exception:
+                            vel_file = os.path.join(sub_path, f"vel{n}_1_{i}.npy")
+                        if os.path.exists(vel_file):
+                            self.input_files.append(seis_file)   # 输入：seis
+                            self.output_files.append(vel_file)   # 输出：vel
+
+                elif group in ('vel', 'style'):
+                    # Vel/Style：data/{data{i}.npy} ↔ model/{model{i}.npy}
+                    data_dir = os.path.join(sub_path, 'data')
+                    model_dir = os.path.join(sub_path, 'model')
+                    if not (os.path.isdir(data_dir) and os.path.isdir(model_dir)):
+                        continue
+
+                    data_files = sorted(glob.glob(os.path.join(data_dir, '*.npy')))
+                    for data_file in data_files:
+                        base = os.path.basename(data_file)   # data{i}.npy
+                        stem, _ = os.path.splitext(base)
+                        if not stem.startswith('data'):
+                            continue
+                        idx = stem.replace('data', '')
+                        model_file = os.path.join(model_dir, f"model{idx}.npy")
+                        if os.path.exists(model_file):
+                            self.input_files.append(data_file)   # 输入：data
+                            self.output_files.append(model_file) # 输出：model
+
+        else:
+            # test：只需要输入
             test_dir = os.path.join(self.data_dir, 'test')
-            # 测试集不需要配对，只需加载输入文件
+            if not os.path.isdir(test_dir):
+                raise RuntimeError(f"测试目录不存在: {test_dir}")
             self.input_files = sorted(glob.glob(os.path.join(test_dir, '*.npy')))
-            self.output_files = [None] * len(self.input_files)  # 测试集没有输出文件
-        
-        # 验证数据加载
+            self.output_files = [None] * len(self.input_files)
+
+        # 校验
         if not self.input_files:
-            raise RuntimeError(f"未找到任何输入文件，请检查路径: {self.data_dir}")
-        
+            raise RuntimeError(
+                f"未找到任何输入文件。请检查路径与过滤条件："
+                f"data_dir={self.data_dir}, split={self.split}, "
+                f"family={self.family}, is_specific={getattr(self, 'is_specific', None)}"
+            )
         if self.split == 'train' and len(self.input_files) != len(self.output_files):
-            raise RuntimeError("输入文件和输出文件的数量不匹配")
+            raise RuntimeError(
+                f"输入与输出数量不一致：inputs={len(self.input_files)}, outputs={len(self.output_files)}"
+            )
     
     def _compute_stats(self):
         """从已加载的内存数据中计算归一化统计量"""

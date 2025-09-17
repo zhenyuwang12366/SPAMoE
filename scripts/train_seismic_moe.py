@@ -1338,11 +1338,16 @@ def run_training(args):
     if args.is_classier:
         config.is_classier = args.is_classier
     
+    # 判断is_specific与选择family是否匹配
+    if config.is_specific and config.family not in ['curve_vel', 'flat_vel', 'curve_fault', 'flat_fault', 'style_style']:
+        raise ValueError(f"{config.family} 与 {config.is_specific} 不匹配")
+    
     #-------------- 设置完毕 -----------#
     # 创建完整数据集
     full_dataset = SeismicDataset(
         data_dir=config.data_dir,
         family=config.family,
+        is_specific=config.is_specific,
         split='train',
     )
     

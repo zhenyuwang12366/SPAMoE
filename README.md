@@ -97,6 +97,8 @@ pip install -r requirements.txt
 - scikit-image (用于评估指标)
 - wandb (可选，用于实验追踪)
 
+python -m pdb scripts/train_seismic_moe.py --num_workers 32 --data_dir /data1/home/teacher/teacher_s/t108790/FWINO/FWINO_data --family vel                                                 --batch_size 4 --epochs 500 --output_dir ../results/seismic_moe_test                                                 --top_k 1 --choose_experts 0 --FNO_n_modes_height 64 --FNO_n_modes_width 64 --FNO_n_layers 8 --hidden_channels 128                                                 --learning_rate 2e-5 --weight_decay 0.05 --scheduler_gamma 0.2 --accum_steps 1
+
 ## 数据集格式
 
 <a id="数据集格式"></a>
