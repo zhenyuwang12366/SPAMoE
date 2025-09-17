@@ -37,6 +37,7 @@ class SeismicDataset(Dataset):
         self.index_map = [] #[(file_idx, sample_idx)]
         self.input_tensors = []
         self.output_tensors = []
+        self.is_specific = is_specific
         
         # 验证参数
         if not is_specific:

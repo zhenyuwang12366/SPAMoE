@@ -1,36 +1,27 @@
 #!/bin/bash
+#SBATCH --job-name=FWINO_syx              # 作业名称
+#SBATCH --partition=gpu-4090-2             # 分区名称（请根据实际情况调整）
+#SBATCH --gres=gpu:2                       # 请求4个GPU
+#SBATCH --ntasks=1                         # 启动1个任务（torchrun会管理GPU）
+#SBATCH --cpus-per-task=10                  # 分配CPU
+#SBATCH --time=24:00:00                    # 最长运行时间
+#SBATCH --output=../results/output%j.txt             # 输出日志
+#SBATCH --no-requeue
 
 # === 进入工作目录（如果未用 sbatch --chdir） ===
-# cd autodl-tmp/FWINO
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOGDIR=logs
-mkdir -p $LOGDIR
-LOGFILE=$LOGDIR/seismic_moe_${TIMESTAMP}.log
+cd /data1/home/teacher/teacher_s/t108790/FWINO_wzy_test
+
 # === 激活 Conda 虚拟环境 ===
-. "/root/miniconda3/etc/profile.d/conda.sh"
-conda activate seismic_moe
+. "/data1/apps/anaconda3/etc/profile.d/conda.sh"
+conda activate FWINO
 
 # === 打印验证信息（可选）===
 echo "当前 Python: $(which python)"
 python -c "import torch; print('PyTorch 版本:', torch.__version__)"
 
 # === 启动训练 ===
-export WANDB_API_KEY=a8a4a60dbf66755b4d2af1a67ef020f69278f6a6
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-nohup bash scripts/run_distributed_seismic_moe.sh --num_gpus 2 --num_workers 32 --data_dir /root/autodl-tmp/FWINO/FWINO_data --family vel \
-                                                --batch_size 4 --epochs 500 --output_dir ../results/seismic_moe_${TIMESTAMP} \
-                                                --top_k 1 --choose_experts 0 --FNO_n_modes_height 64 --FNO_n_modes_width 64 --FNO_n_layers 8 --hidden_channels 128 \
-                                                --learning_rate 2e-5 --weight_decay 0.05 --scheduler_gamma 0.2 --accum_steps 8\
-    > "$LOGFILE" 2>&1 &
-echo "训练已启动，日志记录在：$LOGFILE"
-
-# bash scripts/run_distributed_seismic_moe.sh --num_gpus 2 --num_workers 32 --data_dir ./FWINO_data --family vel --batch_size 8 --epochs 500 --output_dir ../results/seismic_moe  --top_k 1 --choose_experts 1 --FNO_n_modes_height 32 --FNO_n_modes_width 32
-
-
-
-
-#conda activate seismic_moe 
-#cd ~/autodl-tmp/FWINO_wzy
-#python scripts/train_seismic_moe.py --num_workers 8 --data_dir ./FWINO_data --family vel --batch_size 4 --epochs 500 --output_dir ../results/seismic_moe_${TIMESTAMP}  --top_k 0 --choose_experts 1 --FNO_n_modes_height 32 --FNO_n_modes_width 32 
-#--resume_path /root/autodl-tmp/results/seismic_moe_20250820_195645/fourier_0/seismic_moe_vel/best_model_fourier_0.pt
-#--resume_path /root/autodl-tmp/results/seismic_moe/fourier_0/seismic_moe_vel/best_model_fourier_0.pt
+bash scripts/run_distributed_seismic_moe.sh --num_gpus 2 --num_workers 10 --data_dir /data1/home/teacher/teacher_s/t108790/FWINO/FWINO_data --family vel\
+                                                --batch_size 4 --epochs 500 --output_dir ../results/seismic_moe_${SLURM_JOB_NAME}_${SLURM_JOB_ID} \
+                                                --top_k 1 --choose_experts 1 --WNO_n_levels_height 2 --WNO_n_levels_width 2 --hidden_channels 64 --WNO_n_layers 6 --WNO_block_n_layers 3  --WNO_dropout_rate 0.15 --wavelet_type db4\
+                                                --learning_rate 2e-5 --weight_decay 0.05 --scheduler_gamma 0.2 --accum_steps 1\

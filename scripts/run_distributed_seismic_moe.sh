@@ -64,7 +64,7 @@ IS_CLASSIER=0                   # flag -> --is_classier
 
 # 推理/恢复
 MODEL_PATH=""                   # inference 时常用
-RESUME_PATH="./results/distributed_seismic_moe"
+RESUME_PATH=""
 
 # 性能统计
 PROFILE_TIMING=0                # flag -> --profile_timing

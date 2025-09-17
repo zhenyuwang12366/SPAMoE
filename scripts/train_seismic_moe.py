@@ -1222,11 +1222,12 @@ def run_training(args):
     
     config.lr_warmup_epochs = int(config.epochs * 0.05)
     
-    print(f'batch_size:{config.batch_size}')
-    print(f'effective_batch_size:{world_size * config.batch_size * config.accum_steps}')
-    print(f'epochs:{config.epochs}')
-    print(f'learning_rate:{config.learning_rate}')
-    print(f'hidden_channels:{config.hidden_channels}')
+    if is_logger:
+        print(f'batch_size:{config.batch_size}')
+        print(f'effective_batch_size:{world_size * config.batch_size * config.accum_steps}')
+        print(f'epochs:{config.epochs}')
+        print(f'learning_rate:{config.learning_rate}')
+        print(f'hidden_channels:{config.hidden_channels}')
 
     # 设置验证集比例
     val_ratio = args.val_ratio if args.val_ratio is not None else 0.2
@@ -2326,7 +2327,7 @@ if __name__ == '__main__':
                         help='运行模式: 训练或推理')
     parser.add_argument('--data_dir', type=str, default=None,
                         help='数据目录路径')
-    parser.add_argument('--family', type=str, default=None, choices=['vel', 'style', 'fault', 'all'],
+    parser.add_argument('--family', type=str, default=None, choices=['vel', 'style', 'fault', 'all', 'curve_vel', 'flat_vel', 'curve_fault', 'flat_fault', 'style_style'],
                         help='数据集系列: vel, style, fault 或 all')
     parser.add_argument('--batch_size', type=int, default=None,
                         help='批次大小')
