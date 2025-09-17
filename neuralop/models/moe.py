@@ -47,7 +47,8 @@ class Router(nn.Module):
         self.num_experts = num_experts
         self.top_k = min(top_k, num_experts)
         self.noisy_gating = noisy_gating
-
+        self.alpha = 0.1 # aux负载均衡损失因子
+        
         # 路由器网络
         self.router = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -57,62 +58,67 @@ class Router(nn.Module):
         
     def forward(self, x):
         """
-        计算每个专家的路由权重
-        
-        Parameters
-        ----------
-        x : torch.Tensor
-            输入特征
-        
-        Returns
-        -------
-        dispatched_input : torch.Tensor
-            分配后的输入
-        routing_weights : torch.Tensor
-            路由权重
-        expert_indices : torch.Tensor
-            选择的专家索引
+        返回:
+        top_k_weights: [B, k]
+        top_k_indices: [B, k]
+        w_weights:     [B, w_k] or None
+        w_indices:     [B, w_k] or None
+        aux_loss:      scalar tensor or None( eval )
         """
-        # 计算路由权重 b, n
-        logits = self.router(x)
-        
+        logits = self.router(x)                             # [B, N]
+
         if self.noisy_gating and self.training:
-            # 训练时添加噪声以增加探索性
-            noise = torch.randn_like(logits) * 1.0
-            logits = logits + noise
-            
-        # 使用Softmax获取专家权重 b,n
-        routing_weights = F.softmax(logits, dim=-1)
-        
-        # 选择top-k专家 b,k
-        top_k_weights, top_k_indices = torch.topk(routing_weights, self.top_k, dim=-1)
-        
-        # 归一化top-k权重
-        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
-        
-        # 弱激活专家
-        w_top_k = self.num_experts - self.top_k
+            noise_scale = 1.0
+            logits = logits + torch.randn_like(logits) * noise_scale
+
+        routing_weights = F.softmax(logits, dim=-1)         # [B, N]
+
+        # --- top-k 主专家 ---
+        top_k = int(self.top_k)
+        num_experts = int(self.num_experts)
+        assert num_experts > 0 and 1 <= top_k <= num_experts
+
+        top_k_weights, top_k_indices = torch.topk(
+            routing_weights, k=top_k, dim=-1, largest=True, sorted=True
+        )                                                   # [B, k], [B, k]
+
+        # 归一化
+        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+        # --- 弱激活专家（从“未被 top-k 选中”的剩余里挑） ---
+        w_top_k = num_experts - top_k
         if w_top_k > 0:
-            mask = torch.ones_like(top_k_weights, dtype=torch.bool)
-            mask.scatter_add_(1, top_k_indices, False)
-            masked_weights = routing_weights.masked_fill_(~mask, -1e9)
-            
-            w_weights, w_indices = torch.topk(masked_weights, k=w_top_k)
-            # 归一化top-k权重
-            w_weights = w_weights / w_weights.sum(dim=-1, keepdim=True)
+            # 构造与 routing_weights 同形状的选择掩码: 被 top-k 选中的位置为 True
+            B, N = routing_weights.shape
+            selected_mask = torch.zeros(B, N, dtype=torch.bool, device=routing_weights.device)
+            # scatter_ 支持 bool，按行把 top_k_indices 位置置 True
+            selected_mask.scatter_(dim=1, index=top_k_indices, src=torch.ones_like(top_k_indices, dtype=torch.bool))
+
+            # 把已选中的位置屏蔽为 -inf，从“剩余位置”再取最大的 w_top_k
+            remaining = routing_weights.clone().masked_fill(selected_mask, float('-inf'))
+
+            # 若 num_experts == top_k，这里全是 -inf；但我们有 w_top_k>0 的判断保证不会走到这里
+            w_weights, w_indices = torch.topk(remaining, k=w_top_k, dim=-1, largest=True, sorted=True)
+            # 将 -inf 安全归一化（如果极端情况下全是 -inf，会得到 nan，故先替换为 0）
+            w_weights = torch.where(torch.isfinite(w_weights), w_weights, torch.zeros_like(w_weights))
+            w_weights = w_weights / w_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
         else:
-            w_weights = None
-            w_indices = None
-        
-        # aux
-        if self.training and self.alpha > 0.0:
-            ce = F.one_hot(top_k_indices.reshape(-1), num_classes=self.num_experts).float().mean(dim=0)            
-            Pi = routing_weights.mean(dim=0)
-            fi = ce * self.num_experts
-            aux_loss = (Pi * fi).sum() * self.alpha
+            w_weights, w_indices = None, None
+
+        # --- aux（负载均衡损失） ---
+        if self.training and getattr(self, "alpha", 0.0) > 0.0:
+            if top_k_indices.numel() == 0 or routing_weights.numel() == 0:
+                # 空 batch 情况：返回零标量，保持图连接，避免 DDP 不一致
+                aux_loss = routing_weights.sum() * 0.0
+            else:
+                idx = top_k_indices.reshape(-1).to(dtype=torch.long)
+                ce = F.one_hot(idx, num_classes=num_experts).float().mean(dim=0)  # [N]
+                Pi = routing_weights.mean(dim=0)                                  # [N]
+                fi = ce * float(num_experts)                                      # [N]
+                aux_loss = (Pi * fi).sum() * float(self.alpha)
         else:
             aux_loss = None
-        
+
         return top_k_weights, top_k_indices, w_weights, w_indices, aux_loss
     
 class ContinuousCRF(nn.Module):
@@ -240,20 +246,21 @@ class MOEOperator(BaseModel, name='MOE'):
         self.out_channels = out_channels
         self.hidden_channels = hidden_channels
         self.top_k = top_k
-        self.w_k = self.num_experts - top_k
-        self.noisy_gating = noisy_gating
-        self.fusion_type = fusion_type
-        self.router_type = router_type
         
         # 专家列表
         self.experts = nn.ModuleList(experts)
         if self.config.get('is_classier', False):
-            self.num_experts = len(experts)
-        else:
             if self.config.get('is_specific', True):
                 self.num_experts = int(len(experts) / 5)
             else:
                 self.num_experts = int(len(experts) / 3)
+        else:
+            self.num_experts = len(experts)
+        
+        self.w_k = self.num_experts - top_k
+        self.noisy_gating = noisy_gating
+        self.fusion_type = fusion_type
+        self.router_type = router_type
         
         # 确保top_k不超过专家数量
         self.top_k = min(self.top_k, self.num_experts)
@@ -427,11 +434,11 @@ class MOEOperator(BaseModel, name='MOE'):
         device = x.device
         
         if self.config.get('is_classier', False):
-            type_weights = None
-        else:
             feats = self.classier(x)
             type_logits = self.fc(feats) # B*5/B*3
-            type_weights = torch.softmax(type_logits) # B*5/B*3
+            type_weights = torch.softmax(type_logits, dim=-1) # B*5/B*3
+        else:
+            type_weights = None
         
         # x: b 1 1000 350 -> b * (1000*350) * 1 -> b * 1
         # 提取输入特征进行路由
