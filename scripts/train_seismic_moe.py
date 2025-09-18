@@ -2,7 +2,7 @@
 使用MOE（Mixture of Experts）架构训练地震数据的神经算子模型
 支持分布式训练
 """
-
+import optuna
 import os
 import sys
 import math
@@ -1161,7 +1161,7 @@ def train_one_epoch(
     }
     return stats, best_val_loss, stop_flag
 
-def run_training(args):
+def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     """
     训练地震数据的MOE模型
     
@@ -1696,6 +1696,14 @@ def run_training(args):
             tqdm_module=tqdm,
             profile_timing=args.profile_timing,
         )
+        # === Optuna: 每个 epoch 上报 val_loss，并触发剪枝（如配置了 pruner） ===
+        if trial is not None:
+            trial.report(stats["val_loss"], step=epoch)
+            if trial.should_prune():
+                if is_logger:
+                    print(f"[Optuna] Trial pruned at epoch={epoch+1}, val_loss={stats['val_loss']:.6f}")
+                # 抛出给外层 objective 捕获
+                raise optuna.TrialPruned()
         if stop_flag == 1:
             break
     
@@ -2321,8 +2329,9 @@ def load_moe_experts(
     
     return loaded_experts
 
-if __name__ == '__main__':
+def build_argparser_and_parse(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="地震数据MOE训练和推理")
+    
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'inference','overfit1'],
                         help='运行模式: 训练或推理')
     parser.add_argument('--data_dir', type=str, default=None,
@@ -2434,8 +2443,12 @@ if __name__ == '__main__':
     parser.add_argument('--profile_timing', action='store_true',
                         help='是否记录训练过程中的耗时信息')
     
-    args = parser.parse_args()
-    
+    args = parser.parse_args(argv)
+    args.parser = parser
+    return args
+
+if __name__ == '__main__':
+    args = build_argparser_and_parse()
     if args.mode == 'train':
         run_training(args)
     elif args.mode == 'inference':
