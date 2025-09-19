@@ -28,6 +28,7 @@ python scripts/tune_seismic_moe.py \
   --num_workers 10 \
   --n_trials 30 \
   --study_name moe_flatvel_tpe\
-  --num_gpus 2\
+  --num_gpus 1\
   --top_k 1\
   --choose_experts 1\
+  --is_specific
