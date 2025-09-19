@@ -1,100 +1,127 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Optuna 调参独立脚本
-依赖:
-    pip install optuna
+Optuna 调参外层调度器（单进程）
+- 每个 trial 调用你的多卡 bash 启动器（内部再 torchrun 吃满 2 卡）
+- 通过流式解析 stdout 的 REPORT/VAL_LOSS 实现实时上报与剪枝
 """
 import os
 import json
-import copy
+import shlex
+import argparse
+import subprocess
+import signal
 import optuna
 from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner
+import threading
+import re
+import math
+import time
 
-from train_seismic_moe import build_argparser_and_parse, run_training  # 直接使用你的辅助函数
+def suggest_params(trial: optuna.Trial):
+    """在这里集中定义要搜索的超参空间"""
+    return {
+        # -------- 优化/训练 --------
+        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
+        "weight_decay":  trial.suggest_float("weight_decay", 0.0, 0.1),
+        "batch_size":    trial.suggest_categorical("batch_size", [2, 4, 6, 8]),
+        "epochs":        trial.suggest_categorical("epochs", [100, 150, 200]),
+        "accum_steps":   trial.suggest_categorical("accum_steps", [1, 2]),
+        "scheduler_gamma": trial.suggest_float("scheduler_gamma", 0.2, 0.5),
 
-def apply_trial_suggestions(args, trial: optuna.Trial):
+        # -------- 模型容量/结构 --------
+        "hidden_channels": trial.suggest_categorical("hidden_channels", [32, 48, 64, 96, 128, 160]),
+        "FNO_n_layers":  trial.suggest_categorical("FNO_n_layers", [4, 6, 8]),
+        "WNO_n_layers":  trial.suggest_int("WNO_n_layers", 2, 7),
+        "MNO_n_layers":  trial.suggest_categorical("MNO_n_layers", [2, 3, 4]),
+        "LNO_n_layers":  trial.suggest_categorical("LNO_n_layers", [3, 4, 5]),
+        "WNO_block_n_layers": trial.suggest_categorical("WNO_block_n_layers", [2, 4]),
+        "WNO_dropout_rate":   trial.suggest_float("WNO_dropout_rate", 0.1, 0.2),
+        "WNO_n_levels_height": trial.suggest_int("WNO_n_levels_height", 2, 4),
+        "WNO_n_levels_width":  trial.suggest_int("WNO_n_levels_width", 2, 4),
+
+        # -------- Loss 权重 --------
+        "lambda_g1v": trial.suggest_float("lambda_g1v", 0.3, 1.5, log=True),
+        "lambda_g2v": trial.suggest_float("lambda_g2v", 0.3, 1.5, log=True),
+    }
+
+def build_bash_cmd(args, trial_number: int, hp: dict) -> list:
     """
-    针对关键超参 + 你新增的范围 进行搜索
+    返回 list 形式的 argv（不再用 shell=True 拼接大字符串）。
+    通过 stdbuf 强制行缓冲，确保 stdout/stderr 实时刷新。
     """
-    import copy
-    new_args = copy.deepcopy(args)
+    out_dir = os.path.join(args.output_dir, f"trial_{trial_number}")
+    os.makedirs(out_dir, exist_ok=True)
 
-    # ---------- 优化器/训练相关 ----------
-    new_args.learning_rate = trial.suggest_float(
-        "learning_rate", 1e-5, 3e-4, log=True)      # 学习率
-    new_args.weight_decay  = trial.suggest_float(
-        "weight_decay", 0.0, 0.1)                   # 权重衰减
-    new_args.batch_size    = trial.suggest_categorical(
-        "batch_size", [2, 4, 6, 8])                 # 批大小
-    new_args.accum_steps   = trial.suggest_categorical(
-        "accum_steps", [1, 2])                      # 梯度累计
-    new_args.scheduler_gamma = trial.suggest_float(
-        "scheduler_gamma", 0.2, 0.5)                # 学习率衰减因子
+    choose_exp = list(map(str, args.choose_experts))
 
-    # ---------- 模型容量 ----------
-    # 新增 hidden_channels 范围：32–128
-    new_args.hidden_channels = trial.suggest_categorical(
-        "hidden_channels", [32, 48, 64, 96, 128, 160])  # 隐藏通道数
+    argv = [
+        "stdbuf", "-oL", "-eL",                 # 关键：行缓冲
+        "bash", args.bash_launcher,             # 显式用 bash 调用
+        "--mode", "train",
+        "--num_gpus", str(args.num_gpus),
+        "--data_dir", args.data_dir,
+        "--family", args.family,
+        "--output_dir", out_dir,
+        "--num_workers", str(args.num_workers),
+        "--seed", str(args.seed),
+        "--top_k", str(args.top_k),
+        "--choose_experts", *choose_exp,
+    ]
+    if args.is_specific:
+        argv.append("--is_specific")
 
-    # # ---------- MoE 核心 ----------
-    # new_args.top_k = trial.suggest_categorical(
-    #     "top_k", [1, 2])                             # 每次激活专家数量
-    # new_args.choose_experts = trial.suggest_categorical(
-    #     "choose_experts", [[0], [1], [2], [0,1], [1,2], [0,1,2]])
-
-    # ---------- 各专家主要深度 ----------
-    new_args.FNO_n_layers = trial.suggest_categorical(
-        "FNO_n_layers", [4, 6, 8])                   # FNO 层数
-    # 将 WNO 层数范围扩大到 2–7
-    new_args.WNO_n_layers = trial.suggest_int(
-        "WNO_n_layers", 2, 7)                        # WNO 层数
-    new_args.MNO_n_layers = trial.suggest_categorical(
-        "MNO_n_layers", [2, 3, 4])                   # MNO 层数
-    new_args.LNO_n_layers = trial.suggest_categorical(
-        "LNO_n_layers", [3, 4, 5])                   # LNO 层数
-
-    # 新增：WNO block 层数 [2,4]
-    new_args.WNO_block_n_layers = trial.suggest_categorical(
-        "WNO_block_n_layers", [2, 4])
-
-    # 新增：WNO dropout rate [0.1, 0.2]
-    new_args.WNO_dropout_rate = trial.suggest_float(
-        "WNO_dropout_rate", 0.1, 0.2)
-
-    # WNO n levels height/width
-    new_args.WNO_n_levels_height = trial.suggest_int(
-        "WNO_n_levels_height", 2, 4,)
-    
-    new_args.WNO_n_levels_width = trial.suggest_int(
-        "WNO_n_levels_width", 2, 4,)
-    
-    # ---------- Loss 权重 ----------
-    new_args.lambda_g1v = trial.suggest_float(
-        "lambda_g1v", 0.3, 1.5, log=True)
-    new_args.lambda_g2v = trial.suggest_float(
-        "lambda_g2v", 0.3, 1.5, log=True)
-
-    # 若用户未在命令行指定 epoch，可在此限定范围
-    if getattr(new_args, "epochs", None) is None:
-        new_args.epochs = trial.suggest_categorical("epochs", [100, 150, 200])
-
-    return new_args
-
+    # 超参部分
+    argv += [
+        "--batch_size", str(hp["batch_size"]),
+        "--epochs", str(hp["epochs"]),
+        "--learning_rate", str(hp["learning_rate"]),
+        "--weight_decay", str(hp["weight_decay"]),
+        "--accum_steps", str(hp["accum_steps"]),
+        "--scheduler_gamma", str(hp["scheduler_gamma"]),
+        "--hidden_channels", str(hp["hidden_channels"]),
+        "--FNO_n_layers", str(hp["FNO_n_layers"]),
+        "--WNO_n_layers", str(hp["WNO_n_layers"]),
+        "--MNO_n_layers", str(hp["MNO_n_layers"]),
+        "--LNO_n_layers", str(hp["LNO_n_layers"]),
+        "--WNO_block_n_layers", str(hp["WNO_block_n_layers"]),
+        "--WNO_dropout_rate", str(hp["WNO_dropout_rate"]),
+        "--WNO_n_levels_height", str(hp["WNO_n_levels_height"]),
+        "--WNO_n_levels_width", str(hp["WNO_n_levels_width"]),
+        "--lambda_g1v", str(hp["lambda_g1v"]),
+        "--lambda_g2v", str(hp["lambda_g2v"]),
+    ]
+    return argv
 
 def main():
-    # 继承原脚本所有参数，再加上调参专用
-    parser = build_argparser_and_parse([]).parser  # 如果你把 parser 暴露出来，也可直接用 parser
-    parser.add_argument('--n_trials', type=int, default=30)
-    parser.add_argument('--timeout', type=int, default=None)
-    parser.add_argument('--study_name', type=str, default='seismic_moe_tune')
-    parser.add_argument('--storage', type=str, default=None, help='Optuna storage, e.g. sqlite:///moe.db')
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Optuna 调参（外层单进程）")
+    # ---- Optuna 基本参数 ----
+    ap.add_argument("--n_trials", type=int, default=30)
+    ap.add_argument("--timeout", type=int, default=None)
+    ap.add_argument("--study_name", type=str, default="seismic_moe_tune")
+    ap.add_argument("--storage", type=str, default="sqlite:///../results/optuna/moe_flatvel_tpe.db")
+    ap.add_argument("--seed", type=int, default=42)
 
+    # ---- 你的多卡 bash 启动器路径/资源 ----
+    ap.add_argument("--bash_launcher", type=str, default="scripts/run_distributed_seismic_moe.sh")
+    ap.add_argument("--num_gpus", type=int, default=2)
+    ap.add_argument("--cuda_visible_devices", type=str, default="0,1")
+
+    # ---- 训练固定参数（非搜索） ----
+    ap.add_argument("--data_dir", type=str, required=True)
+    ap.add_argument("--family", type=str, required=True)
+    ap.add_argument("--output_dir", type=str, required=True)
+    ap.add_argument("--num_workers", type=int, default=10)
+    ap.add_argument("--top_k", type=int, default=1)
+    ap.add_argument("--choose_experts", nargs="+", type=int, default=[0])
+    ap.add_argument("--is_specific", action="store_true")
+
+    args = ap.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+
     sampler = TPESampler(multivariate=True, group=True, n_startup_trials=10, seed=args.seed)
-    pruner  = MedianPruner(n_startup_trials=5, n_warmup_steps=10)
+    pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=10)
 
     study = optuna.create_study(
         direction="minimize",
@@ -102,31 +129,124 @@ def main():
         pruner=pruner,
         study_name=args.study_name,
         storage=args.storage,
-        load_if_exists=bool(args.storage)
+        load_if_exists=True,
     )
 
-    def objective(trial):
-        trial_args = apply_trial_suggestions(args, trial)
-        trial_args.use_wandb = False
-        trial_args.vis_freq  = max(getattr(trial_args, "vis_freq", 9999), trial_args.epochs + 1)
-        trial_args.seed      = args.seed
-        try:
-            _, best_val = run_training(trial_args, trial=trial)
-        except optuna.TrialPruned:
-            raise
-        except Exception as e:
-            print(f"[Optuna] Trial failed: {e}")
+    REPORT_RE = re.compile(r".*REPORT:\s*([+-]?\d+(\.\d+)?([eE][+-]?\d+)?)\s*:\s*(\d+)")
+    VAL_RE    = re.compile(r".*VAL_LOSS:\s*([+-]?\d+(\.\d+)?([eE][+-]?\d+)?)")
+
+    def objective(trial: optuna.Trial):
+        hp = suggest_params(trial)
+        argv = build_bash_cmd(args, trial.number, hp)
+
+        trial_dir = os.path.join(args.output_dir, f"trial_{trial.number}")
+        os.makedirs(trial_dir, exist_ok=True)
+        stdout_path = os.path.join(trial_dir, "child_stdout.txt")
+        stderr_path = os.path.join(trial_dir, "child_stderr.txt")
+
+        # 环境变量：把 CUDA 设备放到 env，而不是命令行前缀
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+        # （可选）进一步确保 Python 无缓冲
+        env.setdefault("PYTHONUNBUFFERED", "1")
+
+        final_val = None
+        start_ts = time.time()
+
+        with open(stdout_path, "w", encoding="utf-8") as fout, open(stderr_path, "w", encoding="utf-8") as ferr:
+            # 建立新进程组，便于整组杀掉（torchrun 的子进程一并终止）
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+                env=env,
+                preexec_fn=os.setsid,   # Linux 下新建进程组
+            )
+
+            # 后台线程：持续转储 stderr，防止阻塞
+            def _drain_stderr():
+                try:
+                    for eline in proc.stderr:
+                        ferr.write(eline)
+                except Exception:
+                    pass
+
+            t_err = threading.Thread(target=_drain_stderr, daemon=True)
+            t_err.start()
+
+            try:
+                for line in proc.stdout:
+                    fout.write(line)
+                    s = line.strip()
+
+                    # 解析 REPORT:<loss>:<step>
+                    m = REPORT_RE.match(s)
+                    if m:
+                        loss_val = float(m.group(1))
+                        step_val = int(m.group(4))
+                        if math.isfinite(loss_val):
+                            trial.report(loss_val, step=step_val)
+                            if trial.should_prune():
+                                # 剪枝：整组 kill
+                                try:
+                                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                                except Exception:
+                                    pass
+                                raise optuna.TrialPruned("Pruned by median rule")
+
+                    # 解析 VAL_LOSS:<best_val_loss>
+                    m2 = VAL_RE.match(s)
+                    if m2:
+                        try:
+                            final_val = float(m2.group(1))
+                        except Exception:
+                            final_val = None
+
+                retcode = proc.wait(timeout=5)
+            except optuna.TrialPruned:
+                # 写个标记文件，便于回溯
+                with open(os.path.join(trial_dir, "PRUNED"), "w") as f:
+                    f.write("pruned\n")
+                raise
+            except Exception as e:
+                # 异常：整组强杀
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+                # 标记异常原因
+                with open(os.path.join(trial_dir, "ERROR"), "w") as f:
+                    f.write(str(e))
+                return float("inf")
+
+        # 子进程非零退出码，直接判 inf（把原因留在 child_stderr）
+        if retcode != 0:
+            with open(os.path.join(trial_dir, "NONZERO_EXIT"), "w") as f:
+                f.write(f"retcode={retcode}\n")
             return float("inf")
-        return float(best_val)
+
+        # 没有拿到最终指标：通常是缓冲/0 batch/日志没打印到
+        if final_val is None or not math.isfinite(final_val):
+            with open(os.path.join(trial_dir, "NO_FINAL_VAL"), "w") as f:
+                f.write("No VAL_LOSS parsed. Check buffering / dataset / val loop.\n")
+            return float("inf")
+
+        return float(final_val)
 
     study.optimize(objective, n_trials=args.n_trials, timeout=args.timeout)
 
     print("\n===== Optuna 调参完成 =====")
     print(f"Best trial: #{study.best_trial.number}")
     print(f"Best val_loss: {study.best_value:.6f}")
-    with open(os.path.join(args.output_dir,
-              f"optuna_best_params_{args.study_name}.json"), "w", encoding="utf-8") as f:
+
+    best_path = os.path.join(args.output_dir, f"optuna_best_params_{args.study_name}.json")
+    with open(best_path, "w", encoding="utf-8") as f:
         json.dump(study.best_trial.params, f, ensure_ascii=False, indent=2)
+    print(f"Best params saved to: {best_path}")
+
 
 if __name__ == "__main__":
     main()

@@ -16,7 +16,7 @@ import copy
 from contextlib import nullcontext
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Any, List, Union, Optional, Callable
+from typing import Dict, Any, List, Union, Optional, Callable, Iterable
 import argparse
 import tqdm
 import matplotlib.pyplot as plt
@@ -1659,7 +1659,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     
     scaler = torch.amp.GradScaler(device=device,enabled=use_amp)
     optimizer.zero_grad(set_to_none=True)
-
+    REPORT_EVERY = max(1, getattr(args, "report_every", 5))
 #以上全是准备工作，下面是核心循环
     # 训练循环
     for epoch in range(start_epoch, config.epochs):
@@ -1696,20 +1696,25 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             tqdm_module=tqdm,
             profile_timing=args.profile_timing,
         )
-        # === Optuna: 每个 epoch 上报 val_loss，并触发剪枝（如配置了 pruner） ===
-        if trial is not None:
-            trial.report(stats["val_loss"], step=epoch)
-            if trial.should_prune():
-                if is_logger:
-                    print(f"[Optuna] Trial pruned at epoch={epoch+1}, val_loss={stats['val_loss']:.6f}")
-                # 抛出给外层 objective 捕获
-                raise optuna.TrialPruned()
+
+        # ====== 中间上报（仅 rank0 打印，供外层 Optuna 解析）======
+        # 注意：这里假设 stats["val_loss"] 已经做过 all_reduce 得到“全卡平均值”
+        if is_logger:
+            cur_val = float(stats.get("val_loss", float("nan")))
+            # 满足：到达REPORT_EVERY、或最后一个epoch、或提前stop时，打印一次
+            if ((epoch + 1) % REPORT_EVERY == 0) or ((epoch + 1) == config.epochs) or (stop_flag == 1):
+                print(f"REPORT:{cur_val}:{epoch+1}", flush=True)
+
+        # 可选：若内部早停信号触发，则跳出
         if stop_flag == 1:
             break
-    
+
+    # ====== 训练结束：打印最终指标（仅 rank0）======
     if is_logger:
+        # best_val_loss 为整个 trial 的最好验证损失（应已由 rank0 维护）
+        print(f"VAL_LOSS:{best_val_loss}", flush=True)
         plot_loss_curve(log_file, save_path=results_dir)
-        
+
     return model, best_val_loss
 
 def run_overfit_one_sample(args):
@@ -2134,21 +2139,44 @@ def run_inference(args):
     
     print(f"推理完成！结果保存在: {results_dir}")
 
-def get_expert_dict(full_sd, i: int=0, ddp_prefix='module.'):
-    def strip_dp(k):
-        return k[len(ddp_prefix):] if k.startswith(ddp_prefix) else k
-    
-    sub: Dict[str, torch.Tensor] = {}
-    prefix = f'experts.{i}'
-    for k, v in full_sd.items():
-        k2 = strip_dp(k)
-        if k2.startswith(prefix):
-            sub[k2[len(prefix):]] = v
-    
-    if not sub:
-        # 回退
-        sub = {strip_dp(k): v for k, v in full_sd.items()}
-    return sub
+def _strip_prefixes(key: str, prefixes: Iterable[str]) -> str:
+    for p in prefixes:
+        if key.startswith(p):
+            return key[len(p):]
+    return key
+
+def get_expert_dict(ckpt: Dict[str, Any],
+                    ddp_prefixes: Iterable[str] = ("module.",),
+                    allow_experts_prefix_fallback: bool = True
+                   ) -> Dict[str, torch.Tensor]:
+    """
+    从 checkpoint 中提取专家权重（你的保存方式：{'expert_state_dict': ...}）。
+    - 默认去掉常见并行前缀（如 'module.'）。
+    - 若误存成 'experts.0.xxx'，可选地剥掉 'experts.0.'（fallback）。
+
+    Args:
+        ckpt: 通过 torch.load(...) 得到的 checkpoint 字典，必须包含 'expert_state_dict'
+        ddp_prefixes: 需要剥除的并行前缀集合（如 DDP 的 'module.'）
+        allow_experts_prefix_fallback: 若键以 'experts.0.' 开头，是否自动剥掉
+
+    Returns:
+        清洗后的专家 state_dict（键名干净，可直接 expert.load_state_dict(...)）
+    """
+    if not isinstance(ckpt, dict) or "expert_state_dict" not in ckpt:
+        raise ValueError("checkpoint 中未找到 'expert_state_dict'，请确认保存与加载路径一致。")
+
+    raw_sd = ckpt["expert_state_dict"]
+    if not isinstance(raw_sd, dict):
+        raise TypeError("'expert_state_dict' 应是一个 state_dict (dict)。")
+
+    cleaned = OrderedDict()
+    for k, v in raw_sd.items():
+        k2 = _strip_prefixes(k, ddp_prefixes)
+        if allow_experts_prefix_fallback and k2.startswith("experts.0."):
+            k2 = k2[len("experts.0."):]
+        cleaned[k2] = v
+
+    return cleaned
 
 def load_factory(
     experts_config: List[Dict[str, Any]],
