@@ -291,73 +291,50 @@ class MultiscaleNO(BaseModel, name='MultiscaleNO'):
             
             # 通过融合层
             fused_features = self.fusion_layer(concat_features)
-            
+
         elif self.fusion_mode == 'hierarchical':
-            # 从最粗尺度开始，逐步融合到最细尺度
-            # 先将所有特征调整到相应的尺度
-            aligned_features = []
-            
-            for i, feat in enumerate(scale_features):
-                # 从粗到细的顺序处理，所以这里需要倒序
-                # n=3, 0,1,2 细 -> 粗
-                # i=0, feat_0, idx = 2, aligned = feat_0, 最细
-                # i=1, feat_1, idx = 1, target = feat_2, cur = feat_1
-                # i=2, feat_2, idx = 0, tar = feat_0, cur = feat_2
-                idx = self.n_scales - 1 - i
-                
-                if self.scale_factors[idx] != 1.0:
-                    # 对于粗尺度，上采样到下一个较细的尺度
-                    if idx < self.n_scales - 1:
-                        # 计算目标形状和缩放因子
-                        target_shape = scale_features[idx + 1].shape[2:2+self.n_dim]
-                        current_shape = feat.shape[2:2+self.n_dim]
-                        scale_factors = [target_shape[j] / current_shape[j] for j in range(self.n_dim)]
-                        
-                        # 使用缩放因子进行重采样
-                        spatial_dims = list(range(2, 2 + self.n_dim))
-                        if len(scale_factors) == 1:
-                            aligned_feat = resample(feat, scale_factors[0], axis=spatial_dims, output_shape=target_shape)
-                        else:
-                            aligned_feat = resample(feat, scale_factors, axis=spatial_dims, output_shape=target_shape)
-                    else:
-                        # 最细尺度保持原样
-                        aligned_feat = feat
+            # 从最粗尺度开始（索引最大）
+            current = scale_features[-1]
+
+            # 从最粗到最细依次融合
+            for i in range(self.n_scales - 2, -1, -1):  # i=1,0
+                next_feat = scale_features[i]
+
+                # 将当前融合特征上采样到下一个更细尺度
+                target_shape = next_feat.shape[2:2 + self.n_dim]
+                current_shape = current.shape[2:2 + self.n_dim]
+
+                # 计算缩放因子
+                scale_factors = [target_shape[j] / current_shape[j] for j in range(self.n_dim)]
+
+                # 使用缩放因子进行重采样
+                spatial_dims = list(range(2, 2 + self.n_dim))
+                if len(scale_factors) == 1:
+                    current = resample(current, scale_factors[0], axis=spatial_dims, output_shape=target_shape)
                 else:
-                    aligned_feat = feat
-                
-                aligned_features.append(aligned_feat)
-            
-            # 逆序，从最粗到最细
-            aligned_features = aligned_features[::-1]
-            
-            # 层次融合
-            current = aligned_features[0]
-            
-            for i in range(self.n_scales - 1):
-                # 确保空间维度匹配
-                next_feat = aligned_features[i + 1]
-                
+                    current = resample(current, scale_factors, axis=spatial_dims, output_shape=target_shape)
+
                 # 检查空间维度是否匹配
-                if any(current.shape[2+j] != next_feat.shape[2+j] for j in range(self.n_dim)):
+                if any(current.shape[2 + j] != next_feat.shape[2 + j] for j in range(self.n_dim)):
                     # 如果不匹配，将下一个特征调整到当前特征的形状
-                    target_shape = current.shape[2:2+self.n_dim]
-                    current_shape = next_feat.shape[2:2+self.n_dim]
+                    target_shape = current.shape[2:2 + self.n_dim]
+                    current_shape = next_feat.shape[2:2 + self.n_dim]
                     scale_factors = [target_shape[j] / current_shape[j] for j in range(self.n_dim)]
-                    
+
                     # 使用缩放因子进行重采样
                     spatial_dims = list(range(2, 2 + self.n_dim))
                     if len(scale_factors) == 1:
                         next_feat = resample(next_feat, scale_factors[0], axis=spatial_dims, output_shape=target_shape)
                     else:
                         next_feat = resample(next_feat, scale_factors, axis=spatial_dims, output_shape=target_shape)
-                
+
                 # 拼接当前特征和下一个尺度的特征
                 concat = torch.cat([current, next_feat], dim=1)
-                
+
                 # 通过融合层
                 current = self.scale_fusion[i](concat)
                 current = self.non_linearity(current)
-            
+
             fused_features = current
         
         # 应用投影层得到最终输出
