@@ -26,12 +26,12 @@ def suggest_params(trial: optuna.Trial):
         "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
         "weight_decay":  trial.suggest_float("weight_decay", 0.0, 0.1),
         "batch_size":    trial.suggest_categorical("batch_size", [2, 4, 6, 8]),
-        "epochs":        trial.suggest_categorical("epochs", [100, 150, 200]),
+        "epochs":        trial.suggest_categorical("epochs", [150, 200, 300]),
         "accum_steps":   trial.suggest_categorical("accum_steps", [1, 2]),
         "scheduler_gamma": trial.suggest_float("scheduler_gamma", 0.2, 0.5),
 
         # -------- 模型容量/结构 --------
-        "hidden_channels": trial.suggest_categorical("hidden_channels", [32, 48, 64, 96, 128, 160]),
+        "hidden_channels": trial.suggest_categorical("hidden_channels", [64, 96, 128, 160]),
         "FNO_n_layers":  trial.suggest_categorical("FNO_n_layers", [4, 6, 8]),
         "WNO_n_layers":  trial.suggest_int("WNO_n_layers", 2, 7),
         "MNO_n_layers":  trial.suggest_categorical("MNO_n_layers", [2, 3, 4]),
@@ -120,8 +120,18 @@ def main():
     args = ap.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    sampler = TPESampler(multivariate=True, group=True, n_startup_trials=10, seed=args.seed)
-    pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=10)
+    sampler = TPESampler(
+        multivariate=True,   # 利用参数相关性
+        group=True,          # 共同采样一组参数（维度更高→需要更多试验）
+        n_startup_trials=40, # 30–50 之间更稳
+        seed=args.seed
+    )
+
+    pruner = MedianPruner(
+        n_startup_trials=8,                     # 前几个 trial 完全不剪枝
+        n_warmup_steps=15,# 跑到 10% 再比较
+        interval_steps=5                        # 每 5 个 epoch 比较一次
+    )
 
     study = optuna.create_study(
         direction="minimize",

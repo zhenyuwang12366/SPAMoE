@@ -299,6 +299,10 @@ class MultiscaleNO(BaseModel, name='MultiscaleNO'):
             
             for i, feat in enumerate(scale_features):
                 # 从粗到细的顺序处理，所以这里需要倒序
+                # n=3, 0,1,2 细 -> 粗
+                # i=0, feat_0, idx = 2, aligned = feat_0, 最细
+                # i=1, feat_1, idx = 1, target = feat_2, cur = feat_1
+                # i=2, feat_2, idx = 0, tar = feat_0, cur = feat_2
                 idx = self.n_scales - 1 - i
                 
                 if self.scale_factors[idx] != 1.0:

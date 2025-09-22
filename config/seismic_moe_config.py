@@ -92,8 +92,6 @@ class SeismicMOEConfig(Default):
     epochs = 100
     milestones = [60,90,110]
     scheduler_gamma = 0.3
-    lambda_g1v = 1.0
-    lambda_g2v = 1.0
     output_dir = './results'
     lr_warmup_epochs = 5
     
@@ -142,6 +140,10 @@ class SeismicMOEConfig(Default):
     
     # 损失函数配置
     loss_fn = 'mse and mae'  # 均方误差损失
+    lambda_g1v = 1.0
+    lambda_g2v = 1.0
+    lambda_ssim = 0.5
+    lambda_grad = 0.1
     
     # 评估指标配置
     metrics = ['mse', 'mae', 'psnr']
