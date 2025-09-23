@@ -8,6 +8,8 @@
 #SBATCH --error=/data1/home/teacher/teacher_s/t108790/results/logs/%x-%j.err
 #SBATCH --no-requeue
 
+FAMILY=flat_fault
+
 # ========= 安全开关 & 清理 =========
 set -Eeuo pipefail
 cleanup() {
@@ -46,6 +48,8 @@ for i in range(torch.cuda.device_count()):
     print(f"  [{i}] {torch.cuda.get_device_name(i)}")
 PY
 
+echo "Family: ${FAMILY}"
+
 # ========= GPU/NCCL/线程 =========
 export CUDA_VISIBLE_DEVICES=0,1
 export PYTHONUNBUFFERED=1            # Python无缓冲，便于父进程流式读取
@@ -62,13 +66,13 @@ export NCCL_P2P_LEVEL=SYS
 # 使用 stdbuf -oL -eL 强制行缓冲；父进程能实时捕捉 REPORT/VAL_LOSS
 CMD=(stdbuf -oL -eL python scripts/tuna_seismic_moe.py
   --n_trials 30
-  --study_name wno_flatvel
-  --storage sqlite:////data1/home/teacher/teacher_s/t108790/results/optuna/wno_flatvel.db
+  --study_name wno_$FAMILY
+  --storage sqlite:////data1/home/teacher/teacher_s/t108790/results/optuna/wno_${FAMILY}.db
   --bash_launcher scripts/run_distributed_seismic_moe.sh
   --num_gpus 2
   --cuda_visible_devices 0,1
   --data_dir /data1/home/teacher/teacher_s/t108790/FWINO/FWINO_data
-  --family flat_vel
+  --family $FAMILY
   --output_dir /data1/home/teacher/teacher_s/t108790/results/optuna/optuna_seismic_moe_${SLURM_JOB_NAME}_${SLURM_JOB_ID}
   --num_workers 10
   --top_k 1

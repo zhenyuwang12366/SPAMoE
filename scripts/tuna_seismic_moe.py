@@ -26,12 +26,12 @@ def suggest_params(trial: optuna.Trial):
         "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
         "weight_decay":  trial.suggest_float("weight_decay", 0.0, 0.1),
         "batch_size":    trial.suggest_categorical("batch_size", [2, 4, 6, 8]),
-        "epochs":        trial.suggest_categorical("epochs", [150, 200, 300]),
+        "epochs":        trial.suggest_categorical("epochs", [100, 150, 200]),
         "accum_steps":   trial.suggest_categorical("accum_steps", [1, 2]),
         "scheduler_gamma": trial.suggest_float("scheduler_gamma", 0.2, 0.5),
 
         # -------- 模型容量/结构 --------
-        "hidden_channels": trial.suggest_categorical("hidden_channels", [64, 96, 128, 160]),
+        "hidden_channels": trial.suggest_categorical("hidden_channels", [32, 48, 64, 96, 128, 160]),
         "FNO_n_layers":  trial.suggest_categorical("FNO_n_layers", [4, 6, 8]),
         "WNO_n_layers":  trial.suggest_int("WNO_n_layers", 2, 7),
         "MNO_n_layers":  trial.suggest_categorical("MNO_n_layers", [2, 3, 4]),

@@ -148,6 +148,7 @@ class SeismicDataset(Dataset):
                             continue
                         try:
                             vel_file = os.path.join(sub_path, f"vel_{n}_1_{i}.npy")
+                            assert os.path.exists(vel_file)
                         except Exception:
                             vel_file = os.path.join(sub_path, f"vel{n}_1_{i}.npy")
                         if os.path.exists(vel_file):
