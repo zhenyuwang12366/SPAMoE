@@ -9,7 +9,7 @@
 #SBATCH --no-requeue
 
 # === 进入工作目录（如果未用 sbatch --chdir） ===
-cd /data1/home/teacher/teacher_s/t108790/FWINO_wzy_test
+cd /data1/home/teacher/teacher_s/t108790/FWINO_wzy_test || exit
 
 # === 激活 Conda 虚拟环境 ===
 . "/data1/apps/anaconda3/etc/profile.d/conda.sh"
@@ -41,4 +41,4 @@ bash scripts/run_distributed_seismic_moe.sh \
   --learning_rate 2e-5 \
   --weight_decay 0.05 \
   --scheduler_gamma 0.2 \
-  --accum_steps 1\
+  --accum_steps 1

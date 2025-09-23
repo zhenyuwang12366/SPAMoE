@@ -68,19 +68,19 @@ export NCCL_P2P_LEVEL=SYS
 # 使用 stdbuf -oL -eL 强制行缓冲；父进程能实时捕捉 REPORT/VAL_LOSS
 CMD=(stdbuf -oL -eL python scripts/tuna_seismic_moe.py
   --n_trials 30
-  --study_name wno_${FAMILY}_${WAVETYPE}
-  --storage sqlite:////data1/home/teacher/teacher_s/t108790/results/optuna/wno_${FAMILY}_${WAVETYPE}.db
+  --study_name wno_"${FAMILY}"_"${WAVETYPE}"
+  --storage sqlite:////data1/home/teacher/teacher_s/t108790/results/optuna/wno_"${FAMILY}"_"${WAVETYPE}".db
   --bash_launcher scripts/run_distributed_seismic_moe.sh
   --num_gpus 2
-  --cuda_visible_devices 0,1
+  --cuda_visible_devices "0,1"
   --data_dir /data1/home/teacher/teacher_s/t108790/FWINO/FWINO_data
-  --family $FAMILY
-  --output_dir /data1/home/teacher/teacher_s/t108790/results/optuna/optuna_seismic_moe_${SLURM_JOB_NAME}_${SLURM_JOB_ID}
+  --family "$FAMILY"
+  --output_dir /data1/home/teacher/teacher_s/t108790/results/optuna/optuna_seismic_moe_"${SLURM_JOB_NAME}"_"${SLURM_JOB_ID}"
   --num_workers 10
   --top_k 1
   --choose_experts 1
   --is_specific
-  --wavelet_type ${WAVETYPE}
+  --wavelet_type "${WAVETYPE}"
 )
 
 echo "[INFO] Launch: ${CMD[*]}"
