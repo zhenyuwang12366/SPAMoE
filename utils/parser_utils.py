@@ -66,7 +66,7 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='每个WNO块内部的层数')
     parser.add_argument('--WNO_dropout_rate', type=float, default=0.1,
                         help='WNO块中的dropout比例，提高泛化能力')
-    parser.add_argument('--wavelet_type', type=str, default='haar', choices=['haar', 'db4'],
+    parser.add_argument('--wavelet_type', type=str, default='haar', choices=['coif4','db4','db8','sym4','coif5','sym8'],
                         help='小波类型，支持haar和db4小波')
     parser.add_argument('--MNO_n_scales', type=int, default=3,
                         help='总共使用的尺度')

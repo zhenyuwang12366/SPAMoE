@@ -68,6 +68,7 @@ def build_bash_cmd(args, trial_number: int, hp: dict) -> list:
         "--seed", str(args.seed),
         "--top_k", str(args.top_k),
         "--choose_experts", *choose_exp,
+        "--wavelet_type", str(args.wavelet_type),
     ]
     if args.is_specific:
         argv.append("--is_specific")
@@ -116,7 +117,9 @@ def main():
     ap.add_argument("--top_k", type=int, default=1)
     ap.add_argument("--choose_experts", nargs="+", type=int, default=[0])
     ap.add_argument("--is_specific", action="store_true")
-
+    ap.add_argument('--wavelet_type', type=str, default='haar', choices=['coif4','db4','db8','sym4','coif5','sym8'],
+                        help='小波类型')
+    
     args = ap.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
