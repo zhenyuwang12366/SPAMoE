@@ -60,6 +60,25 @@ _PAD_MODE_MAP = {
 }
 
 
+def _is_complex_dtype(dtype) -> bool:
+    complex_dtypes = {torch.complex64, torch.complex128}
+    if hasattr(torch, "cfloat"):
+        complex_dtypes.add(torch.cfloat)
+    if hasattr(torch, "cdouble"):
+        complex_dtypes.add(torch.cdouble)
+    if dtype in complex_dtypes:
+        return True
+
+    is_complex_fn = getattr(torch, "is_complex", None)
+    if callable(is_complex_fn):
+        try:
+            return bool(is_complex_fn(torch.zeros(1, dtype=dtype)))
+        except TypeError:
+            pass
+
+    return False
+
+
 class WaveletConv(BaseSpectralConv):
     """Wavelet convolution using pytorch-wavelets DWT/IDWT implementations."""
 
@@ -125,7 +144,7 @@ class WaveletConv(BaseSpectralConv):
 
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype or (torch.cfloat if complex_data else torch.float32)
-        self.param_dtype = torch.float32 if torch.is_complex_dtype(self.dtype) else self.dtype
+        self.param_dtype = torch.float32 if _is_complex_dtype(self.dtype) else self.dtype
         self.use_amp = use_amp and torch.cuda.is_available()
 
         self.wavelet_mode = _PAD_MODE_MAP.get(self.pad_mode, self.pad_mode)

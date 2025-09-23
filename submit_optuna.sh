@@ -8,7 +8,8 @@
 #SBATCH --error=/data1/home/teacher/teacher_s/t108790/results/logs/%x-%j.err
 #SBATCH --no-requeue
 
-FAMILY=flat_fault
+FAMILY=flat_vel
+WAVETYPE=db8
 
 # ========= 安全开关 & 清理 =========
 set -Eeuo pipefail
@@ -49,6 +50,7 @@ for i in range(torch.cuda.device_count()):
 PY
 
 echo "Family: ${FAMILY}"
+echo "WaveletType: ${WAVETYPE}"
 
 # ========= GPU/NCCL/线程 =========
 export CUDA_VISIBLE_DEVICES=0,1
@@ -66,8 +68,8 @@ export NCCL_P2P_LEVEL=SYS
 # 使用 stdbuf -oL -eL 强制行缓冲；父进程能实时捕捉 REPORT/VAL_LOSS
 CMD=(stdbuf -oL -eL python scripts/tuna_seismic_moe.py
   --n_trials 30
-  --study_name wno_$FAMILY
-  --storage sqlite:////data1/home/teacher/teacher_s/t108790/results/optuna/wno_${FAMILY}.db
+  --study_name wno_${FAMILY}_${WAVETYPE}
+  --storage sqlite:////data1/home/teacher/teacher_s/t108790/results/optuna/wno_${FAMILY}_${WAVETYPE}.db
   --bash_launcher scripts/run_distributed_seismic_moe.sh
   --num_gpus 2
   --cuda_visible_devices 0,1
@@ -78,6 +80,7 @@ CMD=(stdbuf -oL -eL python scripts/tuna_seismic_moe.py
   --top_k 1
   --choose_experts 1
   --is_specific
+  --wavelet_type ${WAVETYPE}
 )
 
 echo "[INFO] Launch: ${CMD[*]}"

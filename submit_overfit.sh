@@ -49,33 +49,33 @@ python scripts/train_seismic_moe.py \
   --wavelet_type db4 \
   --vis_freq 5
 
-# python -m pdb \
-#   scripts/train_seismic_moe.py \
-#   --mode overfit1 \
-#   --data_dir /data1/home/teacher/teacher_s/t108790/FWINO/FWINO_data \
-#   --family flat_vel \
-#   --is_specific \
-#   --batch_size 4 \
-#   --epochs 1000 \
-#   --accum_steps 2 \
-#   --output_dir /data1/home/teacher/teacher_s/t108790/results/overfit1_${SLURM_JOB_NAME}_${SLURM_JOB_ID} \
-#   --learning_rate 0.00010333997431453093 \
-#   --weight_decay 0.0862093097084247 \
-#   --scheduler_gamma 0.4676763741328047 \
-#   --hidden_channels 128 \
-#   --FNO_n_layers 6 \
-#   --WNO_n_layers 6 \
-#   --MNO_n_layers 3 \
-#   --LNO_n_layers 3 \
-#   --WNO_block_n_layers 2 \
-#   --WNO_dropout_rate 0.12328124398155824 \
-#   --WNO_n_levels_height 2 \
-#   --WNO_n_levels_width 3 \
-#   --lambda_g1v 0.30848714348186856 \
-#   --lambda_g2v 0.36656343480393866 \
-#   --top_k 1 \
-#   --choose_experts 1 \
-#   --wavelet_type db4 \
-#   --vis_freq 5
+python -m pdb \
+  scripts/train_seismic_moe.py \
+  --mode train \
+  --data_dir /data1/home/teacher/teacher_s/t108790/FWINO/FWINO_data \
+  --family flat_vel \
+  --is_specific \
+  --batch_size 4 \
+  --epochs 1000 \
+  --accum_steps 2 \
+  --output_dir /data1/home/teacher/teacher_s/t108790/results/overfit1_${SLURM_JOB_NAME}_${SLURM_JOB_ID} \
+  --learning_rate 0.00010333997431453093 \
+  --weight_decay 0.0862093097084247 \
+  --scheduler_gamma 0.4676763741328047 \
+  --hidden_channels 128 \
+  --FNO_n_layers 6 \
+  --WNO_n_layers 6 \
+  --MNO_n_layers 3 \
+  --LNO_n_layers 3 \
+  --WNO_block_n_layers 2 \
+  --WNO_dropout_rate 0.12328124398155824 \
+  --WNO_n_levels_height 2 \
+  --WNO_n_levels_width 3 \
+  --lambda_g1v 0.30848714348186856 \
+  --lambda_g2v 0.36656343480393866 \
+  --top_k 1 \
+  --choose_experts 1 \
+  --wavelet_type db8 \
+  --vis_freq 5
 
   
