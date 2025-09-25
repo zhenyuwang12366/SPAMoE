@@ -100,6 +100,7 @@ def train_one_epoch(
     micro_count = 0
     optim_count = 0
     num_steps = len(train_loader)
+    nan_detected = False
     
     # router type判断
     router_type = model.module.router_type if hasattr(model, "module") else model.router_type
@@ -137,22 +138,33 @@ def train_one_epoch(
         # DDP 同步控制
         sync_ctx = (model.no_sync() if (is_ddp and not last_micro) else nullcontext())
 
+        step_has_nan = False
         with sync_ctx:
             preds, aux_loss = model(inputs)
             loss_dict = criterion(preds, targets)
             # —— 未缩放的“真实训练损失”（用于日志统计） —— #
             loss_raw = loss_dict["loss"] + coef * aux_loss
 
-            # —— 用于反传的缩放 —— #
-            current_group_size = accum_steps if not last_micro else ( (step % accum_steps) + 1 )
-            loss = loss_raw / current_group_size
-            loss.backward()
+            if not torch.isfinite(loss_raw).item():
+                step_has_nan = True
+                nan_detected = True
+            else:
+                # —— 用于反传的缩放 —— #
+                current_group_size = accum_steps if not last_micro else ( (step % accum_steps) + 1 )
+                loss = loss_raw / current_group_size
+                loss.backward()
 
-            # —— 统计（用未缩放的口径，便于和 val 对齐） —— #
-            running_train_loss += loss_raw.item()
-            running_aux_loss   += aux_loss.item()
-            micro_in_group     += 1
-            micro_count        += 1
+                # —— 统计（用未缩放的口径，便于和 val 对齐） —— #
+                running_train_loss += loss_raw.item()
+                running_aux_loss   += aux_loss.item()
+                micro_in_group     += 1
+                micro_count        += 1
+
+        if step_has_nan:
+            optimizer.zero_grad(set_to_none=True)
+            if is_logger:
+                print(f"[NaN Detected] loss became NaN at step {step + 1}, aborting epoch early.")
+            break
 
         if last_micro:
             optimizer.step()
@@ -168,11 +180,25 @@ def train_one_epoch(
             pbar_iter.set_postfix({"train_loss": f"{loss_raw.item():.6f}"})  # 展示未缩放损失
 
     # —— 训练集 loss（micro-step 平均）——
-    avg_train_loss = running_train_loss / max(1, micro_count)
-    avg_aux_loss = running_aux_loss / max(1, micro_count)
+    if nan_detected and micro_count == 0:
+        avg_train_loss = float("nan")
+        avg_aux_loss = float("nan")
+    else:
+        avg_train_loss = running_train_loss / max(1, micro_count)
+        avg_aux_loss = running_aux_loss / max(1, micro_count)
+
     # —— 验证 —— #
-    val_stats = _evaluate_one_epoch(model, val_loader, device, criterion, metrics_module)
-    val_loss = val_stats["val_loss"]
+    if nan_detected:
+        val_stats = {
+            "val_loss": float("inf"),
+            "mse": float("nan"),
+            "mae": float("nan"),
+            "psnr": float("nan")
+        }
+        val_loss = float("inf")
+    else:
+        val_stats = _evaluate_one_epoch(model, val_loader, device, criterion, metrics_module)
+        val_loss = val_stats["val_loss"]
     if router_type == 'adamv':
         signal = router.step_validation(val_loss)
         # 多进程之间同步信号
@@ -287,7 +313,7 @@ def train_one_epoch(
     # —— 早停（仅主进程判定，后广播）—— #
     stop_flag = 0
     if getattr(config, "early_stop", False):
-        if is_logger and early_stopper is not None:
+        if is_logger and early_stopper is not None and not nan_detected:
             if early_stopper.step(val_loss, epoch):
                 stop_flag = 1
 
@@ -299,6 +325,14 @@ def train_one_epoch(
 
         if stop_flag == 1 and is_logger:
             print(f"[EARLY STOP] stop at epoch={epoch+1}, best_val_loss={best_val_loss:.6f}")
+
+    if nan_detected:
+        stop_flag = 1
+        if getattr(config, "distributed", None) and getattr(config.distributed, "use_distributed", False):
+            device_for_flag = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+            flag_tensor = torch.tensor([stop_flag], device=device_for_flag, dtype=torch.int32)
+            torch.distributed.broadcast(flag_tensor, src=0)
+            stop_flag = int(flag_tensor.item())
 
     # —— 调度器（按 epoch）—— #
     if lr_scheduler is not None and scheduler_step_mode == "per_epoch":

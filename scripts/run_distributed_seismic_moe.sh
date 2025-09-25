@@ -43,6 +43,13 @@ WNO_N_LAYERS=4
 WNO_BLOCK_N_LAYERS=2
 WNO_DROPOUT_RATE=0.1
 WAVELET_TYPE="haar"   # haar | db4
+WNO_PAD_MODE=""
+WNO_ENSURE_SHAPES=""
+WNO_ADAPTIVE_PADDING=""
+WNO_USE_CHANNEL_MLP=""
+WNO_CHANNEL_MLP_DROPOUT=""
+WNO_CHANNEL_MLP_EXPANSION=""
+DTCWT_TYPE=()
 
 MNO_SCALES=3
 MNO_FACTORS=(1.0 0.5 0.25)
@@ -111,6 +118,16 @@ while [[ $# -gt 0 ]]; do
     --WNO_block_n_layers) WNO_BLOCK_N_LAYERS="$2"; shift 2 ;;
     --WNO_dropout_rate) WNO_DROPOUT_RATE="$2"; shift 2 ;;
     --wavelet_type) WAVELET_TYPE="$2"; shift 2 ;;
+    --WNO_pad_mode) WNO_PAD_MODE="$2"; shift 2 ;;
+    --WNO_ensure_even_shapes) WNO_ENSURE_SHAPES="1"; shift ;;
+    --WNO_disable_ensure_even_shapes) WNO_ENSURE_SHAPES="0"; shift ;;
+    --WNO_adaptive_padding) WNO_ADAPTIVE_PADDING="1"; shift ;;
+    --WNO_disable_adaptive_padding) WNO_ADAPTIVE_PADDING="0"; shift ;;
+    --WNO_use_channel_mlp) WNO_USE_CHANNEL_MLP="1"; shift ;;
+    --WNO_disable_channel_mlp) WNO_USE_CHANNEL_MLP="0"; shift ;;
+    --WNO_channel_mlp_dropout) WNO_CHANNEL_MLP_DROPOUT="$2"; shift 2 ;;
+    --WNO_channel_mlp_expansion) WNO_CHANNEL_MLP_EXPANSION="$2"; shift 2 ;;
+    --dtcwt_type) shift; DTCWT_TYPE=(); while [[ $# -gt 0 && $1 != --* ]]; do DTCWT_TYPE+=("$1"); shift; done ;;
 
     --MNO_n_scales) MNO_SCALES="$2"; shift 2 ;;
     --MNO_scale_factors) shift; MNO_FACTORS=(); while [[ $# -gt 0 && $1 != --* ]]; do MNO_FACTORS+=("$1"); shift; done ;;
@@ -192,6 +209,13 @@ echo "专家选择: ${CHOOSE_EXPERTS[*]}"
 echo "FNO(H,W,layers): ($FNO_H, $FNO_W, $FNO_N_LAYERS)"
 echo "WNO(levels H,W): ($WNO_H, $WNO_W)"
 echo "WNO(n_layers, block_layers, dropout, wavelet): ($WNO_N_LAYERS, $WNO_BLOCK_N_LAYERS, $WNO_DROPOUT_RATE, $WAVELET_TYPE)"
+echo "WNO pad_mode override: ${WNO_PAD_MODE:-<default>}"
+echo "WNO ensure_even_shapes flag: ${WNO_ENSURE_SHAPES:-<default>}"
+echo "WNO adaptive_padding flag: ${WNO_ADAPTIVE_PADDING:-<default>}"
+echo "WNO channel MLP usage flag: ${WNO_USE_CHANNEL_MLP:-<default>}"
+echo "WNO channel MLP dropout: ${WNO_CHANNEL_MLP_DROPOUT:-<default>}"
+echo "WNO channel MLP expansion: ${WNO_CHANNEL_MLP_EXPANSION:-<default>}"
+echo "DTCWT type: ${DTCWT_TYPE[*]:-<None>}"
 echo "MNO(scales,layers,factors): ($MNO_SCALES, $MNO_LAYERS, ${MNO_FACTORS[*]})"
 echo "LNO(modes H W, layers): (${LNO_MODES[*]}, $LNO_LAYERS)"
 echo "Hidden Channels: $HIDDEN_CHANNELS"
@@ -260,6 +284,26 @@ ARGS=(
   --lambda_g1v "$LAMBDA_G1V"
   --lambda_g2v "$LAMBDA_G2V"
 )
+
+[[ ${#DTCWT_TYPE[@]} -eq 2 ]] && ARGS+=( --dtcwt_type "${DTCWT_TYPE[@]}" )
+[[ -n "$WNO_PAD_MODE" ]] && ARGS+=( --WNO_pad_mode "$WNO_PAD_MODE" )
+if [[ "$WNO_ENSURE_SHAPES" == "1" ]]; then
+  ARGS+=( --WNO_ensure_even_shapes )
+elif [[ "$WNO_ENSURE_SHAPES" == "0" ]]; then
+  ARGS+=( --WNO_disable_ensure_even_shapes )
+fi
+if [[ "$WNO_ADAPTIVE_PADDING" == "1" ]]; then
+  ARGS+=( --WNO_adaptive_padding )
+elif [[ "$WNO_ADAPTIVE_PADDING" == "0" ]]; then
+  ARGS+=( --WNO_disable_adaptive_padding )
+fi
+if [[ "$WNO_USE_CHANNEL_MLP" == "1" ]]; then
+  ARGS+=( --WNO_use_channel_mlp )
+elif [[ "$WNO_USE_CHANNEL_MLP" == "0" ]]; then
+  ARGS+=( --WNO_disable_channel_mlp )
+fi
+[[ -n "$WNO_CHANNEL_MLP_DROPOUT" ]] && ARGS+=( --WNO_channel_mlp_dropout "$WNO_CHANNEL_MLP_DROPOUT" )
+[[ -n "$WNO_CHANNEL_MLP_EXPANSION" ]] && ARGS+=( --WNO_channel_mlp_expansion "$WNO_CHANNEL_MLP_EXPANSION" )
 
 # 可选开关类参数
 [[ "$USE_WANDB" -eq 1 ]]   && ARGS+=( --use_wandb )

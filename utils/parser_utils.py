@@ -66,8 +66,29 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='每个WNO块内部的层数')
     parser.add_argument('--WNO_dropout_rate', type=float, default=0.1,
                         help='WNO块中的dropout比例，提高泛化能力')
-    parser.add_argument('--wavelet_type', type=str, default='haar', choices=['coif4','db4','db8','sym4','coif5','sym8'],
-                        help='小波类型，支持haar和db4小波')
+    parser.add_argument('--wavelet_type', type=str, default='haar', choices=['coif4','db4','db8','sym4','coif5','sym8','db6'],
+                        help='小波类型')
+    parser.add_argument('--dtcwt_type', nargs=2, type=str, default=None,
+                        help='双树复小波类型')
+    parser.add_argument('--WNO_pad_mode', type=str, default=None, choices=['constant', 'reflect', 'replicate', 'circular'],
+                        help='WNO填充模式')
+    parser.add_argument('--WNO_ensure_even_shapes', dest='WNO_ensure_even_shapes', action='store_true', default=None,
+                        help='启用WNO偶数形状约束')
+    parser.add_argument('--WNO_disable_ensure_even_shapes', dest='WNO_ensure_even_shapes', action='store_false',
+                        help='禁用WNO偶数形状约束')
+    parser.add_argument('--WNO_adaptive_padding', dest='WNO_adaptive_padding', action='store_true', default=None,
+                        help='启用WNO自适应填充')
+    parser.add_argument('--WNO_disable_adaptive_padding', dest='WNO_adaptive_padding', action='store_false',
+                        help='禁用WNO自适应填充')
+    parser.add_argument('--WNO_use_channel_mlp', dest='WNO_use_channel_mlp', action='store_true', default=None,
+                        help='启用WNO通道MLP')
+    parser.add_argument('--WNO_disable_channel_mlp', dest='WNO_use_channel_mlp', action='store_false',
+                        help='禁用WNO通道MLP')
+    parser.add_argument('--WNO_channel_mlp_dropout', type=float, default=None,
+                        help='WNO通道MLP的dropout比例')
+    parser.add_argument('--WNO_channel_mlp_expansion', type=float, default=None,
+                        help='WNO通道MLP的扩展倍率')
+    
     parser.add_argument('--MNO_n_scales', type=int, default=3,
                         help='总共使用的尺度')
     parser.add_argument('--MNO_scale_factors', nargs='+', type=float, default=[1.0, 0.5, 0.25],

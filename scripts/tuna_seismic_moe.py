@@ -70,6 +70,26 @@ def build_bash_cmd(args, trial_number: int, hp: dict) -> list:
         "--choose_experts", *choose_exp,
         "--wavelet_type", str(args.wavelet_type),
     ]
+    if args.dtcwt_type:
+        argv += ["--dtcwt_type", *args.dtcwt_type]
+    if args.WNO_pad_mode:
+        argv += ["--WNO_pad_mode", args.WNO_pad_mode]
+    if args.WNO_ensure_even_shapes is True:
+        argv.append("--WNO_ensure_even_shapes")
+    elif args.WNO_ensure_even_shapes is False:
+        argv.append("--WNO_disable_ensure_even_shapes")
+    if args.WNO_adaptive_padding is True:
+        argv.append("--WNO_adaptive_padding")
+    elif args.WNO_adaptive_padding is False:
+        argv.append("--WNO_disable_adaptive_padding")
+    if args.WNO_use_channel_mlp is True:
+        argv.append("--WNO_use_channel_mlp")
+    elif args.WNO_use_channel_mlp is False:
+        argv.append("--WNO_disable_channel_mlp")
+    if args.WNO_channel_mlp_dropout is not None:
+        argv += ["--WNO_channel_mlp_dropout", str(args.WNO_channel_mlp_dropout)]
+    if args.WNO_channel_mlp_expansion is not None:
+        argv += ["--WNO_channel_mlp_expansion", str(args.WNO_channel_mlp_expansion)]
     if args.is_specific:
         argv.append("--is_specific")
 
@@ -119,6 +139,26 @@ def main():
     ap.add_argument("--is_specific", action="store_true")
     ap.add_argument('--wavelet_type', type=str, default='haar', choices=['coif4','db4','db8','sym4','coif5','sym8'],
                         help='小波类型')
+    ap.add_argument('--dtcwt_type', nargs=2, type=str, default=None,
+                        help='双树复小波类型')
+    ap.add_argument('--WNO_pad_mode', type=str, default=None, choices=['constant', 'reflect', 'replicate', 'circular'],
+                        help='WNO填充模式')
+    ap.add_argument('--WNO_ensure_even_shapes', dest='WNO_ensure_even_shapes', action='store_true', default=None,
+                        help='启用WNO偶数形状约束')
+    ap.add_argument('--WNO_disable_ensure_even_shapes', dest='WNO_ensure_even_shapes', action='store_false',
+                        help='禁用WNO偶数形状约束')
+    ap.add_argument('--WNO_adaptive_padding', dest='WNO_adaptive_padding', action='store_true', default=None,
+                        help='启用WNO自适应填充')
+    ap.add_argument('--WNO_disable_adaptive_padding', dest='WNO_adaptive_padding', action='store_false',
+                        help='禁用WNO自适应填充')
+    ap.add_argument('--WNO_use_channel_mlp', dest='WNO_use_channel_mlp', action='store_true', default=None,
+                        help='启用WNO通道MLP')
+    ap.add_argument('--WNO_disable_channel_mlp', dest='WNO_use_channel_mlp', action='store_false',
+                        help='禁用WNO通道MLP')
+    ap.add_argument('--WNO_channel_mlp_dropout', type=float, default=None,
+                        help='WNO通道MLP的dropout比例')
+    ap.add_argument('--WNO_channel_mlp_expansion', type=float, default=None,
+                        help='WNO通道MLP的扩展倍率')
     
     args = ap.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -242,9 +282,20 @@ def main():
             return float("inf")
 
         # 没有拿到最终指标：通常是缓冲/0 batch/日志没打印到
-        if final_val is None or not math.isfinite(final_val):
+        if final_val is None:
             with open(os.path.join(trial_dir, "NO_FINAL_VAL"), "w") as f:
                 f.write("No VAL_LOSS parsed. Check buffering / dataset / val loop.\n")
+            return float("inf")
+
+        if math.isinf(final_val):
+            with open(os.path.join(trial_dir, "VAL_INF"), "w") as f:
+                f.write("val_loss reported as inf; aborting study.\n")
+            study.stop()
+            raise RuntimeError(f"Trial {trial.number} produced infinite val_loss. Stopping Optuna study.")
+
+        if not math.isfinite(final_val):
+            with open(os.path.join(trial_dir, "NO_FINAL_VAL"), "w") as f:
+                f.write("Non-finite VAL_LOSS parsed.\n")
             return float("inf")
 
         return float(final_val)
