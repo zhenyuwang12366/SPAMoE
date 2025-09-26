@@ -52,7 +52,7 @@ def load_factory(
     hidden_channels: int,
     model_dict: OrderedDict,
 ) -> List[nn.Module]: 
-    """专家融合工厂
+    """专家工厂
 
     Args:
         experts_config (List[Dict[str, Any]]): 专家配置字典

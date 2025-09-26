@@ -236,6 +236,7 @@ class MOEOperator(BaseModel, name='MOE'):
         task_dim: int = 0,
         routing_mode: str = 'input',
         is_logger: bool = False,
+        v_type_num: Optional[int] = None,
         **kwargs
     ):
         super().__init__()
@@ -246,14 +247,17 @@ class MOEOperator(BaseModel, name='MOE'):
         self.out_channels = out_channels
         self.hidden_channels = hidden_channels
         self.top_k = top_k
-
+        
+        if(v_type_num is None):
+            self.v_type_num = 5 if self.config.get('is_specific', True) else 3
+        
         # 专家列表
         self.experts = nn.ModuleList(experts)
         if self.config.get('is_classier', False):
             if self.config.get('is_specific', True):
-                self.num_experts = int(len(experts) / 5)
+                self.num_experts = int(len(experts) / self.v_type_num)
             else:
-                self.num_experts = int(len(experts) / 3)
+                self.num_experts = int(len(experts) / self.v_type_num)
         else:
             self.num_experts = len(experts)
 
@@ -285,10 +289,9 @@ class MOEOperator(BaseModel, name='MOE'):
             self.classier.conv1 = new_conv
 
             in_features = self.classier.fc.in_features
-            if self.config.get('is_specific', True):  # 5类
-                self.fc = nn.Linear(in_features, 5)
-            else:  # 3类
-                self.fc = nn.Linear(in_features, 3)
+            
+            self.fc = nn.Linear(in_features, self.v_type_num)
+            
             self.classier.fc = nn.Identity()
 
         # -------- 路由器 --------
@@ -512,7 +515,7 @@ class MOEOperator(BaseModel, name='MOE'):
 
         if self.config.get('is_classier', False):
             feats = self.classier(x)
-            type_logits = self.fc(feats)  # B*5/B*3
+            type_logits = self.fc(feats)  # B*v_type/B*v_type
             type_weights = torch.softmax(type_logits, dim=-1)
         else:
             type_weights = None
@@ -621,7 +624,7 @@ class MOEOperator(BaseModel, name='MOE'):
         
         top_k = k  # 统一命名
         C = self.out_channels
-        T = None if type_weights is None else (5 if self.config.get('is_specific', True) else 3)
+        T = self.v_type_num
 
         try:
             x = F.interpolate(x, size=(256, 256), mode='bilinear', align_corners=True)
@@ -705,7 +708,7 @@ class MOEOperator(BaseModel, name='MOE'):
 
         if type_weights is not None:
             # ------------------------- 分组模式（组内 T 子模型按类型权重加权） -------------------------
-            T = 5 if self.config.get('is_specific', True) else 3
+            T = self.v_type_num
 
             for k_idx in range(top_k):
                 group_ids: torch.Tensor = expert_indices[:, k_idx]   # [B]
