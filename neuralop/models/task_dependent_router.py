@@ -14,7 +14,7 @@ class TaskDependentRouter(nn.Module):
         init_num: int = 1,
         patience: int = 3,
         noisy_gating: bool = True,
-        alpha: float = 0.5,
+        alpha: float = 0.0,
     ):
         # 子类调用父类初始化方法，assert判断
         super().__init__()

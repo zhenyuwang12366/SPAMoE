@@ -24,7 +24,7 @@ cleanup() {
 trap cleanup SIGINT SIGTERM EXIT
 
 # ========= 路径与环境 =========
-cd /data1/home/teacher/teacher_s/t108790/FWINO_wzy_test
+cd /data1/home/teacher/teacher_s/t108790/FWINO_wzy
 
 # 确保日志/结果目录存在（用绝对路径，避免相对路径权限/基准目录不一致）
 mkdir -p /data1/home/teacher/teacher_s/t108790/results/logs

@@ -41,13 +41,14 @@ class Router(nn.Module):
         hidden_dim: int = 256,
         top_k: int = 2,
         noisy_gating: bool = True,
+        alpha: float = 0.0,
     ):
         super().__init__()
         self.input_dim = input_dim
         self.num_experts = num_experts
         self.top_k = min(top_k, num_experts)
         self.noisy_gating = noisy_gating
-        self.alpha = 0.1 # aux负载均衡损失因子
+        self.alpha = alpha # aux负载均衡损失因子
         
         # 路由器网络
         self.router = nn.Sequential(
@@ -298,6 +299,10 @@ class MOEOperator(BaseModel, name='MOE'):
             pass
 
         # -------- 路由器 --------
+        if self.num_experts > 1:
+            self.alpha: float = 0.1
+        else:
+            self.alpha: float = 0.0
         if self.router_type == 'task_aware' and self.fusion_type == 'swa':
             raise ValueError("task_aware 路由当前不支持 'swa' 融合（缺少弱组）。")
         if router_type == 'basic':
@@ -306,7 +311,8 @@ class MOEOperator(BaseModel, name='MOE'):
                 num_experts=self.num_experts,
                 hidden_dim=router_hidden_dim,
                 top_k=self.top_k,
-                noisy_gating=noisy_gating
+                noisy_gating=noisy_gating,
+                alpha = self.alpha,
             )
         elif router_type == 'task_aware':
             self.router = TaskAwareRouter(
@@ -316,7 +322,7 @@ class MOEOperator(BaseModel, name='MOE'):
                 hidden_dim=router_hidden_dim,
                 top_k=self.top_k,
                 noisy_gating=noisy_gating,
-                routing_mode=routing_mode
+                routing_mode=routing_mode,
             )
         elif router_type == 'adamv':
             self.router = TaskDependentRouter(
@@ -324,6 +330,7 @@ class MOEOperator(BaseModel, name='MOE'):
                 num_experts=self.num_experts,
                 hidden_dim=router_hidden_dim,
                 noisy_gating=noisy_gating,
+                alpha = self.alpha,
             )
         else:
             raise ValueError(f"不支持的路由器类型: {router_type}")
@@ -341,11 +348,7 @@ class MOEOperator(BaseModel, name='MOE'):
             elif self.config.get(cfg_key, None) == 'sum':
                 module = SumMix(self.out_channels)
             setattr(self, t, module)
-
-        if fusion_type == 'swa':
-            self.s_act = GroupActMerge(processor=self.s_processor)
-            self.w_act = GroupActMerge(processor=self.w_processor)
-
+        
         # -------- 融合层 --------
         if fusion_type == 'linear':
             self.fusion = nn.Linear(self.out_channels, self.out_channels)
@@ -356,6 +359,8 @@ class MOEOperator(BaseModel, name='MOE'):
                 batch_first=True
             )
         elif fusion_type == 'swa':
+            self.s_act = GroupActMerge(processor=self.s_processor)
+            self.w_act = GroupActMerge(processor=self.w_processor)
             self.sw_act = SWActMerge(beta=self.config.get('beta', 0.5))
         else:
             raise ValueError(f"未支持的融合类型: {fusion_type}")
@@ -565,7 +570,7 @@ class MOEOperator(BaseModel, name='MOE'):
 
         # 合并专家输出
         if self.fusion_type == 'swa':
-            s_combined = torch.stack(s_outputs, dim=1)  # (B, k, 1, h, w) —— 注意：按你的实现矢量化
+            s_combined = torch.stack(s_outputs, dim=1)  # (B, k, 1, h, w)
             w_combined = torch.stack(w_outputs, dim=1)
             s_merged = self.s_act(s_combined)
             w_merged = self.w_act(w_combined)
@@ -631,11 +636,13 @@ class MOEOperator(BaseModel, name='MOE'):
         C = self.out_channels
         T = self.v_type_num
 
-        try:
-            x = F.interpolate(x, size=(256, 256), mode='bilinear', align_corners=True)
-        except Exception as e:
-            if self.is_logger:
-                print(f"[WARN] 输入插值到(256,256)失败：{e}，将使用原始形状 {tuple(x.shape)}")
+        # ==========（可选）统一输入尺寸给专家；默认关闭以保留原始 T×R 语义 ==========
+        if self.config.get('resize_input_for_experts', False):
+            try:
+                x = F.interpolate(x, size=(256, 256), mode='bilinear', align_corners=True)
+            except Exception as e:
+                if self.is_logger:
+                    print(f"[WARN] 输入插值到(256,256)失败：{e}，保持原始形状 {tuple(x.shape)}")
 
         def _zeros_like_x(bsz: int, channels: int, like: torch.Tensor) -> torch.Tensor:
             return torch.zeros(bsz, channels, *like.shape[2:], device=like.device, dtype=like.dtype)
