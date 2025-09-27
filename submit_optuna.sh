@@ -86,13 +86,27 @@ CMD=(stdbuf -oL -eL python scripts/tuna_seismic_moe.py
 echo "[INFO] Launch: ${CMD[*]}"
 
 # 可选：在某些集群用 srun 更稳（资源/环境传递更明确）
-# srun --ntasks=1 --cpus-per-task=${SLURM_CPUS_PER_TASK} --gres=gpu:2 --unbuffered "${CMD[@]}"
+srun --ntasks=1 --cpus-per-task=${SLURM_CPUS_PER_TASK} --gres=gpu:2 --unbuffered "${CMD[@]}"
 
 # 不用 srun 也可以，保持为单进程：
-"${CMD[@]}" &
-MAIN_PID=$!
-MAIN_PGID=$(ps -o pgid= "$MAIN_PID" | tr -d ' ')
-export MAIN_PGID
+# "${CMD[@]}" &
+# MAIN_PID=$!
+# MAIN_PGID=$(ps -o pgid= "$MAIN_PID" | tr -d ' ')
+# export MAIN_PGID
 
-wait "$MAIN_PID"
+# wait "$MAIN_PID"
 echo "Optuna 调参流程结束。"
+
+# CUDA_VISIBLE_DEVICES=0,1 python -m pdb scripts/tuna_seismic_moe.py \
+#   --study_name wno_flat_vel_db8_debug \
+#   --bash_launcher scripts/run_distributed_seismic_moe.sh \
+#   --num_gpus 2 \
+#   --cuda_visible_devices "0,1" \
+#   --data_dir /data1/home/teacher/teacher_s/t108790/FWINO/FWINO_data \
+#   --family "flat_vel" \
+#   --output_dir /data1/home/teacher/teacher_s/t108790/results/optuna/optuna_seismic_moe_"${SLURM_JOB_NAME}"_"${SLURM_JOB_ID}" \
+#   --num_workers 10 \
+#   --top_k 1 \
+#   --choose_experts 1 \
+#   --is_specific \
+#   --wavelet_type "db8"

@@ -5,7 +5,7 @@ from typing import Tuple, List, Union
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-
+import traceback
 # 导入混合精度训练相关模块
 try:
     import torch.cuda.amp as amp
@@ -419,9 +419,9 @@ class WNOBlock(nn.Module):
             
             except Exception as e:
                 print(f"WNOBlock第{i}层处理中发生错误: {str(e)}")
-                # 如果处理过程中发生错误，终止循环
+                # 打印完整堆栈到标准错误
+                traceback.print_exc()
                 break
-                
         return x
     
     def enable_gradient_monitoring(self, save_dir=None):
@@ -668,7 +668,7 @@ class WNO(BaseModel, name='WNO'):
         """
         # 使用混合精度训练
         if self.use_amp and amp is not None:
-            with torch.amp.autocast('cuda'):
+            with torch.autocast(device_type='cuda'):
                 return self._forward_impl(x, output_shape, **kwargs)
         else:
             return self._forward_impl(x, output_shape, **kwargs)

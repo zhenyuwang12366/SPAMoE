@@ -248,9 +248,11 @@ class MOEOperator(BaseModel, name='MOE'):
         self.hidden_channels = hidden_channels
         self.top_k = top_k
         
-        if(v_type_num is None):
+        if v_type_num is None:
             self.v_type_num = 5 if self.config.get('is_specific', True) else 3
-        
+        else:
+            self.v_type_num = v_type_num
+            
         # 专家列表
         self.experts = nn.ModuleList(experts)
         if self.config.get('is_classier', False):
@@ -261,18 +263,17 @@ class MOEOperator(BaseModel, name='MOE'):
         else:
             self.num_experts = len(experts)
 
-        self.w_k = self.num_experts - top_k
         self.noisy_gating = noisy_gating
         self.fusion_type = fusion_type
         self.router_type = router_type
 
         # 确保 top_k 不超过专家数量
         self.top_k = min(self.top_k, self.num_experts)
-
-        # -------- 分类器骨干（ImageNet 预训练 ResNet50，改单通道）--------
+        # 得出弱专家组专家数
+        self.w_k = self.num_experts - top_k
+        
+        # -------- 分类器骨干（ImageNet 预训练 ResNet50，B*1*H*W）--------
         if self.config.get('is_classier', False):
-            pass
-        else:
             self.classier = models.resnet50(pretrained=True)
             old_conv = self.classier.conv1
             new_conv = nn.Conv2d(
@@ -293,8 +294,12 @@ class MOEOperator(BaseModel, name='MOE'):
             self.fc = nn.Linear(in_features, self.v_type_num)
             
             self.classier.fc = nn.Identity()
+        else:
+            pass
 
         # -------- 路由器 --------
+        if self.router_type == 'task_aware' and self.fusion_type == 'swa':
+            raise ValueError("task_aware 路由当前不支持 'swa' 融合（缺少弱组）。")
         if router_type == 'basic':
             self.router = Router(
                 input_dim=in_channels,
@@ -520,8 +525,8 @@ class MOEOperator(BaseModel, name='MOE'):
         else:
             type_weights = None
 
-        # x: [B,1,1000,350] -> 展平再均值
-        x_flat = x.view(batch_size, -1, self.in_channels).mean(dim=1)
+        # x: [B,1,1000,350] -> 对 C H W 做均值
+        x_flat = x.mean(dim=(2, 3)).view(batch_size, -1)  # [B, in_channels]
 
         # 路由
         if self.router_type == 'basic':
@@ -529,7 +534,7 @@ class MOEOperator(BaseModel, name='MOE'):
         elif self.router_type == 'adamv':
             s_weights, s_indices, w_weights, w_indices, aux_loss, new_k = self.router(x_flat)
             self.top_k = new_k
-            self.w_k = self.num_experts - self.top_k
+            self.w_k = max(0, self.num_experts - self.top_k)
         else:  # task_aware
             s_weights, s_indices = self.router(x_flat, task_features)
             w_weights = w_indices = None

@@ -218,7 +218,7 @@ def main():
                 env=env,
                 preexec_fn=os.setsid,   # Linux 下新建进程组
             )
-
+            
             # 后台线程：持续转储 stderr，防止阻塞
             def _drain_stderr():
                 try:
