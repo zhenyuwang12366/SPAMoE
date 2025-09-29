@@ -74,8 +74,8 @@ def visualize_results(inputs, targets, predictions, save_dir='./results', max_sa
         # 绘制目标（速度图或模型）
         target_map = targets[i, 0].cpu().numpy()
         pred_map = predictions[i, 0].cpu().numpy()
-        vmin = min(float(target_map.min()), float(pred_map.min()))
-        vmax = max(float(target_map.max()), float(pred_map.max()))
+        vmin = float(target_map.min())
+        vmax = float(target_map.max())
         shared_norm = Normalize(vmin=vmin, vmax=vmax)
 
         im1 = axes[1].imshow(target_map, cmap='jet', norm=shared_norm)
