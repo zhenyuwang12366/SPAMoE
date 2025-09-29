@@ -144,6 +144,8 @@ class SeismicMOEConfig(Default):
     lambda_g2v = 1.0
     lambda_ssim = 0.5
     lambda_grad = 0.1
+    lambda_grad_l1 = 0.0
+    lambda_fourier_mag_l1 = 0.0
     
     # 评估指标配置
     metrics = ['mse', 'mae', 'psnr']

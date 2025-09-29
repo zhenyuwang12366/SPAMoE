@@ -130,8 +130,8 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
     # Loss related
     parser.add_argument('-g1v', '--lambda_g1v', type=float, default=1.0)
     parser.add_argument('-g2v', '--lambda_g2v', type=float, default=1.0)
-    parser.add_argument('--lambda_ssim', type=float, default=0.5)
-    parser.add_argument('--lambda_grad', type=float, default=0.1)
+    parser.add_argument('--lambda_grad_l1', type=float, default=0.0)
+    parser.add_argument('--lambda_fourier_mag_l1', type=float, default=0.0)
     
     # Performance related
     parser.add_argument('--profile_timing', action='store_true',

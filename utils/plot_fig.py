@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
 import re
 import pandas as pd
 import torch
@@ -71,14 +72,21 @@ def visualize_results(inputs, targets, predictions, save_dir='./results', max_sa
         plt.colorbar(im0, ax=axes[0])
         
         # 绘制目标（速度图或模型）
-        im1 = axes[1].imshow(targets[i, 0].cpu().numpy(), cmap='jet')
+        target_map = targets[i, 0].cpu().numpy()
+        pred_map = predictions[i, 0].cpu().numpy()
+        vmin = min(float(target_map.min()), float(pred_map.min()))
+        vmax = max(float(target_map.max()), float(pred_map.max()))
+        shared_norm = Normalize(vmin=vmin, vmax=vmax)
+
+        im1 = axes[1].imshow(target_map, cmap='jet', norm=shared_norm)
         axes[1].set_title('targets model')
-        plt.colorbar(im1, ax=axes[1])
         
         # 绘制预测（速度图或模型）
-        im2 = axes[2].imshow(predictions[i, 0].cpu().numpy(), cmap='jet')
+        im2 = axes[2].imshow(pred_map, cmap='jet', norm=shared_norm)
         axes[2].set_title('predictions model')
-        plt.colorbar(im2, ax=axes[2])
+
+        cbar = fig.colorbar(im1, ax=axes[1:3], fraction=0.046, pad=0.04)
+        cbar.set_label('Model amplitude')
         
         # 保存图像
         plt.tight_layout()

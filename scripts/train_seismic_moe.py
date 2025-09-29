@@ -28,7 +28,7 @@ from neuralop.utils import get_wandb_api_key, count_model_params
 from config.seismic_moe_config import SeismicMOEConfig
 import neuralop.mpu.comm as comm
 from scripts.scheduler import WarmupMultiStepLR
-from neuralop.losses import L1L2Loss, CombinedLoss
+from neuralop.losses import L1L2Loss, SobelLoss, FourierMag_L1
 from utils import *
  
 print("-----------------------------------------------------------")
@@ -42,194 +42,17 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     args : argparse.Namespace
         命令行参数
     """
-    # 加载配置
-    config = SeismicMOEConfig()
-    
-    # 更新配置
-    # 代码解释：如果用户在命令行中传入了参数 --data_dir，那就用用户的这个路径；否则，就使用默认路径 "/data1/wuruoyu/waveform-inversion"。
-    
-    # 设置随机种子
-    config.distributed.seed = args.seed
-    
-    # 启用分布式训练
-    if args.distributed:
-        config.distributed.use_distributed = True
-        device, is_logger = setup(config)
-    else:
-        device, is_logger = setup(config)
-    
-    local_rank = comm.get_local_rank()
-    global_rank = comm.get_global_rank()
-    world_size = comm.get_world_size()
-    
-    if args.data_dir:
-        config.data_dir = args.data_dir
-    else:
-        # 设置默认数据目录为新路径
-        config.data_dir = r"/root/autodl-tmp/FWINO/FWINO_data"
-    config.output_dir = args.output_dir
+    config, runtime_ctx = get_seismic_config(args)
 
-        #解释见onenote1
-    if args.family:
-        config.family = args.family
-    if args.batch_size:
-        config.batch_size = args.batch_size
-    if args.epochs:
-        config.epochs = args.epochs
-    if args.learning_rate:
-        config.learning_rate = args.learning_rate
-    if args.hidden_channels:
-        config.hidden_channels = args.hidden_channels
-    if args.lr_warmup_epochs:
-        config.lr_warmup_epochs = args.lr_warmup_epochs
-    if args.weight_decay:
-        config.weight_decay = args.weight_decay
-    if args.scheduler_gamma:
-        config.scheduler_gamma = args.scheduler_gamma
-    if args.accum_steps is not None:
-        config.accum_steps = args.accum_steps
-  
-    accum_steps = config.accum_steps
+    device = runtime_ctx["device"]
+    is_logger = runtime_ctx["is_logger"]
+    world_size = runtime_ctx["world_size"]
+    local_rank = runtime_ctx["local_rank"]
+    val_ratio = runtime_ctx["val_ratio"]
+    experts_name = runtime_ctx["experts_name"]
+    experts_name_str = runtime_ctx["experts_name_str"]
     use_amp = config.use_amp
     
-    config.lr_warmup_epochs = int(config.epochs * 0.05)
-    
-    if is_logger:
-        print(f'batch_size:{config.batch_size}')
-        print(f'effective_batch_size:{world_size * config.batch_size * config.accum_steps}')
-        print(f'epochs:{config.epochs}')
-        print(f'learning_rate:{config.learning_rate}')
-        print(f'hidden_channels:{config.hidden_channels}')
-
-    # 设置验证集比例
-    val_ratio = args.val_ratio if args.val_ratio is not None else 0.2
-    
-    # 设置WandB日志记录
-    if args.use_wandb and is_logger:
-        wandb.login(key=get_wandb_api_key())
-        wandb_name = f"seismic_moe_{config.family}"
-        wandb_init_args = dict(
-            config=config,
-            name=wandb_name,
-            project="seismic_moe",
-        )
-        wandb.init(**wandb_init_args)
-    # FNO config setting
-    config.expert_configs[0]['n_modes_height'] = args.FNO_n_modes_height
-    config.expert_configs[0]['n_modes_width'] = args.FNO_n_modes_width
-    config.expert_configs[0]['n_layers'] = args.FNO_n_layers
-    # WNO config setting
-    config.expert_configs[1]['n_levels_height'] = args.WNO_n_levels_height
-    config.expert_configs[1]['n_levels_width'] = args.WNO_n_levels_width
-    config.expert_configs[1]['n_layers'] = args.WNO_n_layers
-    config.expert_configs[1]['block_n_layers'] = args.WNO_block_n_layers
-    config.expert_configs[1]['dropout_rate'] = args.WNO_dropout_rate
-    config.expert_configs[1]['wavelet_type'] = args.wavelet_type
-    if(args.dtcwt_type): 
-        config.expert_configs[1]['wavelet_type'] = args.dtcwt_type
-    if args.WNO_pad_mode:
-        config.expert_configs[1]['pad_mode'] = args.WNO_pad_mode
-    if args.WNO_ensure_even_shapes is not None:
-        config.expert_configs[1]['ensure_even_shapes'] = args.WNO_ensure_even_shapes
-    if args.WNO_adaptive_padding is not None:
-        config.expert_configs[1]['adaptive_padding'] = args.WNO_adaptive_padding
-    if args.WNO_use_channel_mlp is not None:
-        config.expert_configs[1]['use_channel_mlp'] = args.WNO_use_channel_mlp
-    if args.WNO_channel_mlp_dropout is not None:
-        config.expert_configs[1]['channel_mlp_dropout'] = args.WNO_channel_mlp_dropout
-    if args.WNO_channel_mlp_expansion is not None:
-        config.expert_configs[1]['channel_mlp_expansion'] = args.WNO_channel_mlp_expansion
-    # MNO config setting
-    config.expert_configs[2]['n_scales'] = args.MNO_n_scales
-    config.expert_configs[2]['scale_factors'] = args.MNO_scale_factors
-    config.expert_configs[2]['n_layers'] = args.MNO_n_layers
-    # LNO config setting
-    config.expert_configs[3]['n_modes'] = tuple(args.LNO_n_modes)
-    config.expert_configs[3]['n_layers'] = args.LNO_n_layers
-    
-    print(f'FNO:n_modes_height:{config.expert_configs[0]["n_modes_height"]}')
-    print(f'FNO:n_modes_width:{config.expert_configs[0]["n_modes_width"]}')
-    print(f'FNO:n_layers:{config.expert_configs[0]["n_layers"]}')
-    
-    # 设置专家数
-    config.top_k = args.top_k
-    # 选择专家，这里后面的config.expert_configs就是config文件中所创建的字典列表，
-    # 当你从命令行输入choose——experts之后，这里的for循环会根据你给定的序号找到对应的专家的字典，并将这个字典放入
-    #config.expert_configs列表中
-    config.expert_configs = [config.expert_configs[i] for i in args.choose_experts]
-    #这里的config.expert_configs就是seismic_moe_config中的“字典列表”，关于“字典列表”结构的解释详见OneNote3
-    
-    # 训练moe架构
-         #下面两段代码的解释见OneNote2,意义是：
-         # 在使用 Mixture of Experts 模型时，如果用户已经训练并保存了若干个“专家模型”（模型文件保存在某个文件夹中），那么这两段代码就是要：
-         #读取那些 .pt 文件（即每个专家的模型参数）；
-         #按照文件名中的编号提取出专家编号；
-         #做一致性校验（文件数量、编号是否跟配置匹配）；
-    if len(config.expert_configs) > 1 and config.top_k > 1 and args.use_moe and args.use_experts_path:
-        # 模型文件夹中的专家 best_expert_{experts_name}_{i}.pt
-        save_experts = [
-            int(f.split('_')[-1].split('.')[0]) for f in os.listdir(args.use_experts_path)
-            if f.split('_')[1] == 'expert' and f.endswith('.pt')
-        ]
-        #注意，这里输出的save_experts是一个代表专家模型序号的整数列表。详见OneNote2
-
-        # 检测正确性
-        if len(config.expert_configs) != len(save_experts):
-            raise ValueError(f"模型文件夹中专家个数: {args.use_experts_path} 与选择专家个数不匹配: {len(config.expert_configs)}")
-
-        for i in config.expert_configs:
-            if(i not in save_experts):
-                raise ValueError(f"选择的专家: {i} 无法与模型存储文件夹中的专家匹配")
-
-        config.use_moe = True
-        config.use_experts_path = args.use_experts_path
-
-    # 这两行代码解释见OneNote3，不过我想知道为什么这两段代码在我们单个模型训练过程中没有起作用
-    # 修复：使用enumerate来获取正确的索引，因为config.expert_configs已经被重新排序
-    experts_name = []
-    for idx, expert_config in enumerate(config.expert_configs):
-        if 'domain_type' in expert_config:
-            experts_name.append(f"{expert_config['domain_type']}_{args.choose_experts[idx]}")
-        else:
-            experts_name.append(f"{expert_config['type']}_{args.choose_experts[idx]}")
-    experts_name_str = '_'.join(experts_name)
-    config.output_dir = os.path.join(config.output_dir, experts_name_str)   
-    
-    # 设置损失函数加权系数
-    config.lambda_g1v = args.lambda_g1v
-    config.lambda_g2v = args.lambda_g2v
-    
-    # 设置路由形式
-    if args.router_type:
-        config.router_type = args.router_type
-    
-    # 设置专家组间融合方式
-    if args.fusion_type:
-        config.fusion_type = args.fusion_type
-    
-    # 设置强弱专家组内融合方式
-    if args.s_processor_type:
-        config.s_processor_type = args.s_processor_type
-    if args.w_processor_type:
-        config.w_processor_type = args.w_processor_type
-        
-    # 设置强弱激活参数
-    if args.beta:
-        config.beta = args.beta
-    
-    # 设置细化种类
-    if args.is_specific:
-        config.is_specific = args.is_specific
-    
-    # 设置是否使用分组专家网络
-    if args.is_classier:
-        config.is_classier = args.is_classier
-    
-    # 判断is_specific与选择family是否匹配
-    if config.is_specific and config.family not in ['curve_vel', 'flat_vel', 'curve_fault', 'flat_fault', 'style_style']:
-        raise ValueError(f"{config.family} 与 {config.is_specific} 不匹配")
-    
-    #-------------- 设置完毕 -----------#
     # 创建完整数据集
     full_dataset = SeismicDataset(
         data_dir=config.data_dir,
@@ -427,6 +250,8 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         beta = config.beta,
         is_specific = config.is_specific,
         is_classier = config.is_classier,
+        batch_size=config.batch_size,
+        resize_input_for_experts = True,
     )
     
     # 移动模型到设备
@@ -457,7 +282,36 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         optimizer, milestones=lr_milestones, gamma=config.scheduler_gamma,
         warmup_iters=warmup_iters, warmup_factor=1e-5)
      
-    criterion: Callable = L1L2Loss(config.lambda_g1v, config.lambda_g2v)
+    base_loss: Callable = L1L2Loss(config.lambda_g1v, config.lambda_g2v).to(device)
+    lambda_grad_l1 = float(getattr(config, "lambda_grad_l1", 0.0))
+    lambda_fourier_mag_l1 = float(getattr(config, "lambda_fourier_mag_l1", 0.0))
+    grad_loss_module = SobelLoss().to(device) if lambda_grad_l1 > 0 else None
+    fourier_loss_module = FourierMag_L1().to(device) if lambda_fourier_mag_l1 > 0 else None
+
+    def criterion(pred: torch.Tensor, gt: torch.Tensor):
+        loss_dict = base_loss(pred, gt)
+        total_loss = loss_dict["loss"]
+
+        grad_val = pred.new_zeros(())
+        if grad_loss_module is not None:
+            grad_res = grad_loss_module(pred, gt)
+            grad_val = grad_res["loss"]
+            total_loss = total_loss + lambda_grad_l1 * grad_val
+
+        fourier_val = pred.new_zeros(())
+        if fourier_loss_module is not None:
+            fourier_res = fourier_loss_module(pred, gt)
+            fourier_val = fourier_res["loss"]
+            total_loss = total_loss + lambda_fourier_mag_l1 * fourier_val
+
+        combined = {
+            "loss": total_loss,
+            "l1": loss_dict["l1"],
+            "l2": loss_dict["l2"],
+            "grad_l1": grad_val.detach(),
+            "fourier_l1": fourier_val.detach(),
+        }
+        return combined
     
     # 损失函数
     # criterion = F.mse_loss  # 使用均方误差损失
@@ -632,6 +486,14 @@ def run_overfit_one_sample(args):
     if args.output_dir:      config.output_dir      = args.output_dir
     if args.lambda_ssim:     config.lambda_ssim = args.lambda_ssim
     if args.lambda_grad:     config.lambda_grad = args.lambda_grad
+    if getattr(args, "lambda_grad_l1", None) is not None:
+        config.lambda_grad_l1 = args.lambda_grad_l1
+    if getattr(args, "lambda_fourier_mag_l1", None) is not None:
+        config.lambda_fourier_mag_l1 = args.lambda_fourier_mag_l1
+    if getattr(args, "lambda_grad_l1", None) is not None:
+        config.lambda_grad_l1 = args.lambda_grad_l1
+    if getattr(args, "lambda_fourier_mag_l1", None) is not None:
+        config.lambda_fourier_mag_l1 = args.lambda_fourier_mag_l1
     
     # FNO / WNO / MNO / LNO 配置（与 run_training 一致）
     config.expert_configs[0]['n_modes_height'] = args.FNO_n_modes_height
@@ -677,6 +539,14 @@ def run_overfit_one_sample(args):
     # Loss 权重
     config.lambda_g1v = args.lambda_g1v
     config.lambda_g2v = args.lambda_g2v
+    if getattr(args, "lambda_grad_l1", None) is not None:
+        config.lambda_grad_l1 = args.lambda_grad_l1
+    if getattr(args, "lambda_fourier_mag_l1", None) is not None:
+        config.lambda_fourier_mag_l1 = args.lambda_fourier_mag_l1
+    if getattr(args, "lambda_grad_l1", None) is not None:
+        config.lambda_grad_l1 = args.lambda_grad_l1
+    if getattr(args, "lambda_fourier_mag_l1", None) is not None:
+        config.lambda_fourier_mag_l1 = args.lambda_fourier_mag_l1
 
     # MoE 路由/融合
     if args.router_type:     config.router_type = args.router_type
@@ -825,12 +695,7 @@ def run_overfit_one_sample(args):
         warmup_iters=warmup_iters, warmup_factor=1e-5
     )
 
-    criterion: Callable = CombinedLoss(
-        config.lambda_g1v, 
-        config.lambda_g2v, 
-        config.lambda_ssim, 
-        config.lambda_grad,
-    )
+    criterion: Callable = L1L2Loss()
 
     # ---------- 目录 / 日志 ----------
     results_dir = Path(config.output_dir) / f"overfit1_{config.family}"
@@ -1238,15 +1103,6 @@ class TransformedSubset(Subset):
         # self.logger = None
         
     def __getitems__(self, idx: list[int]):
-        # 这个idx是一个batch中各个数据在总数据集中的索引，是一个列表
-        # if self.logger is None:
-        #     self.logger = logging.getLogger(f"Worker-{os.getpid()}")
-        #     if not self.logger.hasHandlers():
-        #         handler = logging.FileHandler(f"/root/autodl-tmp/FWINO/workers_logs/worker_{os.getpid()}.log")
-        #         handler.setFormatter(logging.Formatter('[%(asctime)s][%(levelname)s] %(message)s'))
-        #         self.logger.addHandler(handler)
-        #         self.logger.setLevel(logging.DEBUG)
-        # self.logger.info(f"Loading indices: {idx[0]}-{idx[-1]}")
         batch_sample = []
         for index in idx:
             sample = self.dataset[self.indices[index]]

@@ -238,6 +238,7 @@ class MOEOperator(BaseModel, name='MOE'):
         routing_mode: str = 'input',
         is_logger: bool = False,
         v_type_num: Optional[int] = None,
+        batch_size: int = 0,
         **kwargs
     ):
         super().__init__()
@@ -271,7 +272,7 @@ class MOEOperator(BaseModel, name='MOE'):
         # 确保 top_k 不超过专家数量
         self.top_k = min(self.top_k, self.num_experts)
         # 得出弱专家组专家数
-        self.w_k = self.num_experts - top_k
+        self.w_k = max(0, self.num_experts - top_k)
         
         # -------- 分类器骨干（ImageNet 预训练 ResNet50，B*1*H*W）--------
         if self.config.get('is_classier', False):
@@ -329,6 +330,7 @@ class MOEOperator(BaseModel, name='MOE'):
                 input_dim=in_channels,
                 num_experts=self.num_experts,
                 hidden_dim=router_hidden_dim,
+                bsz=batch_size,
                 noisy_gating=noisy_gating,
                 alpha = self.alpha,
             )
@@ -519,7 +521,7 @@ class MOEOperator(BaseModel, name='MOE'):
         self.feature_map['feature'] = features
 
     # --------------- 前向传播 ---------------
-    def forward(self, x, task_features=None, **kwargs):
+    def forward(self, x, task_features=None, **kwargs) -> Tuple[torch.Tensor]:
         batch_size = x.shape[0]
         device = x.device
 
@@ -597,9 +599,17 @@ class MOEOperator(BaseModel, name='MOE'):
         # 调整输出尺寸到 (B,1,70,70)
         if self.out_channels == 1 and combined_output.shape[2] != 70:
             combined_output = self.time_to_space_projection(combined_output)
+        else:
+            if 'feature' not in self.feature_map:
+                self.feature_map['feature'] = F.interpolate(
+                    combined_output.detach(),
+                    size=(70, 70),
+                    mode='bilinear',
+                    align_corners=True
+                )
 
         # CRF
-        last_output = self.CCrf(combined_output, self.feature_map['feature'])
+        last_output: torch.Tensor = self.CCrf(combined_output, self.feature_map['feature'])
         return last_output, aux_loss
     
     def _process_activation_group(

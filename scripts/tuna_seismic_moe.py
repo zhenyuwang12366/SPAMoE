@@ -25,25 +25,27 @@ def suggest_params(trial: optuna.Trial):
         # -------- 优化/训练 --------
         "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
         "weight_decay":  trial.suggest_float("weight_decay", 0.0, 0.1),
-        "batch_size":    trial.suggest_categorical("batch_size", [2, 4, 6, 8]),
+        "batch_size":    trial.suggest_categorical("batch_size", [4, 6]),
         "epochs":        trial.suggest_categorical("epochs", [100, 150, 200]),
         "accum_steps":   trial.suggest_categorical("accum_steps", [1, 2]),
         "scheduler_gamma": trial.suggest_float("scheduler_gamma", 0.2, 0.5),
 
         # -------- 模型容量/结构 --------
-        "hidden_channels": trial.suggest_categorical("hidden_channels", [32, 48, 64, 96, 128, 160]),
+        "hidden_channels": trial.suggest_categorical("hidden_channels", [96, 128, 160]),
         "FNO_n_layers":  trial.suggest_categorical("FNO_n_layers", [4, 6, 8]),
-        "WNO_n_layers":  trial.suggest_int("WNO_n_layers", 2, 7),
+        "WNO_n_layers":  trial.suggest_int("WNO_n_layers", 5, 8),
         "MNO_n_layers":  trial.suggest_categorical("MNO_n_layers", [2, 3, 4]),
         "LNO_n_layers":  trial.suggest_categorical("LNO_n_layers", [3, 4, 5]),
-        "WNO_block_n_layers": trial.suggest_categorical("WNO_block_n_layers", [2, 4]),
+        "WNO_block_n_layers": trial.suggest_int("WNO_block_n_layers", 2, 6),
         "WNO_dropout_rate":   trial.suggest_float("WNO_dropout_rate", 0.1, 0.2),
-        "WNO_n_levels_height": trial.suggest_int("WNO_n_levels_height", 2, 4),
-        "WNO_n_levels_width":  trial.suggest_int("WNO_n_levels_width", 2, 4),
+        "WNO_n_levels_height": trial.suggest_int("WNO_n_levels_height", 3, 5),
+        "WNO_n_levels_width":  trial.suggest_int("WNO_n_levels_width", 3, 5),
 
         # -------- Loss 权重 --------
         "lambda_g1v": trial.suggest_float("lambda_g1v", 0.3, 1.5, log=True),
         "lambda_g2v": trial.suggest_float("lambda_g2v", 0.3, 1.5, log=True),
+        "lambda_grad_l1": trial.suggest_float("lambda_grad_l1", 0.15, 0.20, log=True),
+        "lambda_fourier_mag_l1": trial.suggest_float("lambda_fourier_mag_l1", 0.05, 0.10, log=True)
     }
 
 def build_bash_cmd(args, trial_number: int, hp: dict) -> list:
@@ -112,6 +114,8 @@ def build_bash_cmd(args, trial_number: int, hp: dict) -> list:
         "--WNO_n_levels_width", str(hp["WNO_n_levels_width"]),
         "--lambda_g1v", str(hp["lambda_g1v"]),
         "--lambda_g2v", str(hp["lambda_g2v"]),
+        "--lambda_grad_l1", str(hp['lambda_grad_l1']),
+        "--lambda_fourier_mag_l1", str(hp['lambda_fourier_mag_l1']),
     ]
     return argv
 

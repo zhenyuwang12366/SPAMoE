@@ -4,6 +4,7 @@ from .plot_fig import visualize_results, plot_loss_curve
 from .calculate import SeismicMetrics
 from .load_utils import load_moe_experts
 from .parser_utils import build_argparser_and_parse
+from .set_config_utils import get_seismic_config
 
 __all__ = [
     "train_one_epoch",
@@ -14,4 +15,5 @@ __all__ = [
     "SeismicMetrics",
     "load_moe_experts",
     "build_argparser_and_parse",
+    "get_seismic_config",
 ]

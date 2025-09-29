@@ -5,10 +5,11 @@ from contextlib import nullcontext
 import torch.distributed as dist
 from .plot_fig import analyze_fourier_domain
 import datetime
+from neuralop.models.moe import MOEOperator
 
 @torch.no_grad()
 def _evaluate_one_epoch(
-    model,
+    model: MOEOperator,
     val_loader,
     device,
     criterion,
@@ -23,6 +24,8 @@ def _evaluate_one_epoch(
         targets = batch['output'].to(device, non_blocking=True)
 
         preds, aux_loss = model(inputs)
+        if aux_loss is None:
+            aux_loss = preds.new_zeros(())
 
         # 兼容 criterion 返回 (loss, loss_g1v, loss_g2v)
         loss_dict = criterion(preds, targets)
@@ -43,7 +46,7 @@ def _evaluate_one_epoch(
 
 def train_one_epoch(
     *args,
-    model,
+    model: MOEOperator,
     optimizer,
     criterion,
     train_loader,
@@ -141,6 +144,8 @@ def train_one_epoch(
         step_has_nan = False
         with sync_ctx:
             preds, aux_loss = model(inputs)
+            if aux_loss is None:
+                aux_loss = preds.new_zeros(())
             loss_dict = criterion(preds, targets)
             # —— 未缩放的“真实训练损失”（用于日志统计） —— #
             loss_raw = loss_dict["loss"] + coef * aux_loss

@@ -25,6 +25,8 @@ MILESTONES=(30 60 90)            # list 参数
 SCHEDULER_GAMMA=0.2
 LAMBDA_G1V=1.0
 LAMBDA_G2V=1.0
+LAMBDA_GRAD_L1=0.0
+LAMBDA_FOURIER_MAG_L1=0.0
 
 # 预处理与路由/MoE
 K=1
@@ -103,6 +105,8 @@ while [[ $# -gt 0 ]]; do
     --scheduler_gamma) SCHEDULER_GAMMA="$2"; shift 2 ;;
     --lambda_g1v|--g1v) LAMBDA_G1V="$2"; shift 2 ;;
     --lambda_g2v|--g2v) LAMBDA_G2V="$2"; shift 2 ;;
+    --lambda_grad_l1) LAMBDA_GRAD_L1="$2"; shift 2 ;;
+    --lambda_fourier_mag_l1) LAMBDA_FOURIER_MAG_L1="$2"; shift 2 ;;
 
     --k) K="$2"; shift 2 ;;
     --top_k) TOP_K="$2"; shift 2 ;;
@@ -202,7 +206,7 @@ echo "WeightDecay: $WEIGHT_DECAY"
 echo "LR Warmup(Epochs): $LR_WARMUP"
 echo "Milestones: ${MILESTONES[*]}"
 echo "Scheduler Gamma: $SCHEDULER_GAMMA"
-echo "Loss λ_g1v: $LAMBDA_G1V, λ_g2v: $LAMBDA_G2V"
+echo "Loss λ_g1v: $LAMBDA_G1V, λ_g2v: $LAMBDA_G2V, λ_grad_l1: $LAMBDA_GRAD_L1, λ_fourier_mag_l1: $LAMBDA_FOURIER_MAG_L1"
 echo "数据预处理缩放因子 k: $K"
 echo "Top-K 专家数: $TOP_K"
 echo "专家选择: ${CHOOSE_EXPERTS[*]}"
@@ -283,6 +287,8 @@ ARGS=(
   --beta "$BETA"
   --lambda_g1v "$LAMBDA_G1V"
   --lambda_g2v "$LAMBDA_G2V"
+  --lambda_grad_l1 "$LAMBDA_GRAD_L1"
+  --lambda_fourier_mag_l1 "$LAMBDA_FOURIER_MAG_L1"
 )
 
 [[ ${#DTCWT_TYPE[@]} -eq 2 ]] && ARGS+=( --dtcwt_type "${DTCWT_TYPE[@]}" )
