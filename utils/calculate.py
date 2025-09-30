@@ -27,11 +27,16 @@ class SeismicMetrics:
             
         if data_range is None:
             data_range = target.max() - target.min()
-        
-        # 确保data_range也在CPU上
-        if isinstance(data_range, torch.Tensor) and data_range.is_cuda:
-            data_range = data_range.detach().cpu()
-        
-        mse = F.mse_loss(pred, target).item()
+
+        if isinstance(data_range, torch.Tensor):
+            data_range = data_range.detach().cpu().item()
+        data_range = float(data_range)
+
+        eps = 1e-12
+        data_range = max(data_range, eps)
+
+        mse = float(F.mse_loss(pred, target).item())
+        mse = max(mse, eps)
+
         psnr = 20 * np.log10(data_range) - 10 * np.log10(mse)
         return psnr

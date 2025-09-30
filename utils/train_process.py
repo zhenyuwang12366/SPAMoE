@@ -85,6 +85,8 @@ def train_one_epoch(
     metrics_module=None,
     tqdm_module=None,   # 传入 tqdm（避免在函数内硬依赖）
     profile_timing: bool = False,            # 是否记录耗时
+    amp_enabled: bool = False,
+    amp_scaler: Optional[torch.amp.GradScaler] = None,
     **kwargs,
 ):
     """
@@ -104,7 +106,8 @@ def train_one_epoch(
     optim_count = 0
     num_steps = len(train_loader)
     nan_detected = False
-    
+    use_amp = bool(amp_enabled) and (amp_scaler is not None)
+
     # router type判断
     router_type = model.module.router_type if hasattr(model, "module") else model.router_type
     if "adamv" == router_type:
@@ -143,12 +146,14 @@ def train_one_epoch(
 
         step_has_nan = False
         with sync_ctx:
-            preds, aux_loss = model(inputs)
-            if aux_loss is None:
-                aux_loss = preds.new_zeros(())
-            loss_dict = criterion(preds, targets)
-            # —— 未缩放的“真实训练损失”（用于日志统计） —— #
-            loss_raw = loss_dict["loss"] + coef * aux_loss
+            autocast_ctx = torch.amp.autocast(device_type=device.type, enabled=use_amp) if use_amp else nullcontext()
+            with autocast_ctx:
+                preds, aux_loss = model(inputs)
+                if aux_loss is None:
+                    aux_loss = preds.new_zeros(())
+                loss_dict = criterion(preds, targets)
+                # —— 未缩放的“真实训练损失”（用于日志统计） —— #
+                loss_raw = loss_dict["loss"] + coef * aux_loss
 
             if not torch.isfinite(loss_raw).item():
                 step_has_nan = True
@@ -157,7 +162,10 @@ def train_one_epoch(
                 # —— 用于反传的缩放 —— #
                 current_group_size = accum_steps if not last_micro else ( (step % accum_steps) + 1 )
                 loss = loss_raw / current_group_size
-                loss.backward()
+                if use_amp:
+                    amp_scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
                 # —— 统计（用未缩放的口径，便于和 val 对齐） —— #
                 running_train_loss += loss_raw.item()
@@ -172,7 +180,11 @@ def train_one_epoch(
             break
 
         if last_micro:
-            optimizer.step()
+            if use_amp:
+                amp_scaler.step(optimizer)
+                amp_scaler.update()
+            else:
+                optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             optim_count += 1
             micro_in_group = 0  # 结算完当前组，清零

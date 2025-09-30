@@ -72,7 +72,7 @@ def get_seismic_config(args: argparse.Namespace):
         config.learning_rate = args.learning_rate
     if args.hidden_channels:
         config.hidden_channels = args.hidden_channels
-    if args.lr_warmup_epochs:
+    if args.lr_warmup_epochs is not None:
         config.lr_warmup_epochs = args.lr_warmup_epochs
     if args.weight_decay:
         config.weight_decay = args.weight_decay
@@ -84,7 +84,8 @@ def get_seismic_config(args: argparse.Namespace):
     accum_steps = config.accum_steps
     use_amp = config.use_amp
     
-    config.lr_warmup_epochs = int(config.epochs * 0.05)
+    if '--lr_warmup_epochs' not in sys.argv:
+        config.lr_warmup_epochs = max(1, int(config.epochs * 0.05))
     
     if is_logger:
         print(f'batch_size:{config.batch_size}')
@@ -169,9 +170,10 @@ def get_seismic_config(args: argparse.Namespace):
         if len(config.expert_configs) != len(save_experts):
             raise ValueError(f"模型文件夹中专家个数: {args.use_experts_path} 与选择专家个数不匹配: {len(config.expert_configs)}")
 
-        for i in config.expert_configs:
-            if(i not in save_experts):
-                raise ValueError(f"选择的专家: {i} 无法与模型存储文件夹中的专家匹配")
+        chosen_experts = list(args.choose_experts or [])
+        missing = set(chosen_experts) - set(save_experts)
+        if missing:
+            raise ValueError(f"选择的专家: {sorted(missing)} 无法与模型存储文件夹中的专家匹配")
 
         config.use_moe = True
         config.use_experts_path = args.use_experts_path

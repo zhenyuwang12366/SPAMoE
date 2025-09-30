@@ -162,7 +162,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         train_loader = DataLoader(
             train_dataset_with_transform,
             batch_size=config.batch_size,
-            shuffle=False,
+            shuffle=True,
             num_workers=args.num_workers,
             pin_memory=True,
             persistent_workers=True
@@ -390,7 +390,8 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         if is_logger:
             print("未提供 resume 路径，或路径无效，将从头开始训练。")
     
-    scaler = torch.amp.GradScaler(device=device,enabled=use_amp)
+    amp_enabled = bool(use_amp) and device.type == 'cuda'
+    scaler = torch.amp.GradScaler(device=device, enabled=amp_enabled)
     optimizer.zero_grad(set_to_none=True)
     REPORT_EVERY = max(1, getattr(args, "report_every", 5))
 #以上全是准备工作，下面是核心循环
@@ -428,6 +429,8 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             metrics_module=metrics,
             tqdm_module=tqdm,
             profile_timing=args.profile_timing,
+            amp_enabled=amp_enabled,
+            amp_scaler=scaler,
         )
 
         # ====== 中间上报（仅 rank0 打印，供外层 Optuna 解析）======
@@ -446,7 +449,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     if is_logger:
         # best_val_loss 为整个 trial 的最好验证损失（应已由 rank0 维护）
         print(f"VAL_LOSS:{best_val_loss}", flush=True)
-        plot_loss_curve(log_file, save_path=results_dir)
+        plot_loss_curve(log_file, save_path=results_dir / "loss_curve.png")
 
     return model, best_val_loss
 
@@ -712,6 +715,9 @@ def run_overfit_one_sample(args):
 
     metrics = SeismicMetrics()
 
+    amp_enabled = bool(config.use_amp) and device.type == 'cuda'
+    scaler = torch.amp.GradScaler(device=device, enabled=amp_enabled)
+
     # ---------- 训练循环（沿用你封装的 train_one_epoch） ----------
     for epoch in range(config.epochs):
         vis_now = (is_logger and ((epoch + 1) % vis_freq == 0))
@@ -746,6 +752,8 @@ def run_overfit_one_sample(args):
             metrics_module=metrics,
             tqdm_module=tqdm,
             profile_timing=False,
+            amp_enabled=amp_enabled,
+            amp_scaler=scaler,
         )
 
         if is_logger:
@@ -755,7 +763,7 @@ def run_overfit_one_sample(args):
 
     if is_logger:
         print(f"VAL_LOSS:{best_val_loss}", flush=True)
-        plot_loss_curve(log_file, save_path=results_dir)
+        plot_loss_curve(log_file, save_path=results_dir / "loss_curve.png")
 
     print(f"[Overfit] 完成。最佳模型保存在：{best_model_path}")
 

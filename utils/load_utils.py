@@ -179,7 +179,7 @@ def load_moe_experts(
             
             ckpt = torch.load(os.path.join(model_path, f), map_location=map_location)
             full_sd = ckpt.get('state_dict', ckpt.get('model_state_dict', ckpt))
-            expert_sd = get_expert_dict(full_sd, i=0)
+            expert_sd = get_expert_dict(full_sd)
             grouped[expert_id].append({v_type: expert_sd})            
     else:
         id_map = type_dict.get('normal', {})
@@ -205,7 +205,7 @@ def load_moe_experts(
 
             ckpt = torch.load(os.path.join(model_path, f), map_location=map_location)
             full_sd = ckpt.get('state_dict', ckpt.get('model_state_dict', ckpt))
-            expert_sd = get_expert_dict(full_sd, i=0)
+            expert_sd = get_expert_dict(full_sd)
             grouped[expert_id].append({v_type: expert_sd}) # [FNO(3), WNO(3), MNO(3), LNO(3)]
     
     # 对 expert_id 做数字序排序, 保证顺序稳定  
