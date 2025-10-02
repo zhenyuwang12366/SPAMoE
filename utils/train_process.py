@@ -78,6 +78,8 @@ def train_one_epoch(
     best_val_loss: float = float("inf"),
     best_model_path: Optional[str] = None,
     best_expert_path: Optional[str] = None,
+    last_model_path: Optional[str] = None,
+    last_expert_path: Optional[str] = None,
     experts_name: Optional[list] = None,
     experts_name_str: Optional[str] = None,
     data_dict: Optional[dict] = None,
@@ -280,6 +282,24 @@ def train_one_epoch(
                 torch.save({
                     'expert_state_dict': model_to_save.experts[0].state_dict()
                 }, best_expert_path)
+
+    if is_logger and last_model_path is not None:
+        model_to_save = model.module if (getattr(config, "distributed", None) and getattr(config.distributed, "use_distributed", False) and hasattr(model, "module")) else model
+
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model_to_save.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'val_loss': val_loss,
+            'metrics': {"psnr": val_stats["psnr"], "mse": val_stats["mse"], "mae": val_stats["mae"]},
+            'data_dict': data_dict
+        }, last_model_path)
+
+        if experts_name is not None and len(experts_name) == 1 and last_expert_path is not None:
+            if hasattr(model_to_save, "experts") and len(model_to_save.experts) > 0:
+                torch.save({
+                    'expert_state_dict': model_to_save.experts[0].state_dict()
+                }, last_expert_path)
 
     # —— 打印本 epoch 概要（仅主进程）—— #
     if is_logger:

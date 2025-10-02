@@ -74,10 +74,18 @@ def get_seismic_config(args: argparse.Namespace):
         config.hidden_channels = args.hidden_channels
     if args.lr_warmup_epochs is not None:
         config.lr_warmup_epochs = args.lr_warmup_epochs
+    config.lr_warmup_factor = args.lr_warmup_factor
+    config.lr_warmup_method = args.lr_warmup_method
+    config.lr_scheduler_type = args.lr_scheduler_type
+    config.milestones = list(args.milestones)
     if args.weight_decay:
         config.weight_decay = args.weight_decay
     if args.scheduler_gamma:
         config.scheduler_gamma = args.scheduler_gamma
+    config.lr_cosine_tmax_epochs = args.lr_cosine_tmax_epochs
+    config.lr_cosine_restart_t0_epochs = args.lr_cosine_restart_t0_epochs
+    config.lr_cosine_restart_t_mult = int(args.lr_cosine_restart_t_mult)
+    config.lr_cosine_eta_min = args.lr_cosine_eta_min
     if args.accum_steps is not None:
         config.accum_steps = args.accum_steps
   

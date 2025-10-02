@@ -21,8 +21,15 @@ SEED=42
 LEARNING_RATE=0.001
 WEIGHT_DECAY=0.05
 LR_WARMUP=5
+LR_WARMUP_FACTOR=0.3333333333
+LR_WARMUP_METHOD="linear"
+LR_SCHEDULER_TYPE="cos_restart"
 MILESTONES=(30 60 90)            # list 参数
 SCHEDULER_GAMMA=0.2
+LR_COSINE_TMAX_EPOCHS=50
+LR_COSINE_RESTART_T0_EPOCHS=10
+LR_COSINE_RESTART_T_MULT=2
+LR_COSINE_ETA_MIN=1e-6
 LAMBDA_G1V=1.0
 LAMBDA_G2V=1.0
 LAMBDA_GRAD_L1=0.0
@@ -101,8 +108,15 @@ while [[ $# -gt 0 ]]; do
     --learning_rate) LEARNING_RATE="$2"; shift 2 ;;
     --weight_decay) WEIGHT_DECAY="$2"; shift 2 ;;
     --lr_warmup_epochs) LR_WARMUP="$2"; shift 2 ;;
+    --lr_warmup_factor) LR_WARMUP_FACTOR="$2"; shift 2 ;;
+    --lr_warmup_method) LR_WARMUP_METHOD="$2"; shift 2 ;;
+    --lr_scheduler_type) LR_SCHEDULER_TYPE="$2"; shift 2 ;;
     --milestones) shift; MILESTONES=(); while [[ $# -gt 0 && $1 != --* ]]; do MILESTONES+=("$1"); shift; done ;;
     --scheduler_gamma) SCHEDULER_GAMMA="$2"; shift 2 ;;
+    --lr_cosine_tmax_epochs) LR_COSINE_TMAX_EPOCHS="$2"; shift 2 ;;
+    --lr_cosine_restart_t0_epochs) LR_COSINE_RESTART_T0_EPOCHS="$2"; shift 2 ;;
+    --lr_cosine_restart_t_mult) LR_COSINE_RESTART_T_MULT="$2"; shift 2 ;;
+    --lr_cosine_eta_min) LR_COSINE_ETA_MIN="$2"; shift 2 ;;
     --lambda_g1v|--g1v) LAMBDA_G1V="$2"; shift 2 ;;
     --lambda_g2v|--g2v) LAMBDA_G2V="$2"; shift 2 ;;
     --lambda_grad_l1) LAMBDA_GRAD_L1="$2"; shift 2 ;;
@@ -204,8 +218,15 @@ echo "梯度累计步数: $ACCUM_STEPS"
 echo "学习率: $LEARNING_RATE"
 echo "WeightDecay: $WEIGHT_DECAY"
 echo "LR Warmup(Epochs): $LR_WARMUP"
+echo "LR Warmup Factor: $LR_WARMUP_FACTOR"
+echo "LR Warmup Method: $LR_WARMUP_METHOD"
 echo "Milestones: ${MILESTONES[*]}"
 echo "Scheduler Gamma: $SCHEDULER_GAMMA"
+echo "LR Scheduler Type: $LR_SCHEDULER_TYPE"
+echo "Cosine T_max (epochs): $LR_COSINE_TMAX_EPOCHS"
+echo "Cosine Restart T0 (epochs): $LR_COSINE_RESTART_T0_EPOCHS"
+echo "Cosine Restart T_mult: $LR_COSINE_RESTART_T_MULT"
+echo "Cosine Eta Min: $LR_COSINE_ETA_MIN"
 echo "Loss λ_g1v: $LAMBDA_G1V, λ_g2v: $LAMBDA_G2V, λ_grad_l1: $LAMBDA_GRAD_L1, λ_fourier_mag_l1: $LAMBDA_FOURIER_MAG_L1"
 echo "数据预处理缩放因子 k: $K"
 echo "Top-K 专家数: $TOP_K"
@@ -277,8 +298,15 @@ ARGS=(
   --resume_path "$RESUME_PATH"
   --weight_decay "$WEIGHT_DECAY"
   --lr_warmup_epochs "$LR_WARMUP"
+  --lr_warmup_factor "$LR_WARMUP_FACTOR"
+  --lr_warmup_method "$LR_WARMUP_METHOD"
+  --lr_scheduler_type "$LR_SCHEDULER_TYPE"
   --milestones "${MILESTONES[@]}"
   --scheduler_gamma "$SCHEDULER_GAMMA"
+  --lr_cosine_tmax_epochs "$LR_COSINE_TMAX_EPOCHS"
+  --lr_cosine_restart_t0_epochs "$LR_COSINE_RESTART_T0_EPOCHS"
+  --lr_cosine_restart_t_mult "$LR_COSINE_RESTART_T_MULT"
+  --lr_cosine_eta_min "$LR_COSINE_ETA_MIN"
   --accum_steps "$ACCUM_STEPS"
   --router_type "$ROUTER_TYPE"
   --fusion_type "$FUSION_TYPE"

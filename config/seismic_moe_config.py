@@ -94,6 +94,14 @@ class SeismicMOEConfig(Default):
     scheduler_gamma = 0.3
     output_dir = './results'
     lr_warmup_epochs = 5
+    lr_warmup_factor = 1.0 / 3
+    lr_warmup_method = 'linear'
+
+    lr_scheduler_type = 'cos_restart'  # cos_restart, cos, multistep
+    lr_cosine_eta_min = 1e-6
+    lr_cosine_tmax_epochs = 50
+    lr_cosine_restart_t0_epochs = 10
+    lr_cosine_restart_t_mult = 2
     
     use_onecycle = True
     

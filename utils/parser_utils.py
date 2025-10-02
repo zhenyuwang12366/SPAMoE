@@ -20,11 +20,25 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
     
     
     parser.add_argument('--lr_warmup_epochs', type=int, default=5,
-                        help='学习率预热轮数')
+                        help='学习率预热轮数（按 epoch 计）')
+    parser.add_argument('--lr_warmup_factor', type=float, default=1.0 / 3,
+                        help='warmup 初始学习率相对 base_lr 的比例')
+    parser.add_argument('--lr_warmup_method', type=str, default='linear', choices=['linear', 'constant'],
+                        help='warmup 的方式：线性或常数')
+    parser.add_argument('--lr_scheduler_type', type=str, default='cos_restart', choices=['cos_restart', 'cos', 'multistep'],
+                        help='学习率调度器类型')
     parser.add_argument('--milestones', nargs='+', type=int, default=[30, 60, 90],
-                        help='学习率衰减里程碑')
+                        help='MultiStepLR 的学习率衰减里程碑（按 epoch 计）')
     parser.add_argument('--scheduler_gamma', type=float, default=0.3,
-                        help='学习率衰减因子')
+                        help='MultiStepLR 的学习率衰减因子')
+    parser.add_argument('--lr_cosine_tmax_epochs', type=float, default=50.0,
+                        help='WarmupCosineLR 进入余弦阶段后的周期长度（按 epoch 计）')
+    parser.add_argument('--lr_cosine_restart_t0_epochs', type=float, default=10.0,
+                        help='CosineAnnealingWarmRestarts 首个周期长度（按 epoch 计）')
+    parser.add_argument('--lr_cosine_restart_t_mult', type=int, default=2,
+                        help='CosineAnnealingWarmRestarts 的周期放大倍率')
+    parser.add_argument('--lr_cosine_eta_min', type=float, default=1e-6,
+                        help='余弦调度阶段的最小学习率')
     parser.add_argument('--weight_decay', type=float, default=0.05,
                         help='L2正则化')
     parser.add_argument('--accum_steps', type=int, default=1,

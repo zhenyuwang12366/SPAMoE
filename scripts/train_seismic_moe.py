@@ -27,7 +27,11 @@ from neuralop.data.datasets import SeismicDataset, create_seismic_dataloader
 from neuralop.utils import get_wandb_api_key, count_model_params
 from config.seismic_moe_config import SeismicMOEConfig
 import neuralop.mpu.comm as comm
-from scripts.scheduler import WarmupMultiStepLR
+from scripts.scheduler import (
+    WarmupMultiStepLR,
+    WarmupCosineLR,
+    WarmupCosineAnnealingWarmRestarts,
+)
 from neuralop.losses import L1L2Loss, SobelLoss, FourierMag_L1
 from utils import *
  
@@ -276,12 +280,49 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=config.weight_decay)
     
     # Convert scheduler to be per iteration instead of per epoch
-    warmup_iters = config.lr_warmup_epochs * len(train_loader)
-    lr_milestones = [len(train_loader) * m for m in config.milestones]
-    lr_scheduler = WarmupMultiStepLR(
-        optimizer, milestones=lr_milestones, gamma=config.scheduler_gamma,
-        warmup_iters=warmup_iters, warmup_factor=1e-5)
-     
+    steps_per_epoch = max(1, len(train_loader))
+    warmup_iters = int(config.lr_warmup_epochs * steps_per_epoch)
+    warmup_kwargs = dict(
+        warmup_factor=getattr(config, "lr_warmup_factor", 1.0 / 3),
+        warmup_iters=warmup_iters,
+        warmup_method=getattr(config, "lr_warmup_method", "linear"),
+    )
+
+    scheduler_type = getattr(config, "lr_scheduler_type", "cos_restart")
+    if scheduler_type == "multistep":
+        lr_milestones = [int(steps_per_epoch * m) for m in config.milestones]
+        lr_scheduler = WarmupMultiStepLR(
+            optimizer=optimizer,
+            milestones=lr_milestones,
+            gamma=config.scheduler_gamma,
+            **warmup_kwargs,
+        )
+    elif scheduler_type == "cos":
+        t_max_epochs = getattr(
+            config,
+            "lr_cosine_tmax_epochs",
+            max(1, config.epochs - config.lr_warmup_epochs),
+        )
+        t_max = max(1, int(t_max_epochs * steps_per_epoch))
+        lr_scheduler = WarmupCosineLR(
+            optimizer=optimizer,
+            T_max=t_max,
+            eta_min=config.lr_cosine_eta_min,
+            **warmup_kwargs,
+        )
+    elif scheduler_type == "cos_restart":
+        t0_epochs = getattr(config, "lr_cosine_restart_t0_epochs", 10)
+        T_0 = max(1, int(t0_epochs * steps_per_epoch))
+        lr_scheduler = WarmupCosineAnnealingWarmRestarts(
+            optimizer=optimizer,
+            T_0=T_0,
+            T_mult=config.lr_cosine_restart_t_mult,
+            eta_min=config.lr_cosine_eta_min,
+            **warmup_kwargs,
+        )
+    else:
+        raise ValueError(f"Unsupported lr_scheduler_type: {scheduler_type}")
+    
     base_loss: Callable = L1L2Loss(config.lambda_g1v, config.lambda_g2v).to(device)
     lambda_grad_l1 = float(getattr(config, "lambda_grad_l1", 0.0))
     lambda_fourier_mag_l1 = float(getattr(config, "lambda_fourier_mag_l1", 0.0))
@@ -330,8 +371,9 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     # 最佳模型保存
     best_val_loss = float("inf")
     best_model_path = results_dir / f"best_model_{experts_name_str}.pt"
-    if len(experts_name) == 1:
-        best_expert_path = results_dir / f"best_expert_{experts_name_str}.pt"
+    best_expert_path = (results_dir / f"best_expert_{experts_name_str}.pt") if len(experts_name) == 1 else None
+    last_model_path = results_dir / f"last_model_{experts_name_str}.pt"
+    last_expert_path = (results_dir / f"last_expert_{experts_name_str}.pt") if len(experts_name) == 1 else None
     
     # 指标计算器
     metrics = SeismicMetrics()
@@ -423,6 +465,8 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             best_val_loss=best_val_loss,
             best_model_path=best_model_path,
             best_expert_path=best_expert_path,
+            last_model_path=last_model_path,
+            last_expert_path=last_expert_path,
             experts_name=experts_name,
             experts_name_str=experts_name_str,
             data_dict=data_dict,
@@ -712,6 +756,8 @@ def run_overfit_one_sample(args):
     best_val_loss = float("inf")
     best_model_path = results_dir / f"best_model_{experts_name_str}.pt"
     best_expert_path = (results_dir / f"best_expert_{experts_name_str}.pt") if len(experts_name)==1 else None
+    last_model_path = results_dir / f"last_model_{experts_name_str}.pt"
+    last_expert_path = (results_dir / f"last_expert_{experts_name_str}.pt") if len(experts_name)==1 else None
 
     metrics = SeismicMetrics()
 
@@ -746,6 +792,8 @@ def run_overfit_one_sample(args):
             best_val_loss=best_val_loss,
             best_model_path=best_model_path,
             best_expert_path=best_expert_path,
+            last_model_path=last_model_path,
+            last_expert_path=last_expert_path,
             experts_name=experts_name,
             experts_name_str=experts_name_str,
             data_dict=data_dict,
