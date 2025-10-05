@@ -74,6 +74,8 @@ def get_seismic_config(args: argparse.Namespace):
         config.hidden_channels = args.hidden_channels
     if args.lr_warmup_epochs is not None:
         config.lr_warmup_epochs = args.lr_warmup_epochs
+    if args.use_amp:
+        config.use_amp = True
     config.lr_warmup_factor = args.lr_warmup_factor
     config.lr_warmup_method = args.lr_warmup_method
     config.lr_scheduler_type = args.lr_scheduler_type
@@ -167,21 +169,22 @@ def get_seismic_config(args: argparse.Namespace):
          #按照文件名中的编号提取出专家编号；
          #做一致性校验（文件数量、编号是否跟配置匹配）；
     if len(config.expert_configs) > 1 and config.top_k > 1 and args.use_moe and args.use_experts_path:
-        # 模型文件夹中的专家 best_expert_{experts_name}_{i}.pt
+        # 模型文件夹中的专家 best_expert_{experts_name}_{i}_{curve/flat/style}_{vel/fault/style}.pt
         save_experts = [
-            int(f.split('_')[-1].split('.')[0]) for f in os.listdir(args.use_experts_path)
+            int(f.split('_')[3]) for f in os.listdir(args.use_experts_path)
             if f.split('_')[1] == 'expert' and f.endswith('.pt')
         ]
-        #注意，这里输出的save_experts是一个代表专家模型序号的整数列表。详见OneNote2
+        save_experts = list(set(save_experts))
+        #注意，这里输出的save_experts是一个代表专家组模型序号的整数列表。详见OneNote2
 
         # 检测正确性
         if len(config.expert_configs) != len(save_experts):
-            raise ValueError(f"模型文件夹中专家个数: {args.use_experts_path} 与选择专家个数不匹配: {len(config.expert_configs)}")
+            raise ValueError(f"模型文件夹中专家组个数: {args.use_experts_path} 与选择专家组个数不匹配: {len(config.expert_configs)}")
 
         chosen_experts = list(args.choose_experts or [])
         missing = set(chosen_experts) - set(save_experts)
         if missing:
-            raise ValueError(f"选择的专家: {sorted(missing)} 无法与模型存储文件夹中的专家匹配")
+            raise ValueError(f"选择的专家组: {sorted(missing)} 无法与模型存储文件夹中的专家匹配")
 
         config.use_moe = True
         config.use_experts_path = args.use_experts_path
@@ -230,7 +233,19 @@ def get_seismic_config(args: argparse.Namespace):
     # 设置是否使用分组专家网络
     if args.is_classier:
         config.is_classier = args.is_classier
-    
+
+    # 设置速度类型数量（分类数）
+    if hasattr(args, "v_type_num") and args.v_type_num is not None:
+        config.v_type_num = args.v_type_num
+    else:
+        current_v_type_num = getattr(config, "v_type_num", None)
+        if not current_v_type_num:
+            type_mapping = getattr(config, "type_id", {})
+            type_key = "specific" if getattr(config, "is_specific", False) else "normal"
+            mapped_types = type_mapping.get(type_key, {})
+            if mapped_types:
+                config.v_type_num = len(mapped_types)
+
     # 判断is_specific与选择family是否匹配
     if config.is_specific and config.family not in ['curve_vel', 'flat_vel', 'curve_fault', 'flat_fault', 'style_style']:
         raise ValueError(f"{config.family} 与 {config.is_specific} 不匹配")

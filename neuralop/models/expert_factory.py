@@ -23,6 +23,7 @@ class ExpertFactory:
         out_channels: int,
         hidden_channels: int,
         n_dim: int = 2,
+        v_type_id: Optional[int] = None,
         **kwargs
     ) -> nn.Module:
         """
@@ -48,6 +49,9 @@ class ExpertFactory:
         """
         if domain_type == 'fourier':
             # 傅里叶神经算子专家
+            if v_type_id is not None:
+                hidden_channels = kwargs.get('hc', 64)
+            
             if n_dim == 1:
                 # 为了避免参数冲突，检查kwargs中是否已包含n_modes_height
                 modes_kwargs = {}
@@ -98,6 +102,8 @@ class ExpertFactory:
                 
         elif domain_type == 'wavelet':
             # 小波神经算子专家
+            if v_type_id is not None:
+                hidden_channels = kwargs.get('hidden_channels', 64)
             if n_dim == 1:
                 # 为了避免参数冲突，检查kwargs中是否已包含n_levels_height
                 levels_kwargs = {}
@@ -160,6 +166,7 @@ class ExpertFactory:
         scale_factors: List[float] = None,
         fusion_type: str = 'adaptive',
         fusion_mode: str = 'hierarchical',
+        v_type_id: Optional[int] = None,
         **kwargs
     ) -> nn.Module:
         """
@@ -195,6 +202,8 @@ class ExpertFactory:
         """
         if expert_type == 'wrapper':
             # 包装器类型的多尺度专家
+            if v_type_id is not None:
+                hidden_channels = kwargs.get('hc', 64)
             if base_expert is None:
                 raise ValueError("当expert_type为'wrapper'时，必须提供base_expert")
                 
@@ -210,6 +219,8 @@ class ExpertFactory:
             )
         elif expert_type == 'native':
             # 原生多尺度神经算子
+            if v_type_id is not None:
+                hidden_channels = kwargs.get('hc', 64)
             if n_dim == 1:
                 return MultiscaleNO1d(
                     in_channels=in_channels,
@@ -306,6 +317,7 @@ class ExpertFactory:
         out_channels: int,
         hidden_channels: int,
         n_dim: int = 2,
+        v_type_id: Optional[int] = None,
         **kwargs
     ) -> nn.Module:
         """
@@ -331,6 +343,8 @@ class ExpertFactory:
         """
         if local_type == 'basic':
             # 基本局部神经算子
+            if v_type_id is not None:
+                hidden_channels = kwargs.get('hc', 64)
             return LocalNO(
                 in_channels=in_channels,
                 out_channels=out_channels,
@@ -347,6 +361,7 @@ class ExpertFactory:
         in_channels: int,
         out_channels: int,
         hidden_channels: int,
+        v_type_id: Optional[int] = None,
         **kwargs
     ) -> nn.Module:
         """
@@ -386,6 +401,7 @@ class ExpertFactory:
                 out_channels=out_channels,
                 hidden_channels=hidden_channels,
                 n_dim=n_dim,
+                v_type_id=v_type_id,
                 **kwargs
             )
         elif expert_type == 'scale':
@@ -411,6 +427,7 @@ class ExpertFactory:
                     n_scales=n_scales,
                     scale_factors=scale_factors,
                     fusion_mode=fusion_mode,
+                    v_type_id=v_type_id,
                     **kwargs
                 )
             else:
@@ -424,6 +441,7 @@ class ExpertFactory:
                     in_channels=in_channels,
                     out_channels=out_channels,
                     hidden_channels=hidden_channels,
+                    v_type_id=v_type_id,
                     **base_expert_config
                 )
                 
@@ -442,6 +460,7 @@ class ExpertFactory:
                     fusion_type=fusion_type,
                     n_scales=n_scales,
                     scale_factors=scale_factors,
+                    v_type_id=v_type_id,
                     **kwargs
                 )
         elif expert_type == 'geometry':
@@ -474,6 +493,7 @@ class ExpertFactory:
                 out_channels=out_channels,
                 hidden_channels=hidden_channels,
                 n_dim=n_dim,
+                v_type_id=v_type_id,
                 **kwargs
             )
         else:
@@ -484,7 +504,8 @@ class ExpertFactory:
         expert_configs: List[Dict[str, Any]],
         in_channels: int,
         out_channels: int,
-        hidden_channels: int
+        hidden_channels: int,
+        v_type_id: Optional[int] = None,
     ) -> List[nn.Module]:
         """
         创建专家集合
@@ -520,6 +541,7 @@ class ExpertFactory:
                 in_channels=in_channels,
                 out_channels=out_channels,
                 hidden_channels=hidden_channels,
+                v_type_id = v_type_id,
                 **config
             )
             

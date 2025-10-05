@@ -92,7 +92,8 @@ def run_training(config=None):
         top_k=config.top_k,
         noisy_gating=config.noisy_gating,
         fusion_type=config.fusion_type,
-        router_hidden_dim=config.router_hidden_dim
+        router_hidden_dim=config.router_hidden_dim,
+        v_type_num=getattr(config, "v_type_num", None)
     )
     
     # 移动模型到设备

@@ -1,4 +1,4 @@
-from typing import Dict,Iterable,Any,List
+from typing import Dict,Iterable,Any,List,Optional
 import torch
 from collections import OrderedDict,defaultdict
 import torch.nn as nn
@@ -12,41 +12,90 @@ def _strip_prefixes(key: str, prefixes: Iterable[str]) -> str:
             return key[len(p):]
     return key
 
-def get_expert_dict(ckpt: Dict[str, Any],
-                    ddp_prefixes: Iterable[str] = ("module.",),
-                    allow_experts_prefix_fallback: bool = True
-                   ) -> Dict[str, torch.Tensor]:
+def get_expert_dict(
+    ckpt: Dict[str, Any],
+    ddp_prefixes: Iterable[str] = ("module.",),
+    expert_prefix: str = "experts.0.",
+) -> Dict[str, torch.Tensor]:
+    """从 state_dict 或保存的专家字典中提取第一个专家权重。
+
+    - 支持单卡/多卡保存（自动剥离常见的 ``module.`` 前缀）。
+    - 仅保留以 ``experts.0.`` 开头的权重键，并去掉该前缀，方便后续直接 ``load_state_dict``。
     """
-    从 checkpoint 中提取专家权重（你的保存方式：{'expert_state_dict': ...}）。
-    - 默认去掉常见并行前缀（如 'module.'）。
-    - 若误存成 'experts.0.xxx'，可选地剥掉 'experts.0.'（fallback）。
 
-    Args:
-        ckpt: 通过 torch.load(...) 得到的 checkpoint 字典，必须包含 'expert_state_dict'
-        ddp_prefixes: 需要剥除的并行前缀集合（如 DDP 的 'module.'）
-        allow_experts_prefix_fallback: 若键以 'experts.0.' 开头，是否自动剥掉
+    raw_sd: Optional[Dict[str, Any]] = None
+    if isinstance(ckpt, dict):
+        for key in ("expert_state_dict", "state_dict", "model_state_dict"):
+            maybe_sd = ckpt.get(key)
+            if isinstance(maybe_sd, dict):
+                raw_sd = maybe_sd
+                break
+        if raw_sd is None and all(isinstance(k, str) for k in ckpt.keys()):
+            raw_sd = ckpt  # 直接就是 state_dict
 
-    Returns:
-        清洗后的专家 state_dict（键名干净，可直接 expert.load_state_dict(...)）
-    """
-    if not isinstance(ckpt, dict) or "expert_state_dict" not in ckpt:
-        raise ValueError("checkpoint 中未找到 'expert_state_dict'，请确认保存与加载路径一致。")
+    if raw_sd is None:
+        raise TypeError("无法从 checkpoint 中提取 state_dict，检查保存格式是否符合 train_process.py 逻辑。")
 
-    raw_sd = ckpt["expert_state_dict"]
     if not isinstance(raw_sd, dict):
-        raise TypeError("'expert_state_dict' 应是一个 state_dict (dict)。")
+        raise TypeError("state_dict 应为字典，无法解析专家权重。")
 
     cleaned = OrderedDict()
+    has_expert_prefix = False
     for k, v in raw_sd.items():
+        if not isinstance(k, str):
+            continue
         k2 = _strip_prefixes(k, ddp_prefixes)
-        if allow_experts_prefix_fallback and k2.startswith("experts.0."):
-            k2 = k2[len("experts.0."):]
-        cleaned[k2] = v
+        if k2.startswith(expert_prefix):
+            if not has_expert_prefix:
+                cleaned.clear()
+                has_expert_prefix = True
+            cleaned[k2[len(expert_prefix):]] = v
+        elif not has_expert_prefix:
+            cleaned[k2] = v
+
+    if has_expert_prefix:
+        if not cleaned:
+            raise ValueError(
+                f"未能解析出 '{expert_prefix}' 下的专家参数，请确认文件来源。"
+            )
+        return cleaned
+
+    if not cleaned:
+        raise ValueError("state_dict 中没有可用的专家参数键。")
 
     return cleaned
+def _extract_expert_module(ckpt: Any) -> Optional[nn.Module]:
+    """尝试从已反序列化对象中直接拿到专家模块。"""
+
+    def _maybe_from_container(module_obj: nn.Module) -> Optional[nn.Module]:
+        experts = getattr(module_obj, "experts", None)
+        if isinstance(experts, (nn.ModuleList, list, tuple)) and len(experts) > 0:
+            maybe_expert = experts[0]
+            if isinstance(maybe_expert, nn.Module):
+                return maybe_expert
+        return None
+
+    if isinstance(ckpt, nn.Module):
+        expert = _maybe_from_container(ckpt)
+        return expert if expert is not None else ckpt
+
+    if isinstance(ckpt, dict):
+        for key in ("module.experts.0", "experts.0", "expert_module", "expert"):
+            maybe_module = ckpt.get(key)
+            if isinstance(maybe_module, nn.Module):
+                return maybe_module
+
+        for container_key in ("module", "model"):
+            maybe_container = ckpt.get(container_key)
+            if isinstance(maybe_container, nn.Module):
+                expert = _maybe_from_container(maybe_container)
+                if expert is not None:
+                    return expert
+
+    return None
 
 def load_factory(
-    experts_config: List[Dict[str, Any]],
+    experts_config: List[Any],
     in_channels: int,
     out_channels: int,
     hidden_channels: int,
@@ -55,7 +104,7 @@ def load_factory(
     """专家工厂
 
     Args:
-        experts_config (List[Dict[str, Any]]): 专家配置字典
+        experts_config (List[Any]): 专家配置字典（可为基础配置或 v_type -> 配置映射）
         model_dict (Dict): 专家模型参数字典, experts_type == 'math' 
         --> Dict[expert_id, List[Dict[v_type_id, sd]]]
 
@@ -76,7 +125,7 @@ def load_factory(
         if not (0 <= expert_id < len(experts_config)):
             raise IndexError(f"experts_config 下标越界: {expert_id}")
         
-        expert_config = experts_config[expert_id]
+        expert_config_group = experts_config[expert_id]
         
         # 按v_type升序排列
         try:
@@ -89,21 +138,39 @@ def load_factory(
         
         for type_expert_sd in sorted_dict_list:
             v_type_id, expert_sd = next(iter(type_expert_sd.items()))
-            
-            # 创建专家骨架
-            expert_raw_model = ExpertFactory.create_expert_ensemble(
-                [expert_config],
-                in_channels,
-                out_channels,
-                hidden_channels,
-            )[0]
-            
-            # 加载权重
-            missing, unexpected = expert_raw_model.load_state_dict(expert_sd, strict=False)
-            if missing or unexpected:
-                print(f"[expert {expert_id}] missing: {missing}, unexpected: {unexpected}")
 
-            # 冻结
+            if isinstance(expert_config_group, dict) and all(isinstance(key, int) for key in expert_config_group.keys()):
+                config_for_type = expert_config_group.get(v_type_id)
+                if config_for_type is None:
+                    raise KeyError(f"expert {expert_id} 缺少 v_type={v_type_id} 的配置")
+            else:
+                config_for_type = expert_config_group
+
+            if isinstance(config_for_type, list):
+                config_list = config_for_type
+            else:
+                if not isinstance(config_for_type, dict):
+                    raise TypeError(
+                        f"expert_config[{expert_id}] 无法解析到有效的字典配置，"
+                        f"收到类型 {type(config_for_type)}"
+                    )
+                config_list = [config_for_type]
+
+            if isinstance(expert_sd, nn.Module):
+                expert_raw_model = expert_sd
+            else:
+                expert_raw_model = ExpertFactory.create_expert_ensemble(
+                    expert_configs=config_list,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    hidden_channels=hidden_channels,
+                    v_type_id=v_type_id,
+                )[0]
+
+                missing, unexpected = expert_raw_model.load_state_dict(expert_sd, strict=False)
+                if missing or unexpected:
+                    print(f"[expert {expert_id}] missing: {missing}, unexpected: {unexpected}")
+
             for p in expert_raw_model.parameters():
                 p.requires_grad = False
             expert_raw_model.eval()
@@ -119,7 +186,7 @@ _NORMAL_PAT = re.compile(
     r'best_expert_(?P<name>\w+)_(?P<i>\d+)_(?P<label>\w+)\.pt$'
 )
 def load_moe_experts(
-    experts_config: List[Dict[str, Any]],
+    experts_config: List[Any],
     in_channels: int,
     out_channels: int,
     hidden_channels: int,
@@ -149,7 +216,7 @@ def load_moe_experts(
     experts_file = [f for f in os.listdir(model_path) if f.endswith('.pt')]
     
     # 组装: expert_id -> List[{v_type_id: sd}]
-    grouped: Dict[str, List[Dict[int, Dict[str, torch.Tensor]]]] = defaultdict(list) #Dict[str(type), list]
+    grouped: Dict[str, List[Dict[int, Any]]] = defaultdict(list) #Dict[str(type), list]
     
     if(is_specific):
         id_map = type_dict.get('specific', {})
@@ -177,9 +244,17 @@ def load_moe_experts(
                 continue
             v_type = id_map[key]
             
-            ckpt = torch.load(os.path.join(model_path, f), map_location=map_location)
-            full_sd = ckpt.get('state_dict', ckpt.get('model_state_dict', ckpt))
-            expert_sd = get_expert_dict(full_sd)
+            ckpt = torch.load(
+                os.path.join(model_path, f),
+                map_location=map_location,
+                weights_only=False,
+            )
+            expert_module = _extract_expert_module(ckpt)
+            if expert_module is not None:
+                grouped[expert_id].append({v_type: expert_module})
+                continue
+
+            expert_sd = get_expert_dict(ckpt)
             grouped[expert_id].append({v_type: expert_sd})            
     else:
         id_map = type_dict.get('normal', {})
@@ -203,9 +278,17 @@ def load_moe_experts(
                 continue
             v_type = id_map[label]
 
-            ckpt = torch.load(os.path.join(model_path, f), map_location=map_location)
-            full_sd = ckpt.get('state_dict', ckpt.get('model_state_dict', ckpt))
-            expert_sd = get_expert_dict(full_sd)
+            ckpt = torch.load(
+                os.path.join(model_path, f),
+                map_location=map_location,
+                weights_only=False,
+            )
+            expert_module = _extract_expert_module(ckpt)
+            if expert_module is not None:
+                grouped[expert_id].append({v_type: expert_module})
+                continue
+
+            expert_sd = get_expert_dict(ckpt)
             grouped[expert_id].append({v_type: expert_sd}) # [FNO(3), WNO(3), MNO(3), LNO(3)]
     
     # 对 expert_id 做数字序排序, 保证顺序稳定  

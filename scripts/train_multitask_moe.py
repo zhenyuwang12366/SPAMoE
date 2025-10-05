@@ -532,7 +532,8 @@ def run_training(args):
         router_hidden_dim=config.router_hidden_dim,
         router_type=config.router_type,
         task_dim=config.task_dim,
-        routing_mode=config.routing_mode
+        routing_mode=config.routing_mode,
+        v_type_num=getattr(config, "v_type_num", None)
     )
     
     # 移动模型到设备

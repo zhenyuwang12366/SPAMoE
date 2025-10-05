@@ -51,7 +51,7 @@ WNO_W=2
 WNO_N_LAYERS=4
 WNO_BLOCK_N_LAYERS=2
 WNO_DROPOUT_RATE=0.1
-WAVELET_TYPE="haar"   # haar | db4
+WAVELET_TYPE="db6"   # haar | db4
 WNO_PAD_MODE=""
 WNO_ENSURE_SHAPES=""
 WNO_ADAPTIVE_PADDING=""
@@ -77,6 +77,7 @@ W_PROCESSOR_TYPE="linear"       # 'linear' / 'atten' / 'mean' / 'sum'
 BETA=0.5
 IS_SPECIFIC=0                   # flag -> --is_specific
 IS_CLASSIER=0                   # flag -> --is_classier
+V_TYPE_NUM=""                  # 可选 -> --v_type_num
 
 # 推理/恢复
 MODEL_PATH=""                   # inference 时常用
@@ -163,6 +164,7 @@ while [[ $# -gt 0 ]]; do
     --beta) BETA="$2"; shift 2 ;;
     --is_specific) IS_SPECIFIC=1; shift ;;
     --is_classier) IS_CLASSIER=1; shift ;;
+    --v_type_num) V_TYPE_NUM="$2"; shift 2 ;;
 
     --model_path) MODEL_PATH="$2"; shift 2 ;;
     --resume_path) RESUME_PATH="$2"; shift 2 ;;
@@ -252,6 +254,7 @@ echo "Strong-Group Processor: $S_PROCESSOR_TYPE"
 echo "Weak-Group Processor: $W_PROCESSOR_TYPE"
 echo "Beta(强弱激活): $BETA"
 echo "is_specific: $IS_SPECIFIC, is_classier: $IS_CLASSIER"
+echo "v_type_num: ${V_TYPE_NUM:-<auto>}"
 echo "Model Path(仅 inference 用): ${MODEL_PATH:-<None>}"
 echo "ResumePath: $RESUME_PATH"
 echo "Profile Timing: $PROFILE_TIMING"
@@ -349,6 +352,7 @@ fi
 # 可选路径参数（非空才追加）
 [[ -n "$USE_EXPERTS_PATH" ]] && ARGS+=( --use_experts_path "$USE_EXPERTS_PATH" )
 [[ -n "$MODEL_PATH" ]]       && ARGS+=( --model_path "$MODEL_PATH" )
+[[ -n "$V_TYPE_NUM" ]]       && ARGS+=( --v_type_num "$V_TYPE_NUM" )
 
 torchrun "${ARGS[@]}"
 

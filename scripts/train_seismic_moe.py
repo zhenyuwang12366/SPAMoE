@@ -128,64 +128,68 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     
     # 创建数据加载器
     if args.distributed:
+        train_num_workers = max(0, args.num_workers // 2)
         train_sampler = DistributedSampler(
             train_dataset_with_transform, 
             num_replicas=world_size, 
             rank=local_rank,
-            drop_last = True,
-            shuffle = True
+            drop_last=True,
+            shuffle=True
         )
         train_loader = DataLoader(
             train_dataset_with_transform,
             sampler=train_sampler,
             batch_size=config.batch_size,
             shuffle=False,
-            num_workers=int(args.num_workers/2),
+            num_workers=train_num_workers,
             pin_memory=True,
-            persistent_workers=True
+            persistent_workers=train_num_workers > 0
         )
 
-        print(f'prefetch_factor={train_loader.prefetch_factor}')
-        
+        val_num_workers = train_num_workers
         val_sampler = DistributedSampler(
             val_dataset_with_transform, 
             num_replicas=world_size, 
             rank=local_rank,
-            drop_last = True
+            drop_last=False
         )
         val_loader = DataLoader(
             val_dataset_with_transform,
-            sampler = val_sampler,
+            sampler=val_sampler,
             batch_size=config.test_batch_size,
             shuffle=False,
-            num_workers=int(args.num_workers/2),
+            num_workers=val_num_workers,
             pin_memory=True,
-            persistent_workers=True
+            persistent_workers=val_num_workers > 0
         )
     else:
+        train_num_workers = max(0, args.num_workers)
         train_loader = DataLoader(
             train_dataset_with_transform,
             batch_size=config.batch_size,
             shuffle=True,
-            num_workers=args.num_workers,
+            num_workers=train_num_workers,
             pin_memory=True,
-            persistent_workers=True
+            persistent_workers=train_num_workers > 0
         )
 
-        print(f'prefetch_factor={train_loader.prefetch_factor}')
-        
         val_loader = DataLoader(
             val_dataset_with_transform,
             batch_size=config.test_batch_size,
             shuffle=False,
-            num_workers=args.num_workers,
+            num_workers=train_num_workers,
             pin_memory=True,
-            persistent_workers=True
+            persistent_workers=train_num_workers > 0
         )
+
+    if is_logger:
+        prefetch = getattr(train_loader, "prefetch_factor", None)
+        if prefetch is not None:
+            print(f'prefetch_factor={prefetch}')
     
     # 检查数据形状
+    sample_batch = next(iter(train_loader))
     if is_logger:
-        sample_batch = next(iter(train_loader))
         input_shape = sample_batch['input'].shape
         output_shape = sample_batch['output'].shape
         print(f"输入张量形状: {input_shape}")
@@ -200,7 +204,6 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             print(f"警告：输出形状不符合预期，应为3D或更高维张量，实际为{len(output_shape)}D")
     
     # 获取实际的输入通道数
-    sample_batch = next(iter(train_loader))
     in_channels = sample_batch['input'].shape[1]  # 获取通道维度大小
     config.in_channels = in_channels  # 更新配置
     
@@ -219,12 +222,12 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     
     if config.use_moe and config.use_experts_path:
         experts = load_moe_experts(
-            expert_configs=config.expert_configs,
+            experts_config=config.load_expert_configs,
             in_channels=config.in_channels,
             out_channels=config.out_channels,
             hidden_channels=config.hidden_channels,
             model_path=config.use_experts_path,
-            is_specific=False,
+            is_specific=config.is_specific,
             map_location=device,
             type_dict=config.type_id
         )
@@ -256,6 +259,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         is_classier = config.is_classier,
         batch_size=config.batch_size,
         resize_input_for_experts = True,
+        v_type_num=config.v_type_num,
     )
     
     # 移动模型到设备
@@ -512,6 +516,13 @@ def run_overfit_one_sample(args):
 
     # ---------- 配置 & 设备 ----------
     config = SeismicMOEConfig()
+    if getattr(args, "v_type_num", None) is not None:
+        config.v_type_num = args.v_type_num
+    elif not getattr(config, "v_type_num", None):
+        type_key = "specific" if config.is_specific else "normal"
+        mapped = config.type_id.get(type_key, {}) if hasattr(config, "type_id") else {}
+        if mapped:
+            config.v_type_num = len(mapped)
     # 单样本过拟合默认禁用分布式，避免 sampler/drop_last 等边界问题
     config.distributed.use_distributed = False
     device, is_logger = setup(config)
@@ -603,6 +614,14 @@ def run_overfit_one_sample(args):
     if args.beta:            config.beta = args.beta
     if args.is_specific:     config.is_specific = True
     if args.is_classier:     config.is_classier = True
+
+    if getattr(args, "v_type_num", None) is not None:
+        config.v_type_num = args.v_type_num
+    elif not getattr(config, "v_type_num", None):
+        type_key = "specific" if config.is_specific else "normal"
+        mapped = config.type_id.get(type_key, {}) if hasattr(config, "type_id") else {}
+        if mapped:
+            config.v_type_num = len(mapped)
 
     # ---------- 数据 ----------
     full_dataset = SeismicDataset(
@@ -728,6 +747,7 @@ def run_overfit_one_sample(args):
         beta=config.beta,
         is_specific=config.is_specific,
         is_classier=config.is_classier,
+        v_type_num=config.v_type_num,
     ).to(device)
 
     # ---------- 优化器 & 调度 & 损失 ----------
@@ -829,6 +849,13 @@ def run_overfit_one_sample_test(args):
 
     # ---------- 配置 & 设备 ----------
     config = SeismicMOEConfig()
+    if getattr(args, "v_type_num", None) is not None:
+        config.v_type_num = args.v_type_num
+    elif not getattr(config, "v_type_num", None):
+        type_key = "specific" if config.is_specific else "normal"
+        mapped = config.type_id.get(type_key, {}) if hasattr(config, "type_id") else {}
+        if mapped:
+            config.v_type_num = len(mapped)
     # 单样本过拟合默认禁用分布式，避免 sampler/drop_last 等边界问题
     config.distributed.use_distributed = False
     device, is_logger = setup(config)
@@ -904,7 +931,15 @@ def run_overfit_one_sample_test(args):
     if args.beta:            config.beta = args.beta
     if args.is_specific:     config.is_specific = True
     if args.is_classier:     config.is_classier = True
-    
+
+    if getattr(args, "v_type_num", None) is not None:
+        config.v_type_num = args.v_type_num
+    elif not getattr(config, "v_type_num", None):
+        type_key = "specific" if config.is_specific else "normal"
+        mapped = config.type_id.get(type_key, {}) if hasattr(config, "type_id") else {}
+        if mapped:
+            config.v_type_num = len(mapped)
+
     # 设备/日志开关（与主训练一致）
     torch.manual_seed(args.seed); np.random.seed(args.seed)
     device, is_logger = setup_env(config)
@@ -988,7 +1023,8 @@ def run_overfit_one_sample_test(args):
         top_k=config.top_k,
         noisy_gating=config.noisy_gating,
         fusion_type=config.fusion_type,
-        router_hidden_dim=config.router_hidden_dim
+        router_hidden_dim=config.router_hidden_dim,
+        v_type_num=config.v_type_num
     ).to(device)
 
     # ===== 3) 优化器/调度/损失 =====
@@ -1158,14 +1194,20 @@ class TransformedSubset(Subset):
         self.transform = transform
         # self.logger = None
         
+    def _get_single(self, index: int):
+        sample = self.dataset[self.indices[index]]
+        sample = {**sample, 'idx': index}
+        if self.transform:
+            return self.transform(sample)
+        return sample
+
+    def __getitem__(self, index):
+        if isinstance(index, list):
+            return [self._get_single(i) for i in index]
+        return self._get_single(index)
+
     def __getitems__(self, idx: list[int]):
-        batch_sample = []
-        for index in idx:
-            sample = self.dataset[self.indices[index]]
-            sample['idx'] = index
-            if self.transform:
-                batch_sample.append(self.transform(sample))
-        return batch_sample
+        return [self._get_single(index) for index in idx]
 
 
 def run_inference(args):
@@ -1189,6 +1231,13 @@ def run_inference(args):
     
     # 加载配置
     config = SeismicMOEConfig()
+    if getattr(args, "v_type_num", None) is not None:
+        config.v_type_num = args.v_type_num
+    elif not getattr(config, "v_type_num", None):
+        type_key = "specific" if config.is_specific else "normal"
+        mapped = config.type_id.get(type_key, {}) if hasattr(config, "type_id") else {}
+        if mapped:
+            config.v_type_num = len(mapped)
     if args.data_dir:
         config.data_dir = args.data_dir
     else:
@@ -1246,7 +1295,8 @@ def run_inference(args):
         top_k=config.top_k,
         noisy_gating=config.noisy_gating,
         fusion_type=config.fusion_type,
-        router_hidden_dim=config.router_hidden_dim
+        router_hidden_dim=config.router_hidden_dim,
+        v_type_num=config.v_type_num
     )
     
     # 加载模型参数

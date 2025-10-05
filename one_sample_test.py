@@ -33,5 +33,6 @@ if __name__ == '__main__':
         is_classier = config.is_classier,
         batch_size=config.batch_size,
         resize_input_for_experts = True,
+        v_type_num=config.v_type_num,
     )
     output = model(x)

@@ -17,7 +17,8 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='数据加载工作进程数')
     parser.add_argument('--seed', type=int, default=42,
                         help='随机种子')
-    
+    parser.add_argument('--use_amp', action='store_true', 
+                        help='是否使用混合精度训练')
     
     parser.add_argument('--lr_warmup_epochs', type=int, default=5,
                         help='学习率预热轮数（按 epoch 计）')
@@ -133,7 +134,9 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='是否细化种类')
     parser.add_argument('--is_classier', action='store_true',
                         help='是否使用分组专家网络')
-    
+    parser.add_argument('--v_type_num', type=int, default=None,
+                        help='速度类型数量，用于控制分类器输出维度及专家分组')
+
     parser.add_argument('--hidden_channels', type=int, default=128,
                         help='隐藏通道数（默认值由配置文件决定，可通过此参数覆盖）')
     parser.add_argument('--learning_rate', type=float, default=1e-4,

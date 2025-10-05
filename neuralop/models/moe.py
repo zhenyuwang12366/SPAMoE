@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import List, Dict, Union, Tuple, Callable, Optional
 import numpy as np
-from torchvision import models
+from torchvision.models import resnet50, ResNet50_Weights
 from collections import Counter
 
 from .base_model import BaseModel
@@ -77,7 +77,7 @@ class Router(nn.Module):
         # --- top-k 主专家 ---
         top_k = int(self.top_k)
         num_experts = int(self.num_experts)
-        assert num_experts > 0 and 1 <= top_k <= num_experts
+        assert num_experts > 0 and 1 <= top_k <= num_experts, f"num_experts: {num_experts}, top_k: {top_k}"
 
         top_k_weights, top_k_indices = torch.topk(
             routing_weights, k=top_k, dim=-1, largest=True, sorted=True
@@ -276,7 +276,7 @@ class MOEOperator(BaseModel, name='MOE'):
         
         # -------- 分类器骨干（ImageNet 预训练 ResNet50，B*1*H*W）--------
         if self.config.get('is_classier', False):
-            self.classier = models.resnet50(pretrained=True)
+            self.classier = resnet50(weights=ResNet50_Weights.DEFAULT)
             old_conv = self.classier.conv1
             new_conv = nn.Conv2d(
                 1,

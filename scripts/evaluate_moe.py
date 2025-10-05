@@ -253,6 +253,11 @@ class ModelEvaluator:
         config = SeismicMOEConfig()
         config.data_dir = data_dir
         config.family = family
+        if not getattr(config, "v_type_num", None):
+            type_key = "specific" if getattr(config, "is_specific", False) else "normal"
+            mapped = config.type_id.get(type_key, {}) if hasattr(config, "type_id") else {}
+            if mapped:
+                config.v_type_num = len(mapped)
         
         # 创建数据加载器
         val_loader, val_dataset = create_seismic_dataloader(
@@ -288,7 +293,8 @@ class ModelEvaluator:
             top_k=config.top_k,
             noisy_gating=config.noisy_gating,
             fusion_type=config.fusion_type,
-            router_hidden_dim=config.router_hidden_dim
+            router_hidden_dim=config.router_hidden_dim,
+            v_type_num=getattr(config, "v_type_num", None)
         )
         
         # 加载模型参数
@@ -420,7 +426,8 @@ class ModelEvaluator:
             top_k=config.top_k,
             noisy_gating=config.noisy_gating,
             fusion_type=config.fusion_type,
-            router_hidden_dim=config.router_hidden_dim
+            router_hidden_dim=config.router_hidden_dim,
+            v_type_num=getattr(config, "v_type_num", None)
         )
         
         # 加载模型参数
