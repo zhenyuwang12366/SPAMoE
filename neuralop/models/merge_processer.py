@@ -18,7 +18,9 @@ class LinearMix(nn.Module):
         output_channels,
         ):
         super().__init__()
-        self.linear = nn.Linear(num_experts, output_channels, bias=False)
+        self.output_channels = output_channels
+        self.num_experts = num_experts
+        self.linear = nn.Linear(self.num_experts, self.output_channels, bias=False)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         bsz, k, _, h, w = input.shape
