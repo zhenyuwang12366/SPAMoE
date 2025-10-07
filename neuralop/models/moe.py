@@ -343,7 +343,8 @@ class MOEOperator(BaseModel, name='MOE'):
             cfg_key = f'{t}_type'
             module = None
             if self.config.get(cfg_key, None) == 'linear':
-                module = LinearMix(self.out_channels)
+                k = self.top_k if t == 's_processor' else self.w_k
+                module = LinearMix(k, self.out_channels)
             elif self.config.get(cfg_key, None) == 'attention':
                 k = self.top_k if t == 's_processor' else self.w_k
                 module = AttentionMix(
@@ -359,7 +360,7 @@ class MOEOperator(BaseModel, name='MOE'):
         
         # -------- 融合层 --------
         if fusion_type == 'linear':
-            self.fusion = LinearMix(self.out_channels)
+            self.fusion = LinearMix(self.top_k, self.out_channels)
         elif fusion_type == 'attention':
             self.fusion = AttentionMix(
                 input_resolution=256, patch_size=16, in_channels=1,

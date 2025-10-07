@@ -12,15 +12,18 @@ class LinearMix(nn.Module):
     Args:
         input (torch.Tensor): 形状为B,k,1,h,w
     """
-    def __init__(self, output_channels):
+    def __init__(
+        self, 
+        num_experts: int, 
+        output_channels,
+        ):
         super().__init__()
-        self.output_channels = output_channels
-        self.linear = nn.LazyLinear(self.output_channels, bias=False)
+        self.linear = nn.Linear(num_experts, output_channels, bias=False)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         bsz, k, _, h, w = input.shape
-        input = input.view(bsz, k, -1).permute(0, 2, 1).reshape(-1, k) # 把batch和空间合并的常见写法，方便其他统一操作
-        output = self.linear(input) # b*h*w, 1
+        input = input.view(bsz, k, -1).permute(0, 2, 1).reshape(-1, k) # b*h*w, k ,把batch和空间合并的常见写法，方便其他统一操作
+        output = self.linear(input) # b*h*w, k -> b*h*w, 1
         output = output.view(bsz, h, w, self.output_channels).permute(0, 3, 1, 2)
         return output
 
