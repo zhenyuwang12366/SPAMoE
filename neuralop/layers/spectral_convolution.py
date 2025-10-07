@@ -442,7 +442,7 @@ class SpectralConv(BaseSpectralConv):
         starts = [(max_modes - min(size, n_mode)) for (size, n_mode, max_modes) in zip(fft_size, self.n_modes, self.max_n_modes)]
         # if contraction is separable, weights have shape (channels, modes_x, ...)
         # otherwise they have shape (in_channels, out_channels, modes_x, ...)
-        if self.separable: 
+        if self.separable:
             slices_w = [slice(None)] # channels
         else:
             slices_w =  [slice(None), slice(None)] # in_channels, out_channels

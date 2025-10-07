@@ -16,6 +16,7 @@ from .expert_factory import ExpertFactory
 from .task_dependent_router import TaskDependentRouter
 from .SWActivate import GroupActMerge, SWActMerge
 from .merge_processer import MeanMix, SumMix, LinearMix, AttentionMix
+from torch.nn.parameter import UninitializedParameter
 
 class Router(nn.Module):
     """
@@ -342,9 +343,14 @@ class MOEOperator(BaseModel, name='MOE'):
             cfg_key = f'{t}_type'
             module = None
             if self.config.get(cfg_key, None) == 'linear':
-                module = nn.Linear(self.out_channels, self.out_channels)
-            elif self.config.get(cfg_key, None) == 'attn':
-                module = AttentionMix(self.out_channels)
+                module = LinearMix(self.out_channels)
+            elif self.config.get(cfg_key, None) == 'attention':
+                k = self.top_k if t == 's_processor' else self.w_k
+                module = AttentionMix(
+                    input_resolution=256, patch_size=16, in_channels=1,
+                    width=512, layers=6, heads=8, num_experts=k,
+                    use_cls_expert=False,
+                )
             elif self.config.get(cfg_key, None) == 'mean':
                 module = MeanMix(self.out_channels)
             elif self.config.get(cfg_key, None) == 'sum':
@@ -353,17 +359,19 @@ class MOEOperator(BaseModel, name='MOE'):
         
         # -------- 融合层 --------
         if fusion_type == 'linear':
-            self.fusion = nn.Linear(self.out_channels, self.out_channels)
+            self.fusion = LinearMix(self.out_channels)
         elif fusion_type == 'attention':
-            self.fusion = nn.MultiheadAttention(
-                embed_dim=self.out_channels,
-                num_heads=4,
-                batch_first=True
+            self.fusion = AttentionMix(
+                input_resolution=256, patch_size=16, in_channels=1,
+                width=512, layers=6, heads=8, num_experts=self.top_k,
+                use_cls_expert=False,
             )
         elif fusion_type == 'swa':
             self.s_act = GroupActMerge(processor=self.s_processor)
             self.w_act = GroupActMerge(processor=self.w_processor)
             self.sw_act = SWActMerge(beta=self.config.get('beta', 0.5))
+        elif fusion_type == 'basic':
+            self.fusion = SumMix(self.out_channels)
         else:
             raise ValueError(f"未支持的融合类型: {fusion_type}")
 
@@ -414,105 +422,106 @@ class MOEOperator(BaseModel, name='MOE'):
 
     # --------------- 初始化策略 ---------------
     def reset_parameters_(self):
-        """
-        - Conv2d(LeakyReLU 0.2) → Kaiming normal (fan_in, a=0.2)
-        - BatchNorm2d → gamma=1, beta=0
-        - Linear → Xavier uniform
-        - Router 的最后一层 Linear 权重与偏置置零（初始均匀路由）
-        - fusion_type='linear' 时：若方阵，初始化为近似恒等；否则 Xavier
-        - 预训练 ResNet50：仅初始化新建的 fc（conv1 已做均值拷贝）
-        - Experts/CRF/SWActMerge/GroupActMerge 等按通用规则或调用其内置 reset
-        """
+        """按照当前 MOE 架构对所有可学习组件进行初始化。"""
         neg_slope = 0.2
 
-        def init_module(m: nn.Module):
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, a=neg_slope, mode='fan_in', nonlinearity='leaky_relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm2d):
-                if m.weight is not None:
-                    nn.init.ones_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=1.0)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        def _init_linear(layer: nn.Linear):
+            weight = getattr(layer, 'weight', None)
+            if isinstance(weight, UninitializedParameter):
+                # 延迟参数（LazyLinear 等）在第一次 forward 时再由 PyTorch 初始化
+                return
+            if weight is not None:
+                nn.init.xavier_uniform_(weight, gain=1.0)
+            bias = getattr(layer, 'bias', None)
+            if bias is not None:
+                nn.init.zeros_(bias)
 
-        # 1) 通用初始化：time_to_space, CRF, experts, s/w processor
-        self.time_to_space_projection.apply(init_module)
+        def _init_basic(module: nn.Module):
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(
+                    module.weight,
+                    a=neg_slope,
+                    mode='fan_in',
+                    nonlinearity='leaky_relu',
+                )
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.BatchNorm2d):
+                if module.weight is not None:
+                    nn.init.ones_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Linear):
+                _init_linear(module)
+            elif isinstance(module, SpectralConv):
+                # SpectralConv 自带初始化逻辑
+                if hasattr(module, 'reset_parameters'):
+                    module.reset_parameters()
 
-        if hasattr(self, 'CCrf') and self.CCrf is not None:
-            # 若 CCrf 内部包含可学习层
-            try:
-                self.CCrf.apply(init_module)
-            except Exception:
-                pass
+        def _apply_basic(module: Optional[nn.Module]):
+            if module is not None:
+                module.apply(_init_basic)
 
-        for e in self.experts:
-            if hasattr(e, 'reset_parameters'):
-                e.reset_parameters()
+        def _init_composite(module: Optional[nn.Module]):
+            if module is None:
+                return
+            if hasattr(module, 'reset_parameters_'):
+                module.reset_parameters_()
+            elif hasattr(module, 'reset_parameters'):
+                module.reset_parameters()
             else:
-                e.apply(init_module)
+                module.apply(_init_basic)
 
-        for t in ['s_processor', 'w_processor']:
-            mod = getattr(self, t, None)
-            if mod is not None:
-                try:
-                    mod.apply(init_module)
-                except Exception:
-                    pass
+        # 1) 输入到输出的主干映射
+        _apply_basic(self.time_to_space_projection)
 
-        # 2) Router：先通用初始化，再把“最后一层 Linear”置零，得到“均匀起步”
-        if hasattr(self, 'router') and self.router is not None:
-            self.router.apply(init_module)
+        if getattr(self, 'CCrf', None) is not None:
+            if hasattr(self.CCrf, 'apply'):
+                self.CCrf.apply(_init_basic)
+            if hasattr(self.CCrf, 'w'):
+                nn.init.constant_(self.CCrf.w, 1.0)
+
+        # 2) 专家：优先使用其自带的 reset 接口
+        for expert in self.experts:
+            if hasattr(expert, 'reset_parameters'):
+                expert.reset_parameters()
+            elif hasattr(expert, 'reset_parameters_'):
+                expert.reset_parameters_()
+            else:
+                expert.apply(_init_basic)
+
+        # 3) 路由器：通用初始化 + 最后一层置零保证均匀起步
+        if getattr(self, 'router', None) is not None:
+            self.router.apply(_init_basic)
             last_linear = None
-            for m in self.router.modules():
-                if isinstance(m, nn.Linear):
-                    last_linear = m
-            if last_linear is not None:
+            for module in self.router.modules():
+                if isinstance(module, nn.Linear):
+                    last_linear = module
+            if last_linear is not None and not isinstance(getattr(last_linear, 'weight', None), UninitializedParameter):
                 nn.init.zeros_(last_linear.weight)
                 if last_linear.bias is not None:
                     nn.init.zeros_(last_linear.bias)
 
-        # 3) 融合层
-        if self.fusion_type == 'linear':
-            if isinstance(self.fusion, nn.Linear) and self.fusion.weight.shape[0] == self.fusion.weight.shape[1]:
-                with torch.no_grad():
-                    self.fusion.weight.zero_()
-                    eye = torch.eye(self.fusion.weight.shape[0], device=self.fusion.weight.device)
-                    self.fusion.weight.add_(eye)
-                    if self.fusion.bias is not None:
-                        self.fusion.bias.zero_()
-            else:
-                init_module(self.fusion)
-        elif self.fusion_type == 'attention':
-            # PyTorch 默认初始化已较稳，通常不改
-            pass
-        elif self.fusion_type == 'swa':
-            if hasattr(self, 's_act') and self.s_act is not None:
-                try:
-                    self.s_act.apply(init_module)
-                except Exception:
-                    pass
-            if hasattr(self, 'w_act') and self.w_act is not None:
-                try:
-                    self.w_act.apply(init_module)
-                except Exception:
-                    pass
-            if hasattr(self, 'sw_act') and self.sw_act is not None:
-                try:
-                    self.sw_act.apply(init_module)
-                except Exception:
-                    pass
+        # 4) s_processor / w_processor
+        for name in ('s_processor', 'w_processor'):
+            _init_composite(getattr(self, name, None))
 
-        # 4) ResNet50 新建 fc
-        if hasattr(self, 'classier'):
-            if hasattr(self, 'fc'):
-                nn.init.xavier_uniform_(self.fc.weight, gain=1.0)
-                if self.fc.bias is not None:
-                    nn.init.zeros_(self.fc.bias)
+        # 5) 融合头
+        if self.fusion_type == 'linear':
+            _init_composite(getattr(self, 'fusion', None))
+        elif self.fusion_type == 'attention':
+            if hasattr(self, 'fusion') and hasattr(self.fusion, 'reset_parameters'):
+                self.fusion.reset_parameters()
+        elif self.fusion_type == 'swa':
+            if getattr(self, 's_act', None) is not None:
+                _init_composite(getattr(self.s_act, 'processor', None))
+            if getattr(self, 'w_act', None) is not None:
+                _init_composite(getattr(self.w_act, 'processor', None))
+            # sw_act 无可学习参数
+
+        # 6) 线性分类头（仅在启用分类器时存在）
+        if getattr(self, 'config', {}).get('is_classier', False) and hasattr(self, 'fc'):
+            _init_linear(self.fc)
 
     # --------------- Hook：为 CRF 准备特征图 ---------------
     def hook_fn(self, module: nn.Module, input: Tuple[torch.Tensor], output: torch.Tensor):
@@ -547,6 +556,7 @@ class MOEOperator(BaseModel, name='MOE'):
             w_weights = w_indices = None
             aux_loss = None
 
+        # list[b,1,256,256] len = k
         s_outputs = self._process_activation_group(
             x=x,
             expert_indices=s_indices,
@@ -571,32 +581,19 @@ class MOEOperator(BaseModel, name='MOE'):
             )
 
         # 合并专家输出
+        s_combined = torch.stack(s_outputs, dim=1)  # (B, k, 1, h, w)
         if self.fusion_type == 'swa':
-            s_combined = torch.stack(s_outputs, dim=1)  # (B, k, 1, h, w)
             w_combined = torch.stack(w_outputs, dim=1)
-            s_merged = self.s_act(s_combined)
-            w_merged = self.w_act(w_combined)
-            combined_output = self.sw_act(s_merged, w_merged)
-        else:
-            # 线性/注意力两种都先把 s_outputs 加权求和得到 combined_output
-            combined_output = sum(s_outputs)
 
         # 融合层
-        if self.fusion_type == 'linear':
-            shape = combined_output.shape
-            combined_output = combined_output.view(batch_size, -1, self.out_channels)
-            combined_output = self.fusion(combined_output)
-            combined_output = combined_output.view(*shape)
-        elif self.fusion_type == 'attention':
-            shape = combined_output.shape
-            combined_output = combined_output.view(batch_size, -1, self.out_channels)
-            combined_output, _ = self.fusion(
-                combined_output, combined_output, combined_output
-            )
-            combined_output = combined_output.view(*shape)
-        # 'swa' 已在上面合并
-
-        # 调整输出尺寸到 (B,1,70,70)
+        if self.fusion_type == 'swa':
+            s_combined = self.s_act(s_outputs)
+            w_combined = self.w_act(w_outputs)
+            combined_output = self.sw_act(s_combined, w_combined)
+        else:
+            combined_output = self.fusion(s_combined)
+            
+        # b,1,h,w 调整输出尺寸到 (B,1,70,70)
         if self.out_channels == 1 and combined_output.shape[2] != 70:
             combined_output = self.time_to_space_projection(combined_output)
         else:

@@ -123,11 +123,11 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
     parser.add_argument('--router_type', type=str, default='basic',
                         help='路由器类型: \'basic\'/\'adamv\'')
     parser.add_argument('--fusion_type', type=str, default='linear',
-                        help='专家组间融合方式: \'linear\'/\'attention\'/\'swa\'')
+                        help='专家组间融合方式: \'linear\'/\'attention\'/\'swa\'/\'basic(sum)\'')
     parser.add_argument('--s_processor_type', type=str, default='linear',
-                        help='强专家组内融合方式: \'linear\'/\'atten\'/\'mean\'/\'sum\'')
+                        help='强专家组内融合方式: \'linear\'/\'attention\'/\'mean\'/\'sum\'')
     parser.add_argument('--w_processor_type', type=str, default='linear',
-                        help='弱专家组内融合方式: \'linear\'/\'atten\'/\'mean\'/\'sum\'')
+                        help='弱专家组内融合方式: \'linear\'/\'attention\'/\'mean\'/\'sum\'')
     parser.add_argument('--beta', type=float, default=0.5,
                         help='强弱激活参数，beta越大，弱激活影响越大')
     parser.add_argument('--is_specific', action='store_true',
