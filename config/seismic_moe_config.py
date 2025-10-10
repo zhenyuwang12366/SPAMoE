@@ -262,6 +262,69 @@ class SeismicMOEConfig(Default):
                 'default_in_shape': (256, 256),  # 基于输入张量形状设置
                 'hc': 64,
             },
+        },
+        # 几何感知专家 - GeoFNO，聚焦规则网格的几何变形
+        {
+            type_id_specific['flat_vel']: {
+                'type': 'geometry',
+                'geometry_type': 'geofno',
+                'modes1': 24,
+                'modes2': 24,
+                'n_fourier_layers': 5,
+                'code_dim': 42,
+                's1': 256,
+                's2': 256,
+                'is_mesh': True,
+                'hc': 96,
+            },
+            type_id_specific['flat_fault']: {
+                'type': 'geometry',
+                'geometry_type': 'geofno',
+                'modes1': 24,
+                'modes2': 24,
+                'n_fourier_layers': 5,
+                'code_dim': 42,
+                's1': 256,
+                's2': 256,
+                'is_mesh': True,
+                'hc': 96,
+            },
+            type_id_specific['curve_vel']: {
+                'type': 'geometry',
+                'geometry_type': 'geofno',
+                'modes1': 48,
+                'modes2': 48,
+                'n_fourier_layers': 6,
+                'code_dim': 42,
+                's1': 256,
+                's2': 256,
+                'is_mesh': True,
+                'hc': 160,
+            },
+            type_id_specific['curve_fault']: {
+                'type': 'geometry',
+                'geometry_type': 'geofno',
+                'modes1': 32,
+                'modes2': 32,
+                'n_fourier_layers': 5,
+                'code_dim': 42,
+                's1': 256,
+                's2': 256,
+                'is_mesh': True,
+                'hc': 128,
+            },
+            type_id_specific['style_style']: {
+                'type': 'geometry',
+                'geometry_type': 'geofno',
+                'modes1': 24,
+                'modes2': 24,
+                'n_fourier_layers': 5,
+                'code_dim': 42,
+                's1': 256,
+                's2': 256,
+                'is_mesh': True,
+                'hc': 96,
+            },
         }
     ]
 
@@ -333,6 +396,18 @@ class SeismicMOEConfig(Default):
             'diff_layers': True,   # 启用差分层
             'n_layers': 3,         # 设置层数
             'default_in_shape': (256, 256),  # 基于输入张量形状设置
+        },
+        # 几何感知专家 - GeoFNO
+        {
+            'type': 'geometry',
+            'geometry_type': 'geofno',
+            'modes1': 32,
+            'modes2': 32,
+            'n_fourier_layers': 5,
+            'code_dim': 42,
+            's1': 256,
+            's2': 256,
+            'is_mesh': True,
         }
     ]
     

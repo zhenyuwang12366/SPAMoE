@@ -149,6 +149,23 @@ def get_seismic_config(args: argparse.Namespace):
     # LNO config setting
     config.expert_configs[3]['n_modes'] = tuple(args.LNO_n_modes)
     config.expert_configs[3]['n_layers'] = args.LNO_n_layers
+    # GeoFNO config setting (index 4)
+    if len(config.expert_configs) > 4 and args.GeoFNO_modes1 is not None:
+        config.expert_configs[4]['modes1'] = args.GeoFNO_modes1
+    if len(config.expert_configs) > 4 and args.GeoFNO_modes2 is not None:
+        config.expert_configs[4]['modes2'] = args.GeoFNO_modes2
+    if len(config.expert_configs) > 4 and args.GeoFNO_n_fourier_layers is not None:
+        config.expert_configs[4]['n_fourier_layers'] = args.GeoFNO_n_fourier_layers
+    if len(config.expert_configs) > 4 and args.GeoFNO_code_dim is not None:
+        config.expert_configs[4]['code_dim'] = args.GeoFNO_code_dim
+    if len(config.expert_configs) > 4 and args.GeoFNO_s1 is not None:
+        config.expert_configs[4]['s1'] = args.GeoFNO_s1
+    if len(config.expert_configs) > 4 and args.GeoFNO_s2 is not None:
+        config.expert_configs[4]['s2'] = args.GeoFNO_s2
+    if len(config.expert_configs) > 4 and args.GeoFNO_width is not None:
+        config.expert_configs[4]['hc'] = args.GeoFNO_width
+    if len(config.expert_configs) > 4 and args.GeoFNO_is_mesh is not None:
+        config.expert_configs[4]['is_mesh'] = args.GeoFNO_is_mesh
     
     print(f'FNO:n_modes_height:{config.expert_configs[0]["n_modes_height"]}')
     print(f'FNO:n_modes_width:{config.expert_configs[0]["n_modes_width"]}')

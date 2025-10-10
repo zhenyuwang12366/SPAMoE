@@ -4,7 +4,6 @@
 #SBATCH --gres=gpu:2                       # 请求4个GPU
 #SBATCH --ntasks=1                         # 启动1个任务（torchrun会管理GPU）
 #SBATCH --cpus-per-task=10                  # 分配CPU
-#SBATCH --time=24:00:00                    # 最长运行时间
 #SBATCH --output=../results/output%j.txt             # 输出日志
 #SBATCH --no-requeue
 
@@ -25,14 +24,14 @@ bash scripts/run_distributed_seismic_moe.sh \
   --mode train \
   --num_gpus 2 \
   --num_workers 10 \
-  --data_dir /data1/home/teacher/teacher_s/t108790/FWINO/FWINO_data \
-  --family flat_vel \
+  --data_dir /data1/home/teacher/teacher_s/t108790/DATAA \
+  --family curve_vel \
   --is_specific \
   --batch_size 4 \
-  --epochs 100 \
+  --epochs 200 \
   --output_dir ../results/seismic_moe_${SLURM_JOB_NAME}_${SLURM_JOB_ID} \
   --top_k 1 \
-  --choose_experts 1 \
+  --choose_experts 4 \
   --WNO_n_levels_height 4 \
   --WNO_n_levels_width 3 \
   --hidden_channels 96 \

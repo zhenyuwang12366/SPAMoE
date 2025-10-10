@@ -40,7 +40,7 @@ K=1
 TOP_K=1
 CHOOSE_EXPERTS=(0)
 
-# FNO/WNO/MNO/LNO
+# FNO/WNO/MNO/LNO/GeoFNO
 FNO_H=16
 FNO_W=16
 FNO_N_LAYERS=8
@@ -65,6 +65,16 @@ MNO_FACTORS=(1.0 0.5 0.25)
 MNO_LAYERS=3
 LNO_MODES=(16 16)
 LNO_LAYERS=3
+
+# GeoFNO
+GEOFNO_MODES1=32
+GEOFNO_MODES2=32
+GEOFNO_N_FOURIER_LAYERS=5
+GEOFNO_CODE_DIM=42
+GEOFNO_S1=256
+GEOFNO_S2=256
+GEOFNO_WIDTH=""
+GEOFNO_IS_MESH=""
 
 # 模型结构 / MoE 融合相关
 HIDDEN_CHANNELS=64
@@ -153,6 +163,16 @@ while [[ $# -gt 0 ]]; do
     --MNO_n_layers) MNO_LAYERS="$2"; shift 2 ;;
     --LNO_n_modes) shift; LNO_MODES=(); while [[ $# -gt 0 && $1 != --* ]]; do LNO_MODES+=("$1"); shift; done ;;
     --LNO_n_layers) LNO_LAYERS="$2"; shift 2 ;;
+
+    --GeoFNO_modes1) GEOFNO_MODES1="$2"; shift 2 ;;
+    --GeoFNO_modes2) GEOFNO_MODES2="$2"; shift 2 ;;
+    --GeoFNO_n_fourier_layers) GEOFNO_N_FOURIER_LAYERS="$2"; shift 2 ;;
+    --GeoFNO_code_dim) GEOFNO_CODE_DIM="$2"; shift 2 ;;
+    --GeoFNO_s1) GEOFNO_S1="$2"; shift 2 ;;
+    --GeoFNO_s2) GEOFNO_S2="$2"; shift 2 ;;
+    --GeoFNO_width) GEOFNO_WIDTH="$2"; shift 2 ;;
+    --GeoFNO_is_mesh) GEOFNO_IS_MESH="1"; shift ;;
+    --GeoFNO_disable_is_mesh) GEOFNO_IS_MESH="0"; shift ;;
 
     --hidden_channels) HIDDEN_CHANNELS="$2"; shift 2 ;;
     --use_experts_path) USE_EXPERTS_PATH="$2"; shift 2 ;;
@@ -245,6 +265,8 @@ echo "WNO channel MLP expansion: ${WNO_CHANNEL_MLP_EXPANSION:-<default>}"
 echo "DTCWT type: ${DTCWT_TYPE[*]:-<None>}"
 echo "MNO(scales,layers,factors): ($MNO_SCALES, $MNO_LAYERS, ${MNO_FACTORS[*]})"
 echo "LNO(modes H W, layers): (${LNO_MODES[*]}, $LNO_LAYERS)"
+echo "GeoFNO(modes1,modes2,layers): ($GEOFNO_MODES1, $GEOFNO_MODES2, $GEOFNO_N_FOURIER_LAYERS)"
+echo "GeoFNO(code_dim,s1,s2,width,is_mesh): ($GEOFNO_CODE_DIM, $GEOFNO_S1, $GEOFNO_S2, ${GEOFNO_WIDTH:-<config>}, ${GEOFNO_IS_MESH:-<config>})"
 echo "Hidden Channels: $HIDDEN_CHANNELS"
 echo "Use Experts Path: ${USE_EXPERTS_PATH:-<None>}"
 echo "Use MoE: $USE_MOE"
@@ -295,6 +317,12 @@ ARGS=(
   --MNO_n_layers "$MNO_LAYERS"
   --LNO_n_modes "${LNO_MODES[@]}"
   --LNO_n_layers "$LNO_LAYERS"
+  --GeoFNO_modes1 "$GEOFNO_MODES1"
+  --GeoFNO_modes2 "$GEOFNO_MODES2"
+  --GeoFNO_n_fourier_layers "$GEOFNO_N_FOURIER_LAYERS"
+  --GeoFNO_code_dim "$GEOFNO_CODE_DIM"
+  --GeoFNO_s1 "$GEOFNO_S1"
+  --GeoFNO_s2 "$GEOFNO_S2"
   --k "$K"
   --hidden_channels "$HIDDEN_CHANNELS"
   --learning_rate "$LEARNING_RATE"
@@ -341,6 +369,12 @@ elif [[ "$WNO_USE_CHANNEL_MLP" == "0" ]]; then
 fi
 [[ -n "$WNO_CHANNEL_MLP_DROPOUT" ]] && ARGS+=( --WNO_channel_mlp_dropout "$WNO_CHANNEL_MLP_DROPOUT" )
 [[ -n "$WNO_CHANNEL_MLP_EXPANSION" ]] && ARGS+=( --WNO_channel_mlp_expansion "$WNO_CHANNEL_MLP_EXPANSION" )
+[[ -n "$GEOFNO_WIDTH" ]] && ARGS+=( --GeoFNO_width "$GEOFNO_WIDTH" )
+if [[ "$GEOFNO_IS_MESH" == "1" ]]; then
+  ARGS+=( --GeoFNO_is_mesh )
+elif [[ "$GEOFNO_IS_MESH" == "0" ]]; then
+  ARGS+=( --GeoFNO_disable_is_mesh )
+fi
 
 # 可选开关类参数
 [[ "$USE_WANDB" -eq 1 ]]   && ARGS+=( --use_wandb )

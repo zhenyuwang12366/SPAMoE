@@ -8,7 +8,7 @@ from .gino import GINO
 from .multiscale_expert import MultiscaleExpert
 from .multiscale_no import MultiscaleNO, MultiscaleNO1d, MultiscaleNO2d, MultiscaleNO3d
 from .local_no import LocalNO
-
+from .geofno import GeoFNO2d
 
 class ExpertFactory:
     """
@@ -306,6 +306,31 @@ class ExpertFactory:
                 out_channels=out_channels,
                 fno_hidden_channels=hidden_channels,
                 **kwargs
+            )
+        elif geometry_type in ('geo', 'geofno'):
+            # GeoFNO 专家，默认处理单通道 (B,1,H,W) 输入
+            if in_channels != 1:
+                raise ValueError(f"GeoFNO 目前仅支持单通道输入，收到 in_channels={in_channels}")
+
+            modes1 = kwargs.pop('modes1', kwargs.pop('n_modes_height', 12))
+            modes2 = kwargs.pop('modes2', kwargs.pop('n_modes_width', 12))
+            code_dim = kwargs.pop('code_dim', 42)
+            n_fourier_layers = kwargs.pop('n_fourier_layers', 5)
+            s1 = kwargs.pop('s1', 40)
+            s2 = kwargs.pop('s2', 40)
+            is_mesh = kwargs.pop('is_mesh', True)
+
+            return GeoFNO2d(
+                modes1=modes1,
+                modes2=modes2,
+                width=hidden_channels,
+                out_channels=out_channels,
+                code_dim=code_dim,
+                is_mesh=is_mesh,
+                s1=s1,
+                s2=s2,
+                n_fourier_layers=n_fourier_layers,
+                **kwargs,
             )
         else:
             raise ValueError(f"不支持的几何类型: {geometry_type}")

@@ -4,6 +4,7 @@ from .fnogno import FNOGNO
 from .gino import GINO
 from .local_no import LocalNO
 from .sfno import SFNO
+from .geofno import GeoFNO2d
 from .uno import UNO
 from .uqno import UQNO
 from .codano import CODANO
@@ -26,6 +27,7 @@ __all__ = [
     'LocalNO1d',
     'LocalNO2d',
     'LocalNO3d',
+    'GeoFNO2d',
     'SFNO',
     'UNO',
     'UQNO',

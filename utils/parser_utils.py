@@ -63,7 +63,7 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
     parser.add_argument('--top_k', type=int, default=1,
                         help='选择前k个专家')
     parser.add_argument('--choose_experts',nargs='+', type=int, default=[0],
-                        help='专家选择, FNO:0, WNO:1, MNO:2, LNO:3')
+                        help='专家选择, FNO:0, WNO:1, MNO:2, LNO:3, GeoFNO:4')
     
     parser.add_argument('--FNO_n_modes_height', type=int, default=16,
                         help='高度傅里叶变换后保留的模态数量')
@@ -103,6 +103,26 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='WNO通道MLP的dropout比例')
     parser.add_argument('--WNO_channel_mlp_expansion', type=float, default=None,
                         help='WNO通道MLP的扩展倍率')
+
+    parser.add_argument('--GeoFNO_modes1', type=int, default=None,
+                        help='GeoFNO 保留的傅里叶模态数量（高度方向），None 表示使用配置文件默认值')
+    parser.add_argument('--GeoFNO_modes2', type=int, default=None,
+                        help='GeoFNO 保留的傅里叶模态数量（宽度方向），None 表示使用配置文件默认值')
+    parser.add_argument('--GeoFNO_n_fourier_layers', type=int, default=None,
+                        help='GeoFNO 中 Fourier block 的层数')
+    parser.add_argument('--GeoFNO_code_dim', type=int, default=None,
+                        help='GeoFNO 条件向量长度')
+    parser.add_argument('--GeoFNO_s1', type=int, default=None,
+                        help='GeoFNO 内部的参考网格高度')
+    parser.add_argument('--GeoFNO_s2', type=int, default=None,
+                        help='GeoFNO 内部的参考网格宽度')
+    parser.add_argument('--GeoFNO_width', type=int, default=None,
+                        help='GeoFNO 主干宽度（hidden channels）')
+    parser.add_argument('--GeoFNO_is_mesh', dest='GeoFNO_is_mesh', action='store_true',
+                        help='强制 GeoFNO 在前向中使用 mesh 模式')
+    parser.add_argument('--GeoFNO_disable_is_mesh', dest='GeoFNO_is_mesh', action='store_false',
+                        help='禁用 GeoFNO 的 mesh 模式')
+    parser.set_defaults(GeoFNO_is_mesh=None)
     
     parser.add_argument('--MNO_n_scales', type=int, default=3,
                         help='总共使用的尺度')
