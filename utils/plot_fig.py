@@ -54,43 +54,35 @@ def visualize_results(inputs, targets, predictions, save_dir='./results', max_sa
     """可视化地震数据和预测结果"""
     os.makedirs(save_dir, exist_ok=True)
     
-    # 限制样本数
     n_samples = min(inputs.shape[0], max_samples)
     
     for i in range(n_samples):
-        # 创建图形
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6), constrained_layout=True)  
         
-        # 绘制输入地震数据（选择第一个通道）
-        # 如果输入数据是多维的，我们只显示第一个通道
         if len(inputs[i].shape) > 2:
             input_data = inputs[i, 0].cpu().numpy()
         else:
             input_data = inputs[i].cpu().numpy()
-        im0 = axes[0].imshow(input_data, cmap='viridis')
+        im0 = axes[0].imshow(input_data, cmap='viridis', aspect='auto')
         axes[0].set_title('inputs data')
-        plt.colorbar(im0, ax=axes[0])
+        fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
         
-        # 绘制目标（速度图或模型）
         target_map = targets[i, 0].cpu().numpy()
-        pred_map = predictions[i, 0].cpu().numpy()
-        vmin = float(target_map.min())
-        vmax = float(target_map.max())
+        pred_map   = predictions[i, 0].cpu().numpy()
+        vmin, vmax = float(target_map.min()), float(target_map.max())
         shared_norm = Normalize(vmin=vmin, vmax=vmax)
 
-        im1 = axes[1].imshow(target_map, cmap='jet', norm=shared_norm)
+        im1 = axes[1].imshow(target_map, cmap='jet', norm=shared_norm, aspect='auto')
         axes[1].set_title('targets model')
-        
-        # 绘制预测（速度图或模型）
-        im2 = axes[2].imshow(pred_map, cmap='jet', norm=shared_norm)
+
+        im2 = axes[2].imshow(pred_map, cmap='jet', norm=shared_norm, aspect='auto')
         axes[2].set_title('predictions model')
 
         cbar = fig.colorbar(im1, ax=axes[1:3], fraction=0.046, pad=0.04)
         cbar.set_label('Model amplitude')
-        
-        # 保存图像
-        plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, f'sample_{i}.png'), dpi=300)
+
+        save_path = os.path.join(save_dir, f'sample_{i}.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close(fig)
 
 def analyze_fourier_domain(inputs, targets, predictions, save_dir='./results', max_samples=4):
