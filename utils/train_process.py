@@ -10,20 +10,39 @@ from neuralop.models.moe import MOEOperator
 @torch.no_grad()
 def _evaluate_one_epoch(
     model: MOEOperator,
+    encoder,
+    # classifier,
     val_loader,
     device,
     criterion,
     metrics_module,  # 需有 calculate_psnr(pred, tgt)
+    amp_enabled: bool = False,
 ):
     model.eval()
+    if encoder is not None:
+        encoder.eval()
+    # if classifier is not None:
+    #     classifier.eval()
     val_loss = 0.0
     mse_sum, mae_sum, psnr_sum = 0.0, 0.0, 0.0
 
     for batch in val_loader:
         inputs  = batch['input'].to(device, non_blocking=True)
         targets = batch['output'].to(device, non_blocking=True)
+        targets = targets.to(dtype=torch.float32)
 
-        preds, aux_loss = model(inputs)
+        if encoder is not None:
+            if amp_enabled:
+                with torch.amp.autocast(device_type=device.type, enabled=True):
+                    encoded, weights, _ = encoder(inputs)
+            else:
+                encoded, weights, _ = encoder(inputs)
+            encoded = encoded.to(dtype=torch.float32).detach()
+            weights = weights.to(dtype=torch.float32).detach() if weights is not None else None
+        else:
+            encoded = inputs.to(dtype=torch.float32)
+            weights = None
+        preds, aux_loss = model(encoded, weights)
         if aux_loss is None:
             aux_loss = preds.new_zeros(())
 
@@ -47,6 +66,8 @@ def _evaluate_one_epoch(
 def train_one_epoch(
     *args,
     model: MOEOperator,
+    encoder=None,
+    # classifier=None,
     optimizer,
     criterion,
     train_loader,
@@ -102,6 +123,10 @@ def train_one_epoch(
 
     start_time = time.time()
     model.train()
+    if encoder is not None:
+        encoder.train()
+    # if classifier is not None:
+    #     classifier.train()
     running_train_loss = 0.0
     running_aux_loss = 0.0
     micro_count = 0
@@ -138,6 +163,23 @@ def train_one_epoch(
     for step, batch in enumerate(pbar_iter):
         inputs  = batch['input'].to(device, non_blocking=True)
         targets = batch['output'].to(device, non_blocking=True)
+        if encoder is not None:
+            if use_amp:
+                with torch.amp.autocast(device_type=device.type, enabled=True):
+                    encoded, weights, _ = encoder(inputs)
+            else:
+                encoded, weights, _ = encoder(inputs)
+        else:
+            encoded = inputs
+            weights = None
+        encoded = encoded.to(dtype=torch.float32)
+        weights = weights.to(dtype=torch.float32) if weights is not None else None
+        targets = targets.to(dtype=torch.float32)
+        # if classifier is not None:
+        #     weights = classifier(encoded)
+        # else:
+        #     weights = None
+        del inputs
 
         # —— 计算该 step 是否是这一累计组的“最后一个” —— #
         # 规则：自然分组 + 末尾不足一组也强制结算
@@ -148,14 +190,12 @@ def train_one_epoch(
 
         step_has_nan = False
         with sync_ctx:
-            autocast_ctx = torch.amp.autocast(device_type=device.type, enabled=use_amp) if use_amp else nullcontext()
-            with autocast_ctx:
-                preds, aux_loss = model(inputs)
-                if aux_loss is None:
-                    aux_loss = preds.new_zeros(())
-                loss_dict = criterion(preds, targets)
-                # —— 未缩放的“真实训练损失”（用于日志统计） —— #
-                loss_raw = loss_dict["loss"] + coef * aux_loss
+            preds, aux_loss = model(encoded, weights)
+            if aux_loss is None:
+                aux_loss = preds.new_zeros(())
+            loss_dict = criterion(preds, targets)
+            # —— 未缩放的“真实训练损失”（用于日志统计） —— #
+            loss_raw = loss_dict["loss"] + coef * aux_loss
 
             if not torch.isfinite(loss_raw).item():
                 step_has_nan = True
@@ -197,7 +237,8 @@ def train_one_epoch(
 
         if is_logger and tqdm is not None:
             pbar_iter.set_postfix({"train_loss": f"{loss_raw.item():.6f}"})  # 展示未缩放损失
-
+        encoded = None
+        weights = None
     # —— 训练集 loss（micro-step 平均）——
     if nan_detected and micro_count == 0:
         avg_train_loss = float("nan")
@@ -216,7 +257,15 @@ def train_one_epoch(
         }
         val_loss = float("inf")
     else:
-        val_stats = _evaluate_one_epoch(model, val_loader, device, criterion, metrics_module)
+        val_stats = _evaluate_one_epoch(
+            model,
+            encoder,
+            val_loader,
+            device,
+            criterion,
+            metrics_module,
+            amp_enabled=use_amp,
+        )
         val_loss = val_stats["val_loss"]
     if router_type == 'adamv':
         signal = router.step_validation(val_loss)
@@ -266,15 +315,23 @@ def train_one_epoch(
     if is_logger and (val_loss < best_val_loss):
         best_val_loss = val_loss
         model_to_save = model.module if (getattr(config, "distributed", None) and getattr(config.distributed, "use_distributed", False) and hasattr(model, "module")) else model
+        encoder_to_save = encoder.module if (encoder is not None and hasattr(encoder, "module")) else encoder
+        # classifier_to_save = classifier.module if (classifier is not None and hasattr(classifier, "module")) else classifier
 
-        torch.save({
+        checkpoint = {
             'epoch': epoch,
             'model_state_dict': model_to_save.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'val_loss': val_loss,
             'metrics': {"psnr": val_stats["psnr"], "mse": val_stats["mse"], "mae": val_stats["mae"]},
             'data_dict': data_dict
-        }, best_model_path)
+        }
+        if encoder_to_save is not None:
+            checkpoint['encoder_state_dict'] = encoder_to_save.state_dict()
+        # if classifier_to_save is not None:
+        #     checkpoint['classifier_state_dict'] = classifier_to_save.state_dict()
+
+        torch.save(checkpoint, best_model_path)
 
         if experts_name is not None and len(experts_name) == 1 and best_expert_path is not None:
             # 仅示例：若你的模型结构中存在 experts[0]
@@ -285,15 +342,23 @@ def train_one_epoch(
 
     if is_logger and last_model_path is not None:
         model_to_save = model.module if (getattr(config, "distributed", None) and getattr(config.distributed, "use_distributed", False) and hasattr(model, "module")) else model
+        encoder_to_save = encoder.module if (encoder is not None and hasattr(encoder, "module")) else encoder
+        # classifier_to_save = classifier.module if (classifier is not None and hasattr(classifier, "module")) else classifier
 
-        torch.save({
+        checkpoint = {
             'epoch': epoch,
             'model_state_dict': model_to_save.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'val_loss': val_loss,
             'metrics': {"psnr": val_stats["psnr"], "mse": val_stats["mse"], "mae": val_stats["mae"]},
             'data_dict': data_dict
-        }, last_model_path)
+        }
+        if encoder_to_save is not None:
+            checkpoint['encoder_state_dict'] = encoder_to_save.state_dict()
+        # if classifier_to_save is not None:
+        #     checkpoint['classifier_state_dict'] = classifier_to_save.state_dict()
+
+        torch.save(checkpoint, last_model_path)
 
         if experts_name is not None and len(experts_name) == 1 and last_expert_path is not None:
             if hasattr(model_to_save, "experts") and len(model_to_save.experts) > 0:
@@ -317,7 +382,18 @@ def train_one_epoch(
         inputs = vis_batch['input'].to(device, non_blocking=True)
         targets = vis_batch['output'].to(device, non_blocking=True)
         with torch.no_grad():
-            preds, _ = model(inputs)
+            if encoder is not None:
+                if use_amp:
+                    with torch.amp.autocast(device_type=device.type, enabled=True):
+                        vis_encoded, vis_weights, _ = encoder(inputs)
+                else:
+                    vis_encoded, vis_weights, _ = encoder(inputs)
+                vis_encoded = vis_encoded.to(dtype=torch.float32).detach()
+                vis_weights = vis_weights.to(dtype=torch.float32).detach() if vis_weights is not None else None
+            else:
+                vis_encoded = inputs.to(dtype=torch.float32)
+                vis_weights = None
+            preds, _ = model(vis_encoded, vis_weights)
 
         if input_inverse_transform is not None:
             inputs_v = input_inverse_transform(inputs)

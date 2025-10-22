@@ -6,6 +6,17 @@ from torch.utils.data import Dataset, DataLoader
 from typing import Dict, List, Tuple, Union, Optional
 import re
 from pathlib import Path
+import torch.nn.functional as F
+from config.seismic_moe_config import SeismicMOEConfig, SPECIFIC_TYPE_VARIANTS
+
+_SPECIFIC_VARIANT_TO_BASE = {
+    variant: base
+    for base, variants in SPECIFIC_TYPE_VARIANTS.items()
+    for variant in variants
+}
+_SPECIFIC_BASE_FAMILIES = set(SPECIFIC_TYPE_VARIANTS.keys())
+_SPECIFIC_VARIANT_FAMILIES = set(_SPECIFIC_VARIANT_TO_BASE.keys())
+_ALLOWED_SPECIFIC_FAMILIES = _SPECIFIC_BASE_FAMILIES | _SPECIFIC_VARIANT_FAMILIES
 
 class SeismicDataset(Dataset):
     """
@@ -20,7 +31,7 @@ class SeismicDataset(Dataset):
     family : str
         数据集系列，可选 'vel', 'style', 'fault' 或 'all'
     is_specific : bool
-        是否细化分类, 细化后: 'curve_vel', 'flat_vel', 'curve_fault', 'flat_fault', 'style_style'
+        是否细化分类, 细化后: 'curve_vel_a/b', 'flat_vel_a/b', 'curve_fault_a/b', 'flat_fault_a/b', 'style_style_a/b'
     split : str
         数据集分割，可选 'train' 或 'test'
     """
@@ -38,15 +49,19 @@ class SeismicDataset(Dataset):
         self.input_tensors = []
         self.output_tensors = []
         self.is_specific = is_specific
+        self._specific_target_family: Optional[str] = None
         
         # 验证参数
         if not is_specific:
             if self.family not in ['vel', 'style', 'fault', 'all']:
                 raise ValueError(f"不支持的数据集系列: {self.family}")
         else:
-            if self.family not in ['curve_vel', 'flat_vel', 'curve_fault', 'flat_fault', 'style_style']:
-                raise ValueError(f"不支持的数据集系列: {self.family}")
-            
+            if self.family not in _ALLOWED_SPECIFIC_FAMILIES:
+                raise ValueError(
+                    f"不支持的细分类系列: {self.family}. 可选项包括: {sorted(_ALLOWED_SPECIFIC_FAMILIES)}"
+                )
+            self._specific_target_family = _SPECIFIC_VARIANT_TO_BASE.get(self.family, self.family)
+
         if self.split not in ['train', 'test']:
             raise ValueError(f"不支持的数据集分割: {self.split}")
         # 加载数据
@@ -91,16 +106,17 @@ class SeismicDataset(Dataset):
 
         def want_family(group: str, variant: str | None) -> bool:
             """根据 family / is_specific 判定是否保留该目录"""
+            target_family = self._specific_target_family or self.family
             if not getattr(self, 'is_specific', False):
                 if self.family == 'all':
                     return True
                 return self.family == group
             else:
                 if group == 'style':
-                    return self.family == 'style_style'
+                    return target_family == 'style_style'
                 if variant is None:
                     return False
-                return self.family == f"{variant}_{group}"
+                return target_family == f"{variant}_{group}"
 
         if self.split == 'train':
             train_dir = os.path.join(self.data_dir, 'train_samples')
@@ -335,13 +351,74 @@ class SeismicDataProcessor:
         self,
         channel_dim: int = 0,
         input_transform : callable = None,
-        output_transform : callable = None
+        output_transform : callable = None,
+        config: SeismicMOEConfig = None,
     ):
+        assert config is not None, "please input config in data_processor"
+        self.config = config
         self.channel_dim = channel_dim
         # input_transform可以使用transforms中写好的类
         self.input_transform = input_transform
         self.output_transform = output_transform
-          
+
+    def _flexible_resize(
+        self,
+        x:torch.Tensor,
+        keep: bool = False,
+        size: Optional[Tuple[int, int]] = None,
+        mode: str = "bilinear",
+        align_corners: Optional[bool] = False,
+        antialias: bool = True,
+        auto_pad: bool = True,
+        pad_mode: str = "reflect",
+    ) -> torch.Tensor:
+        """
+        可选自动pad + resize 的统一函数
+        - 若 keep=True: 尺寸保持不变
+        - 若 size 给定: resize 到指定大小
+        - 若 auto_pad=True: 自动对 H/W 不相等的输入反射填充为正方形
+        
+        参数:
+        x: (B, C, H, W)
+        keep: 是否保持原尺寸
+        size: 目标尺寸 (H_out, W_out)
+        mode: 插值模式 ('bilinear'/'nearest'/'area'/...)
+        align_corners: 对齐角点（线性族插值建议 False）
+        antialias: 是否抗锯齿
+        auto_pad: 是否自动pad成正方形
+        pad_mode: pad 模式 ('reflect'/'replicate'/'constant' 等)
+        """
+        x = x.unsqueeze(0)
+        if keep:
+            x = x.squeeze(0)
+            return x
+        _, C, H, W = x.shape
+        if auto_pad and H != W:
+            # 目标正方形边长
+            M = max(H, W)
+            # 计算各方向 pad
+            pad_h = M - H
+            pad_w = M - W
+            pad_top = pad_h // 2
+            pad_bottom = pad_h - pad_top
+            pad_left = pad_w // 2
+            pad_right = pad_w - pad_left
+            # pad 参数按 (left, right, top, bottom)
+            pad = (pad_left, pad_right, pad_top, pad_bottom)
+            x = F.pad(x, pad, mode=pad_mode)
+
+        if size is None:
+            raise ValueError("Must specify `size` when keep=False")
+
+        if x.shape[-2:] == tuple(size):
+            x = x.squeeze(0)
+            return x
+
+        _align = align_corners if mode in {"linear", "bilinear", "bicubic", "trilinear"} else None
+        x = F.interpolate(x, size=size, mode=mode, align_corners=_align, antialias=antialias)
+        x = x.squeeze(0)
+        return x
+    
     def __call__(self, sample):
         """
         处理地震数据或速度图
@@ -395,6 +472,34 @@ class SeismicDataProcessor:
                 y = self.output_transform(y)
                 
             sample['output'] = y
+        
+        # 变换数据大小
+        # ==========（可选）统一输入尺寸给专家；默认关闭以保留原始 T×R 语义 ==========
+        for key in ['input']:
+            if key in sample and sample[key] is not None:
+                x = sample[key]
+                resize_enabled = bool(self.config.is_resize)
+                target_h = self.config.H_size
+                target_w = self.config.W_size
+                if resize_enabled:
+                    if target_h is None or target_w is None:
+                        target_size = tuple(x.shape[2:])
+                    else:
+                        target_size = (int(target_h), int(target_w))
+                else:
+                    target_size = tuple(x.shape[2:])
+
+                x = self._flexible_resize(
+                    x,
+                    keep=not resize_enabled,
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=True,
+                    antialias=True,
+                    auto_pad=True,
+                    pad_mode="reflect",
+                )
+                sample[key] = x
         
         return sample
 

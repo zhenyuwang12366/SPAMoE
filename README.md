@@ -41,7 +41,7 @@ normal(未细化):
   
 specific(细化)：
 
-- 模型分为curve_vel, curve_fault, flat_vel, flat_fault, style五类
+- 模型分为 curve_vel/curve_fault/flat_vel/flat_fault/style 五类，每类细分为 _a/_b 共 10 种标签
 - 命名约定：best_expert_{experts_name}\_{i}\_{curve/flat/style}_{vel/fault/style}.pt
 
 新增功能以及相关参数

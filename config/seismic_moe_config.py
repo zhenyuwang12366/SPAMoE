@@ -2,8 +2,34 @@
 用于地震数据的MOE (Mixture of Experts) 神经算子模型配置
 """
 
+from copy import deepcopy
+
 from .default_config import Default
 from .distributed import DistributedConfig
+
+# 细分类类别与对应变体列表
+SPECIFIC_TYPE_VARIANTS = {
+    'curve_vel': ('curve_vel_a', 'curve_vel_b'),
+    'curve_fault': ('curve_fault_a', 'curve_fault_b'),
+    'flat_vel': ('flat_vel_a', 'flat_vel_b'),
+    'flat_fault': ('flat_fault_a', 'flat_fault_b'),
+    'style_style': ('style_style_a', 'style_style_b'),
+}
+
+
+def expand_specific_configs(type_id_map: dict[str, int], base_cfg_map: dict[str, dict]) -> dict[int, dict]:
+    """
+    将以粗粒度类别为键的配置，扩展到具体的细分类别（例如 curve_vel → curve_vel_a/curve_vel_b）。
+    """
+    expanded: dict[int, dict] = {}
+    for base_name, cfg in base_cfg_map.items():
+        variants = SPECIFIC_TYPE_VARIANTS.get(base_name, (base_name,))
+        for variant in variants:
+            if variant not in type_id_map:
+                raise KeyError(f"Unknown specific velocity type variant '{variant}' (base '{base_name}').")
+            expanded[type_id_map[variant]] = deepcopy(cfg)
+    return expanded
+
 
 class SeismicMOEConfig(Default):
     """地震数据MOE神经算子的配置"""
@@ -12,13 +38,21 @@ class SeismicMOEConfig(Default):
     model_name = 'MOE'
     in_channels = 1  # 修正为1，与实际输入通道数一致
     out_channels = 1  # 根据输出张量形状更新，输出通道数为5
+    is_resize = False
+    H_size = 256
+    W_size = 256
     # v_type_id dict
     type_id_specific = {
-        'curve_vel': 0,
-        'curve_fault': 1,
-        'flat_vel': 2,
-        'flat_fault': 3,
-        'style_style': 4,
+        'curve_vel_a': 0,
+        'curve_vel_b': 1,
+        'curve_fault_a': 2,
+        'curve_fault_b': 3,
+        'flat_vel_a': 4,
+        'flat_vel_b': 5,
+        'flat_fault_a': 6,
+        'flat_fault_b': 7,
+        'style_style_a': 8,
+        'style_style_b': 9,
     }
     type_id_normal = {
         'vel': 0,
@@ -32,131 +66,131 @@ class SeismicMOEConfig(Default):
     
     load_expert_configs = [
         # 傅里叶域专家 - 适合捕捉频率特征 FNO
-        {
-            type_id_specific['flat_vel']: {
-                    'type': 'domain',
-                    'domain_type': 'fourier',
-                    'n_dim': 2,
-                    'n_modes_height': 16,
-                    'n_modes_width': 16,
-                    'lifting_channel_ratio': 2,
-                    'projection_channel_ratio': 2,
-                    'n_layers': 8,
-                    'hc': 64,
+        expand_specific_configs(type_id_specific, {
+            'flat_vel': {
+                'type': 'domain',
+                'domain_type': 'fourier',
+                'n_dim': 2,
+                'n_modes_height': 16,
+                'n_modes_width': 16,
+                'lifting_channel_ratio': 2,
+                'projection_channel_ratio': 2,
+                'n_layers': 8,
+                'hc': 64,
             },
-            type_id_specific['flat_fault']: {
-                    'type': 'domain',
-                    'domain_type': 'fourier',
-                    'n_dim': 2,
-                    'n_modes_height': 16,
-                    'n_modes_width': 16,
-                    'lifting_channel_ratio': 2,
-                    'projection_channel_ratio': 2,
-                    'n_layers': 8,
-                    'hc': 64,
+            'flat_fault': {
+                'type': 'domain',
+                'domain_type': 'fourier',
+                'n_dim': 2,
+                'n_modes_height': 16,
+                'n_modes_width': 16,
+                'lifting_channel_ratio': 2,
+                'projection_channel_ratio': 2,
+                'n_layers': 8,
+                'hc': 64,
             },
-            type_id_specific['curve_vel']: {
-                    'type': 'domain',
-                    'domain_type': 'fourier',
-                    'n_dim': 2,
-                    'n_modes_height': 64,
-                    'n_modes_width': 64,
-                    'lifting_channel_ratio': 2,
-                    'projection_channel_ratio': 2,
-                    'n_layers': 8,
-                    'hc': 128,
+            'curve_vel': {
+                'type': 'domain',
+                'domain_type': 'fourier',
+                'n_dim': 2,
+                'n_modes_height': 64,
+                'n_modes_width': 64,
+                'lifting_channel_ratio': 2,
+                'projection_channel_ratio': 2,
+                'n_layers': 8,
+                'hc': 128,
             },
-            type_id_specific['curve_fault']: {
-                    'type': 'domain',
-                    'domain_type': 'fourier',
-                    'n_dim': 2,
-                    'n_modes_height': 16,
-                    'n_modes_width': 16,
-                    'lifting_channel_ratio': 2,
-                    'projection_channel_ratio': 2,
-                    'n_layers': 8,
-                    'hc': 64,
+            'curve_fault': {
+                'type': 'domain',
+                'domain_type': 'fourier',
+                'n_dim': 2,
+                'n_modes_height': 16,
+                'n_modes_width': 16,
+                'lifting_channel_ratio': 2,
+                'projection_channel_ratio': 2,
+                'n_layers': 8,
+                'hc': 64,
             },
-            type_id_specific['style_style']: {
-                    'type': 'domain',
-                    'domain_type': 'fourier',
-                    'n_dim': 2,
-                    'n_modes_height': 16,
-                    'n_modes_width': 16,
-                    'lifting_channel_ratio': 2,
-                    'projection_channel_ratio': 2,
-                    'n_layers': 8,
-                    'hc': 64,
+            'style_style': {
+                'type': 'domain',
+                'domain_type': 'fourier',
+                'n_dim': 2,
+                'n_modes_height': 16,
+                'n_modes_width': 16,
+                'lifting_channel_ratio': 2,
+                'projection_channel_ratio': 2,
+                'n_layers': 8,
+                'hc': 64,
             },
-        },
+        }),
         # 小波域专家 - 适合处理局部特征和多尺度结构 WNO
-        {
-            type_id_specific['flat_vel']: {
+        expand_specific_configs(type_id_specific, {
+            'flat_vel': {
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 2,
+                'n_levels_width': 2,
                 'wavelet_type': 'haar',
-                'ensure_even_shapes': True,  # 确保形状为偶数
-                'pad_mode': 'reflect',  # 添加填充模式
-                'adaptive_padding': True,  # 启用自适应填充
+                'ensure_even_shapes': True,
+                'pad_mode': 'reflect',
+                'adaptive_padding': True,
                 'hc': 64,
             },
-            type_id_specific['flat_fault']: {
+            'flat_fault': {
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 2,
+                'n_levels_width': 2,
                 'wavelet_type': 'haar',
-                'ensure_even_shapes': True,  # 确保形状为偶数
-                'pad_mode': 'reflect',  # 添加填充模式
-                'adaptive_padding': True,  # 启用自适应填充
+                'ensure_even_shapes': True,
+                'pad_mode': 'reflect',
+                'adaptive_padding': True,
                 'hc': 64,
             },
-            type_id_specific['curve_vel']: {
+            'curve_vel': {
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 2,
+                'n_levels_width': 2,
                 'wavelet_type': 'haar',
-                'ensure_even_shapes': True,  # 确保形状为偶数
-                'pad_mode': 'reflect',  # 添加填充模式
-                'adaptive_padding': True,  # 启用自适应填充
+                'ensure_even_shapes': True,
+                'pad_mode': 'reflect',
+                'adaptive_padding': True,
                 'hc': 64,
             },
-            type_id_specific['curve_fault']: {
+            'curve_fault': {
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 2,
+                'n_levels_width': 2,
                 'wavelet_type': 'haar',
-                'ensure_even_shapes': True,  # 确保形状为偶数
-                'pad_mode': 'reflect',  # 添加填充模式
-                'adaptive_padding': True,  # 启用自适应填充
+                'ensure_even_shapes': True,
+                'pad_mode': 'reflect',
+                'adaptive_padding': True,
                 'hc': 64,
             },
-            type_id_specific['style_style']: {
+            'style_style': {
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 2,
+                'n_levels_width': 2,
                 'wavelet_type': 'haar',
-                'ensure_even_shapes': True,  # 确保形状为偶数
-                'pad_mode': 'reflect',  # 添加填充模式
-                'adaptive_padding': True,  # 启用自适应填充
+                'ensure_even_shapes': True,
+                'pad_mode': 'reflect',
+                'adaptive_padding': True,
                 'hc': 64,
             },
-        },
+        }),
         # 原生多尺度神经算子专家 - 专门处理多尺度地质结构 MNO
-        {
-            type_id_specific['flat_vel']: {
+        expand_specific_configs(type_id_specific, {
+            'flat_vel': {
                 'type': 'scale',
-                'scale_expert_type': 'native',  # 更新为scale_expert_type
+                'scale_expert_type': 'native',
                 'n_dim': 2,
                 'n_scales': 3,
                 'scale_factors': [1.0, 0.5, 0.25],
@@ -164,9 +198,9 @@ class SeismicMOEConfig(Default):
                 'n_layers': 3,
                 'hc': 64,
             },
-            type_id_specific['flat_fault']: {
+            'flat_fault': {
                 'type': 'scale',
-                'scale_expert_type': 'native',  # 更新为scale_expert_type
+                'scale_expert_type': 'native',
                 'n_dim': 2,
                 'n_scales': 3,
                 'scale_factors': [1.0, 0.5, 0.25],
@@ -174,9 +208,9 @@ class SeismicMOEConfig(Default):
                 'n_layers': 3,
                 'hc': 64,
             },
-            type_id_specific['curve_vel']: {
+            'curve_vel': {
                 'type': 'scale',
-                'scale_expert_type': 'native',  # 更新为scale_expert_type
+                'scale_expert_type': 'native',
                 'n_dim': 2,
                 'n_scales': 3,
                 'scale_factors': [1.0, 0.6, 0.3],
@@ -184,9 +218,9 @@ class SeismicMOEConfig(Default):
                 'n_layers': 4,
                 'hc': 128,
             },
-            type_id_specific['curve_fault']: {
+            'curve_fault': {
                 'type': 'scale',
-                'scale_expert_type': 'native',  # 更新为scale_expert_type
+                'scale_expert_type': 'native',
                 'n_dim': 2,
                 'n_scales': 3,
                 'scale_factors': [1.0, 0.5, 0.25],
@@ -194,9 +228,9 @@ class SeismicMOEConfig(Default):
                 'n_layers': 3,
                 'hc': 64,
             },
-            type_id_specific['style_style']: {
+            'style_style': {
                 'type': 'scale',
-                'scale_expert_type': 'native',  # 更新为scale_expert_type
+                'scale_expert_type': 'native',
                 'n_dim': 2,
                 'n_scales': 3,
                 'scale_factors': [1.0, 0.5, 0.25],
@@ -204,68 +238,68 @@ class SeismicMOEConfig(Default):
                 'n_layers': 3,
                 'hc': 64,
             },
-        },
-        # # 局部处理专家 - 用于局部细节重建 LNO
-        {
-            type_id_specific['flat_vel']: {
+        }),
+        # 局部处理专家 - 用于局部细节重建 LNO
+        expand_specific_configs(type_id_specific, {
+            'flat_vel': {
                 'type': 'local',
-                'local_type': 'basic',  # 更新为basic类型
+                'local_type': 'basic',
                 'n_dim': 2,
                 'n_modes': (16, 16),
-                'disco_layers': True,  # 启用DISCO层
-                'diff_layers': True,   # 启用差分层
-                'n_layers': 3,         # 设置层数
-                'default_in_shape': (256, 256),  # 基于输入张量形状设置
+                'disco_layers': True,
+                'diff_layers': True,
+                'n_layers': 3,
+                'default_in_shape': (256, 256),
                 'hc': 64,
             },
-            type_id_specific['flat_fault']: {
+            'flat_fault': {
                 'type': 'local',
-                'local_type': 'basic',  # 更新为basic类型
+                'local_type': 'basic',
                 'n_dim': 2,
                 'n_modes': (16, 16),
-                'disco_layers': True,  # 启用DISCO层
-                'diff_layers': True,   # 启用差分层
-                'n_layers': 3,         # 设置层数
-                'default_in_shape': (256, 256),  # 基于输入张量形状设置
+                'disco_layers': True,
+                'diff_layers': True,
+                'n_layers': 3,
+                'default_in_shape': (256, 256),
                 'hc': 64,
             },
-            type_id_specific['curve_vel']: {
+            'curve_vel': {
                 'type': 'local',
-                'local_type': 'basic',  # 更新为basic类型
+                'local_type': 'basic',
                 'n_dim': 2,
                 'n_modes': (16, 16),
-                'disco_layers': True,  # 启用DISCO层
-                'diff_layers': True,   # 启用差分层
-                'n_layers': 3,         # 设置层数
-                'default_in_shape': (256, 256),  # 基于输入张量形状设置
+                'disco_layers': True,
+                'diff_layers': True,
+                'n_layers': 3,
+                'default_in_shape': (256, 256),
                 'hc': 64,
             },
-            type_id_specific['curve_fault']: {
+            'curve_fault': {
                 'type': 'local',
-                'local_type': 'basic',  # 更新为basic类型
+                'local_type': 'basic',
                 'n_dim': 2,
                 'n_modes': (16, 16),
-                'disco_layers': True,  # 启用DISCO层
-                'diff_layers': True,   # 启用差分层
-                'n_layers': 3,         # 设置层数
-                'default_in_shape': (256, 256),  # 基于输入张量形状设置
+                'disco_layers': True,
+                'diff_layers': True,
+                'n_layers': 3,
+                'default_in_shape': (256, 256),
                 'hc': 64,
             },
-            type_id_specific['style_style']: {
+            'style_style': {
                 'type': 'local',
-                'local_type': 'basic',  # 更新为basic类型
+                'local_type': 'basic',
                 'n_dim': 2,
                 'n_modes': (16, 16),
-                'disco_layers': True,  # 启用DISCO层
-                'diff_layers': True,   # 启用差分层
-                'n_layers': 3,         # 设置层数
-                'default_in_shape': (256, 256),  # 基于输入张量形状设置
+                'disco_layers': True,
+                'diff_layers': True,
+                'n_layers': 3,
+                'default_in_shape': (256, 256),
                 'hc': 64,
             },
-        },
+        }),
         # 几何感知专家 - GeoFNO，聚焦规则网格的几何变形
-        {
-            type_id_specific['flat_vel']: {
+        expand_specific_configs(type_id_specific, {
+            'flat_vel': {
                 'type': 'geometry',
                 'geometry_type': 'geofno',
                 'modes1': 24,
@@ -277,7 +311,7 @@ class SeismicMOEConfig(Default):
                 'is_mesh': True,
                 'hc': 96,
             },
-            type_id_specific['flat_fault']: {
+            'flat_fault': {
                 'type': 'geometry',
                 'geometry_type': 'geofno',
                 'modes1': 24,
@@ -289,7 +323,7 @@ class SeismicMOEConfig(Default):
                 'is_mesh': True,
                 'hc': 96,
             },
-            type_id_specific['curve_vel']: {
+            'curve_vel': {
                 'type': 'geometry',
                 'geometry_type': 'geofno',
                 'modes1': 48,
@@ -301,7 +335,7 @@ class SeismicMOEConfig(Default):
                 'is_mesh': True,
                 'hc': 160,
             },
-            type_id_specific['curve_fault']: {
+            'curve_fault': {
                 'type': 'geometry',
                 'geometry_type': 'geofno',
                 'modes1': 32,
@@ -313,7 +347,7 @@ class SeismicMOEConfig(Default):
                 'is_mesh': True,
                 'hc': 128,
             },
-            type_id_specific['style_style']: {
+            'style_style': {
                 'type': 'geometry',
                 'geometry_type': 'geofno',
                 'modes1': 24,
@@ -325,7 +359,7 @@ class SeismicMOEConfig(Default):
                 'is_mesh': True,
                 'hc': 96,
             },
-        }
+        }),
     ]
 
     # 数据集配置

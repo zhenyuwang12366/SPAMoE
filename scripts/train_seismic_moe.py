@@ -22,6 +22,8 @@ import transforms as T
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neuralop.models import MOEOperator, ExpertFactory
+from neuralop.models.encoder import get_encoder
+# from neuralop.models.classifier import get_classifier
 from neuralop.training import setup
 from neuralop.data.datasets import SeismicDataset, create_seismic_dataloader
 from neuralop.utils import get_wandb_api_key, count_model_params
@@ -46,6 +48,8 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     args : argparse.Namespace
         命令行参数
     """
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     config, runtime_ctx = get_seismic_config(args)
 
     device = runtime_ctx["device"]
@@ -119,7 +123,8 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     data_processor = SeismicDataProcessor(
         input_transform=input_transform,
         output_transform=output_transform,
-        channel_dim=config.channel_dim
+        channel_dim=config.channel_dim,
+        config=config,
     )
     
     # 应用变换到训练集和验证集
@@ -205,25 +210,35 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     
     # 获取实际的输入通道数
     in_channels = sample_batch['input'].shape[1]  # 获取通道维度大小
-    config.in_channels = in_channels  # 更新配置
-    
+    config.in_channels = in_channels  # 更新配置（原始输入通道数）
+
     # 检查专家配置
     if is_logger:
         print(f"更新后的输入通道数: {config.in_channels}")
         print(f"输出通道数: {config.out_channels}")
         print(f"隐藏通道数: {config.hidden_channels}")
         print(f"专家数量: {len(config.expert_configs)}")
-        
-        # 检查每个专家配置
-        for i, expert_config in enumerate(config.expert_configs):
-            print(f"专家 {i+1} 类型: {expert_config.get('type', 'unknown')}")
-            if 'in_channels' in expert_config and expert_config['in_channels'] != in_channels:
-                print(f"警告：专家 {i+1} 的输入通道数 {expert_config['in_channels']} 与实际输入通道数 {in_channels} 不匹配")
-    
+
+    # 先构建 encoder，估计编码后张量的通道数用于 MoE
+    encoder_model = get_encoder(in_channels=1, out_channels=128, num_types=10)
+    if not config.is_classier and hasattr(encoder_model, "type_head"):
+        for p in encoder_model.type_head.parameters():
+            p.requires_grad_(False)
+    encoder_model.eval()
+    with torch.no_grad():
+        encoder_probe, _, _ = encoder_model(sample_batch['input'])
+    moe_in_channels = encoder_probe.shape[1]
+    del encoder_probe
+    encoder_model.train()
+    config.moe_in_channels = moe_in_channels
+
+    if is_logger:
+        print(f"Encoder 输出通道数(供 MoE 使用): {moe_in_channels}")
+
     if config.use_moe and config.use_experts_path:
         experts = load_moe_experts(
             experts_config=config.load_expert_configs,
-            in_channels=config.in_channels,
+            in_channels=moe_in_channels,
             out_channels=config.out_channels,
             hidden_channels=config.hidden_channels,
             model_path=config.use_experts_path,
@@ -235,15 +250,16 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         # 创建专家模型
         experts = ExpertFactory.create_expert_ensemble(
             expert_configs=config.expert_configs,
-            in_channels=config.in_channels,
+            in_channels=moe_in_channels,
             out_channels=config.out_channels,
             hidden_channels=config.hidden_channels
         )
-    
-    # 创建MOE模型
-    model = MOEOperator(
+
+    # 创建分类器和 MOE 主干
+    # classifier_model = get_classifier(moe_in_channels)
+    moe_model = MOEOperator(
         experts=experts,
-        in_channels=config.in_channels,
+        in_channels=moe_in_channels,
         out_channels=config.out_channels,
         hidden_channels=config.hidden_channels,
         top_k=config.top_k,
@@ -258,30 +274,50 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         is_specific = config.is_specific,
         is_classier = config.is_classier,
         batch_size=config.batch_size,
-        resize_input_for_experts = True,
         v_type_num=config.v_type_num,
     )
-    
+
     # 移动模型到设备
-    model = model.to(device)
-    
-    # 使用分布式数据并行
     if config.distributed.use_distributed:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
-        model = DDP(
-            model, device_ids=[device.index], 
-            output_device=device.index, 
+        encoder_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(encoder_model).to(device)
+        # classifier_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(classifier_model).to(device)
+        moe_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(moe_model).to(device)
+        encoder_model = DDP(
+            encoder_model, device_ids=[device.index],
+            output_device=device.index,
+            static_graph=False,
+            find_unused_parameters=False,
+        )
+        # classifier_model = DDP(
+        #     classifier_model, device_ids=[device.index],
+        #     output_device=device.index,
+        #     static_graph=False,
+        #     find_unused_parameters=False,
+        # )
+        trainable_model = DDP(
+            moe_model, device_ids=[device.index],
+            output_device=device.index,
             static_graph=False,
             find_unused_parameters=True,
-            gradient_as_bucket_view=True,
+            gradient_as_bucket_view=False,
         )
+    else:
+        encoder_model = encoder_model.to(device)
+        # classifier_model = classifier_model.to(device)
+        moe_model = moe_model.to(device)
+        trainable_model = moe_model
+    
+    model = trainable_model
  
     # Scale lr according to effective batch size
     if config.distributed.use_distributed and world_size > 2:
         lr = config.learning_rate * math.sqrt(world_size)
     else:
         lr = config.learning_rate
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=config.weight_decay)
+    optim_params = list(model.parameters())
+    optim_params += list(encoder_model.parameters())
+    # optim_params += list(classifier_model.parameters())
+    optimizer = torch.optim.AdamW(optim_params, lr=lr, betas=(0.9, 0.999), weight_decay=config.weight_decay)
     
     # Convert scheduler to be per iteration instead of per epoch
     steps_per_epoch = max(1, len(train_loader))
@@ -397,13 +433,16 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     
     # 记录参数数量
     if is_logger:
-        if config.distributed.use_distributed:
-            # 对于DDP模型，需要获取原始模型
-            n_params = count_model_params(model.module)
-        else:
-            n_params = count_model_params(model)
+        moe_module = model.module if (config.distributed.use_distributed and hasattr(model, "module")) else model
+        encoder_module = encoder_model.module if (config.distributed.use_distributed and hasattr(encoder_model, "module")) else encoder_model
+        # classifier_module = classifier_model.module if (config.distributed.use_distributed and hasattr(classifier_model, "module")) else classifier_model
+
+        moe_params = count_model_params(moe_module)
+        encoder_params = count_model_params(encoder_module)
+        # classifier_params = count_model_params(classifier_module)
+        n_params = moe_params + encoder_params
         
-        print(f"模型参数数量: {n_params}")
+        print(f"模型参数数量: 总计 {n_params} (MoE {moe_params}, Encoder {encoder_params})")
         
         if args.use_wandb:
             wandb.log({"n_params": n_params})
@@ -418,6 +457,16 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             model.module.load_state_dict(checkpoint['model_state_dict'])
         else:
             model.load_state_dict(checkpoint['model_state_dict'])
+
+        encoder_state = checkpoint.get('encoder_state_dict')
+        if encoder_state is not None:
+            encoder_target = encoder_model.module if (config.distributed.use_distributed and hasattr(encoder_model, "module")) else encoder_model
+            encoder_target.load_state_dict(encoder_state)
+
+        # classifier_state = checkpoint.get('classifier_state_dict')
+        # if classifier_state is not None:
+        #     classifier_target = classifier_model.module if (config.distributed.use_distributed and hasattr(classifier_model, "module")) else classifier_model
+        #     classifier_target.load_state_dict(classifier_state)
 
         # 加载优化器状态
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -437,7 +486,12 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             print("未提供 resume 路径，或路径无效，将从头开始训练。")
     
     amp_enabled = bool(use_amp) and device.type == 'cuda'
-    scaler = torch.amp.GradScaler(device=device, enabled=amp_enabled)
+    moe_module = moe_model if not hasattr(moe_model, "module") else moe_model.module
+    moe_has_complex = any(p.is_complex() for p in moe_module.parameters())
+    scaler_enabled = amp_enabled and not moe_has_complex
+    if amp_enabled and not scaler_enabled and is_logger:
+        print("[AMP] 检测到 MoE 含有复数参数，禁用 GradScaler，仅对 encoder 使用 autocast。")
+    scaler = torch.amp.GradScaler(device=device, enabled=scaler_enabled)
     optimizer.zero_grad(set_to_none=True)
     REPORT_EVERY = max(1, getattr(args, "report_every", 5))
 #以上全是准备工作，下面是核心循环
@@ -446,6 +500,8 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         vis_now = (is_logger and ((epoch + 1) % args.vis_freq == 0))
         stats, best_val_loss, stop_flag = train_one_epoch(
             model=model,
+            encoder=encoder_model,
+            # classifier=classifier_model,
             optimizer=optimizer,
             criterion=criterion,
             train_loader=train_loader,

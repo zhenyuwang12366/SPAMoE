@@ -483,7 +483,8 @@ class SpectralConv(BaseSpectralConv):
         else:
             slices_x[-1] = slice(None)
         
-        out_fft[slices_x] = self._contract(x[slices_x], weight, separable=self.separable)
+        slices_x_tuple = tuple(slices_x)
+        out_fft[slices_x_tuple] = self._contract(x[slices_x_tuple], weight, separable=self.separable)
 
         if self.resolution_scaling_factor is not None and output_shape is None:
             mode_sizes = tuple([round(s * r) for (s, r) in zip(mode_sizes, self.resolution_scaling_factor)])

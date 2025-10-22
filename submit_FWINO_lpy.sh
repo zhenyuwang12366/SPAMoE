@@ -27,11 +27,11 @@ bash scripts/run_distributed_seismic_moe.sh \
   --data_dir /data1/home/teacher/teacher_s/t108790/DATAA \
   --family curve_vel \
   --is_specific \
-  --batch_size 4 \
-  --epochs 200 \
+  --batch_size 32 \
+  --epochs 100 \
   --output_dir ../results/seismic_moe_${SLURM_JOB_NAME}_${SLURM_JOB_ID} \
   --top_k 1 \
-  --choose_experts 4 \
+  --choose_experts 0 \
   --WNO_n_levels_height 4 \
   --WNO_n_levels_width 3 \
   --hidden_channels 96 \
@@ -49,4 +49,5 @@ bash scripts/run_distributed_seismic_moe.sh \
   --lambda_g1v 0.43947650935102966 \
   --lambda_g2v 0.35339805101397564 \
   --lambda_grad_l1 0.15 \
-  --lambda_fourier_mag_l1 0.05
+  --lambda_fourier_mag_l1 0.05 \
+  --use_amp

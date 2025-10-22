@@ -12,6 +12,7 @@ EPOCHS=100
 OUTPUT_DIR="./results/distributed_seismic_moe"
 VIS_FREQ=5
 USE_WANDB=0
+USE_AMP=0
 VAL_RATIO=0.2
 ACCUM_STEPS=1
 NUM_WORKERS=4
@@ -95,6 +96,9 @@ RESUME_PATH=""
 
 # 性能统计
 PROFILE_TIMING=0                # flag -> --profile_timing
+IS_RESIZE=0
+H_SIZE=256
+W_SIZE=256
 
 # ================================
 # 解析命令行参数
@@ -110,11 +114,13 @@ while [[ $# -gt 0 ]]; do
     --output_dir) OUTPUT_DIR="$2"; shift 2 ;;
     --vis_freq) VIS_FREQ="$2"; shift 2 ;;
     --use_wandb) USE_WANDB=1; shift ;;
+    --use_amp) USE_AMP=1; shift ;;
 
     --val_ratio) VAL_RATIO="$2"; shift 2 ;;
     --num_workers) NUM_WORKERS="$2"; shift 2 ;;
     --seed) SEED="$2"; shift 2 ;;
     --accum_steps) ACCUM_STEPS="$2"; shift 2 ;;
+    --distributed) shift ;;
 
     --learning_rate) LEARNING_RATE="$2"; shift 2 ;;
     --weight_decay) WEIGHT_DECAY="$2"; shift 2 ;;
@@ -190,6 +196,9 @@ while [[ $# -gt 0 ]]; do
     --resume_path) RESUME_PATH="$2"; shift 2 ;;
 
     --profile_timing) PROFILE_TIMING=1; shift ;;
+    --is_resize) IS_RESIZE=1; shift ;;
+    --H_size) H_SIZE="$2"; shift 2 ;;
+    --W_size) W_SIZE="$2"; shift 2 ;;
 
     *)
       echo "未知参数: $1"
@@ -233,9 +242,11 @@ echo "训练轮数: $EPOCHS"
 echo "输出目录: $OUTPUT_DIR"
 echo "可视化频率: $VIS_FREQ"
 echo "使用WandB: $USE_WANDB"
+echo "使用AMP: $USE_AMP"
 echo "验证集比例: $VAL_RATIO"
 echo "Num Workers: $NUM_WORKERS"
 echo "Seed: $SEED"
+echo "是否Resize输入: $IS_RESIZE, H_size: $H_SIZE, W_size: $W_SIZE"
 echo "梯度累计步数: $ACCUM_STEPS"
 echo "学习率: $LEARNING_RATE"
 echo "WeightDecay: $WEIGHT_DECAY"
@@ -324,6 +335,8 @@ ARGS=(
   --GeoFNO_s1 "$GEOFNO_S1"
   --GeoFNO_s2 "$GEOFNO_S2"
   --k "$K"
+  --H_size "$H_SIZE"
+  --W_size "$W_SIZE"
   --hidden_channels "$HIDDEN_CHANNELS"
   --learning_rate "$LEARNING_RATE"
   --resume_path "$RESUME_PATH"
@@ -377,11 +390,13 @@ elif [[ "$GEOFNO_IS_MESH" == "0" ]]; then
 fi
 
 # 可选开关类参数
+[[ "$USE_AMP" -eq 1 ]]   && ARGS+=( --use_amp )
 [[ "$USE_WANDB" -eq 1 ]]   && ARGS+=( --use_wandb )
 [[ "$USE_MOE" -eq 1 ]]     && ARGS+=( --use_moe )
 [[ "$IS_SPECIFIC" -eq 1 ]] && ARGS+=( --is_specific )
 [[ "$IS_CLASSIER" -eq 1 ]] && ARGS+=( --is_classier )
 [[ "$PROFILE_TIMING" -eq 1 ]] && ARGS+=( --profile_timing )
+[[ "$IS_RESIZE" -eq 1 ]]  && ARGS+=( --is_resize )
 
 # 可选路径参数（非空才追加）
 [[ -n "$USE_EXPERTS_PATH" ]] && ARGS+=( --use_experts_path "$USE_EXPERTS_PATH" )

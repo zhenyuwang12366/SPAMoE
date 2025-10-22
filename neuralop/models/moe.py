@@ -192,7 +192,114 @@ class ContinuousCRF(nn.Module):
         # 确保 source 和 target 区域 shape 相同
         shifted[:, :, tgt_x1:tgt_x2, tgt_y1:tgt_y2] = x[:, :, src_x1:src_x2, src_y1:src_y2]
         return shifted
+    
+class ConvBNAct(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, s=1, p=1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, k, s, p, bias=False)
+        self.bn   = nn.BatchNorm2d(out_ch)
+        self.act  = nn.LeakyReLU(0.2, inplace=True)
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
 
+class ResidualBlock(nn.Module):
+    def __init__(self, ch, expansion=2):
+        super().__init__()
+        mid = ch * expansion // 2
+        self.f = nn.Sequential(
+            ConvBNAct(ch, mid, k=1, s=1, p=0),
+            ConvBNAct(mid, mid, k=3, s=1, p=1),
+            nn.Conv2d(mid, ch, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(ch),
+        )
+        self.act = nn.LeakyReLU(0.2, inplace=True)
+    def forward(self, x):
+        return self.act(self.f(x) + x)
+
+class AdaptiveDownsample(nn.Module):
+    """
+    根据输入形状自适应选择 stride：
+    - 长条形(高>>宽)：优先 (2,1)
+    - 长条形(宽>>高)：优先 (1,2)
+    - 否则：(2,2)
+    """
+    def __init__(self, ch_in, ch_out):
+        super().__init__()
+        # 这里 stride 在 forward 里动态决定；卷积核/通道提前定义
+        self.conv_21 = ConvBNAct(ch_in, ch_out, k=3, s=(2,1), p=1)
+        self.conv_12 = ConvBNAct(ch_in, ch_out, k=3, s=(1,2), p=1)
+        self.conv_22 = ConvBNAct(ch_in, ch_out, k=3, s=(2,2), p=1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        aspect = H / max(W, 1)
+        if aspect > 1.5:                    # 高明显更长：优先压 H 维
+            return self.conv_21(x)
+        if aspect < 1 / 1.5:                # 宽明显更长：优先压 W 维
+            return self.conv_12(x)
+        else:
+            return self.conv_22(x)
+
+class TimeSpaceProjectorFlexible(nn.Module):
+    """
+    输入:  B x 1 x H x W  (H,W ∈ {1000×350, 350×350, 256×256, 1000/int × 350/int, ...})
+    输出:  B x 1 x 70 x 70
+    """
+    def __init__(self, base_ch=32, bottleneck_depth=3, min_side_target=96):
+        super().__init__()
+        self.min_side_target = min_side_target  # 下采样的“安全带”
+        # Stem
+        self.stem = nn.Sequential(
+            ConvBNAct(1, base_ch,   k=3, s=1, p=1),
+            ConvBNAct(base_ch, base_ch, k=3, s=1, p=1),
+        )
+        # 预备几级可复用的自适应下采样（共享结构、顺序堆叠）
+        down_channels = [
+            (base_ch, base_ch * 2),      # 32 -> 64
+            (base_ch * 2, base_ch * 4),  # 64 -> 128
+            (base_ch * 4, base_ch * 4),  # 128(保持)
+            (base_ch * 4, base_ch * 4),  # 128(保持)
+            (base_ch * 4, base_ch * 4),  # 额外冗余一层，兼容更大输入
+        ]
+        self.down_stages = nn.ModuleList(
+            AdaptiveDownsample(cin, cout) for cin, cout in down_channels
+        )
+        self.min_required_down_stages = 2  # 至少叠两层，确保达到 base_ch*4 通道
+
+        # bottleneck 残差堆叠
+        ch = base_ch*4
+        blocks = []
+        for _ in range(bottleneck_depth):
+            blocks.append(ResidualBlock(ch, expansion=2))
+        self.bottleneck = nn.Sequential(*blocks)
+
+        # 轻量上增强+投影
+        self.head = nn.Sequential(
+            ConvBNAct(ch, ch//2, k=3, s=1, p=1),   # 64
+            ConvBNAct(ch//2, ch//4, k=3, s=1, p=1),# 32
+            nn.Conv2d(ch//4, 1, kernel_size=3, stride=1, padding=1, bias=True)
+        )
+        # 最终 70x70 对齐
+        self.out_pool = nn.AdaptiveAvgPool2d((70, 70))
+
+    def forward(self, x):
+        x = self.stem(x)
+        # 自适应下采样，直到最短边 ≤ 96 或者用完下采样模块
+        H, W = x.shape[-2:]
+        need_force_down = min(H, W) > self.min_side_target
+        for idx, d in enumerate(self.down_stages):
+            if min(H, W) <= self.min_side_target and not need_force_down:
+                break
+            x = d(x)
+            H, W = x.shape[-2:]
+            if need_force_down and idx + 1 >= self.min_required_down_stages:
+                need_force_down = False
+
+        x = self.bottleneck(x)
+        x = self.head(x)
+        x = self.out_pool(x)  # 保证 Bx1x70x70
+        return x
+    
 class MOEOperator(BaseModel, name='MOE'):
     """
     多专家混合神经算子 (Mixture of Experts Neural Operator)
@@ -252,7 +359,7 @@ class MOEOperator(BaseModel, name='MOE'):
         self.top_k = top_k
         
         if v_type_num is None:
-            self.v_type_num = 5 if self.config.get('is_specific', True) else 3
+            self.v_type_num = 10 if self.config.get('is_specific', True) else 3
         else:
             self.v_type_num = v_type_num
             
@@ -269,36 +376,12 @@ class MOEOperator(BaseModel, name='MOE'):
         self.noisy_gating = noisy_gating
         self.fusion_type = fusion_type
         self.router_type = router_type
+        self._type_weight_warned = False
 
         # 确保 top_k 不超过专家数量
         self.top_k = min(self.top_k, self.num_experts)
         # 得出弱专家组专家数
         self.w_k = max(0, self.num_experts - top_k)
-        
-        # -------- 分类器骨干（ImageNet 预训练 ResNet50，B*1*H*W）--------
-        if self.config.get('is_classier', False):
-            self.classier = resnet50(weights=ResNet50_Weights.DEFAULT)
-            old_conv = self.classier.conv1
-            new_conv = nn.Conv2d(
-                1,
-                old_conv.out_channels,
-                old_conv.kernel_size,
-                old_conv.stride,
-                old_conv.padding,
-                bias=False
-            )
-            with torch.no_grad():
-                w = old_conv.weight.mean(dim=1, keepdim=True)
-                new_conv.weight.copy_(w)
-            self.classier.conv1 = new_conv
-
-            in_features = self.classier.fc.in_features
-            
-            self.fc = nn.Linear(in_features, self.v_type_num)
-            
-            self.classier.fc = nn.Identity()
-        else:
-            pass
 
         # -------- 路由器 --------
         if self.num_experts > 1:
@@ -344,11 +427,11 @@ class MOEOperator(BaseModel, name='MOE'):
             module = None
             if self.config.get(cfg_key, None) == 'linear':
                 k = self.top_k if t == 's_processor' else self.w_k
-                module = LinearMix(k, self.out_channels)
+                module = LinearMix(k, self.in_channels)
             elif self.config.get(cfg_key, None) == 'attention':
                 k = self.top_k if t == 's_processor' else self.w_k
                 module = AttentionMix(
-                    input_resolution=256, patch_size=16, in_channels=1,
+                    input_resolution=256, patch_size=16, in_channels=self.in_channels,out_channels=self.in_channels,
                     width=512, layers=6, heads=8, num_experts=k,
                     use_cls_expert=False,
                 )
@@ -360,10 +443,10 @@ class MOEOperator(BaseModel, name='MOE'):
         
         # -------- 融合层 --------
         if fusion_type == 'linear':
-            self.fusion = LinearMix(self.top_k, self.out_channels)
+            self.fusion = LinearMix(self.top_k, self.in_channels)
         elif fusion_type == 'attention':
             self.fusion = AttentionMix(
-                input_resolution=256, patch_size=16, in_channels=1,
+                input_resolution=256, patch_size=16, in_channels=self.in_channels, out_channels=self.in_channels,
                 width=512, layers=6, heads=8, num_experts=self.top_k,
                 use_cls_expert=False,
             )
@@ -372,49 +455,23 @@ class MOEOperator(BaseModel, name='MOE'):
             self.w_act = GroupActMerge(processor=self.w_processor)
             self.sw_act = SWActMerge(beta=self.config.get('beta', 0.5))
         elif fusion_type == 'basic':
-            self.fusion = SumMix(self.out_channels)
+            self.fusion = SumMix(self.in_channels)
         else:
             raise ValueError(f"未支持的融合类型: {fusion_type}")
 
+        self.proj = nn.Conv2d(in_channels, 1, 1)
         # -------- 时域→空域投影（B,1,T,R -> B,1,70,70）--------
         # 如用 AMP，调试阶段可把 inplace=False 更稳
-        self.time_to_space_projection = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, stride=(2, 1), padding=1),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(32, 64, kernel_size=3, stride=(2, 1), padding=1),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(64, 128, kernel_size=3, stride=(2, 1), padding=1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(128, 128, kernel_size=4, stride=(1, 1), padding=0),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(128, 64, kernel_size=3, stride=(1, 1), padding=1),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(64, 32, kernel_size=3, stride=(1, 1), padding=1),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(32, 16, kernel_size=5, stride=1, padding=0),
-            nn.BatchNorm2d(16),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(16, 1, kernel_size=3, stride=(1, 1), padding=1),
-            nn.Upsample(size=(70, 70), mode='bilinear', align_corners=True)
-        )
+        # self.time_to_space_projection = TimeSpaceProjectorFlexible()
 
         # -------- CRF 与特征 Map --------
-        self.CCrf = ContinuousCRF()
-        self.feature_map = {}
-        self.time_to_space_projection[-2].register_forward_hook(self.hook_fn)
+        # self.CCrf = ContinuousCRF()
+        # self.feature_map = {}
+        # hook_target = getattr(self.time_to_space_projection, 'head', None)
+        # if isinstance(hook_target, nn.Sequential) and len(hook_target) >= 2:
+        #     self._feature_hook_handle = hook_target[-2].register_forward_hook(self.hook_fn)
+        # else:
+        #     self._feature_hook_handle = self.time_to_space_projection.register_forward_hook(self.hook_fn)
 
         self.is_logger = is_logger
 
@@ -474,7 +531,7 @@ class MOEOperator(BaseModel, name='MOE'):
                 module.apply(_init_basic)
 
         # 1) 输入到输出的主干映射
-        _apply_basic(self.time_to_space_projection)
+        # _apply_basic(self.time_to_space_projection)
 
         if getattr(self, 'CCrf', None) is not None:
             if hasattr(self.CCrf, 'apply'):
@@ -525,24 +582,30 @@ class MOEOperator(BaseModel, name='MOE'):
             _init_linear(self.fc)
 
     # --------------- Hook：为 CRF 准备特征图 ---------------
-    def hook_fn(self, module: nn.Module, input: Tuple[torch.Tensor], output: torch.Tensor):
-        features = input[0].detach()
-        features = F.interpolate(features, size=(70, 70), mode='bilinear', align_corners=True)
-        self.feature_map['feature'] = features
+    # def hook_fn(self, module: nn.Module, input: Tuple[torch.Tensor], output: torch.Tensor):
+    #     features = input[0].detach()
+    #     features = F.interpolate(features, size=(70, 70), mode='bilinear', align_corners=True)
+    #     self.feature_map['feature'] = features
 
     # --------------- 前向传播 ---------------
-    def forward(self, x, task_features=None, **kwargs) -> Tuple[torch.Tensor]:
+    def forward(self, x, class_weights, task_features=None, **kwargs) -> Tuple[torch.Tensor]:
         batch_size = x.shape[0]
         device = x.device
 
-        if self.config.get('is_classier', False):
-            feats = self.classier(x)
-            type_logits = self.fc(feats)  # B*v_type/B*v_type
-            type_weights = torch.softmax(type_logits, dim=-1)
+        expect_group_mode = (
+            class_weights is not None
+            and getattr(self, 'config', {}).get('is_classier', False)
+            and len(self.experts) >= self.v_type_num
+        )
+        if expect_group_mode:
+            type_weights = class_weights
         else:
             type_weights = None
+            if class_weights is not None and self.is_logger and not self._type_weight_warned:
+                print("[WARN] 忽略 encoder 提供的类型权重：当前配置未启用分组专家或专家数量不足。")
+                self._type_weight_warned = True
 
-        # x: [B,1,1000,350] -> 对 C H W 做均值
+        # x: [B,C,1000,350] -> 对 C H W 做均值
         x_flat = x.mean(dim=(2, 3)).view(batch_size, -1)  # [B, in_channels]
 
         # 路由
@@ -557,7 +620,7 @@ class MOEOperator(BaseModel, name='MOE'):
             w_weights = w_indices = None
             aux_loss = None
 
-        # list[b,1,256,256] len = k
+        # list[b,C,H,W] len = k
         s_outputs = self._process_activation_group(
             x=x,
             expert_indices=s_indices,
@@ -582,7 +645,7 @@ class MOEOperator(BaseModel, name='MOE'):
             )
 
         # 合并专家输出
-        s_combined = torch.stack(s_outputs, dim=1)  # (B, k, 1, h, w)
+        s_combined = torch.stack(s_outputs, dim=1)  # (B, k, C, h, w)
         if self.fusion_type == 'swa':
             w_combined = torch.stack(w_outputs, dim=1)
 
@@ -594,21 +657,17 @@ class MOEOperator(BaseModel, name='MOE'):
         else:
             combined_output = self.fusion(s_combined)
             
-        # b,1,h,w 调整输出尺寸到 (B,1,70,70)
-        if self.out_channels == 1 and combined_output.shape[2] != 70:
-            combined_output = self.time_to_space_projection(combined_output)
-        else:
-            if 'feature' not in self.feature_map:
-                self.feature_map['feature'] = F.interpolate(
-                    combined_output.detach(),
-                    size=(70, 70),
-                    mode='bilinear',
-                    align_corners=True
-                )
+        # b,C,h,w 调整输出尺寸到 (B,1,70,70)
+        if combined_output.shape[2] != 70:
+            # combined_output = self.time_to_space_projection(combined_output)
+            bc_size = combined_output.shape[:2]
+            combined_output = F.interpolate(combined_output, size=(70, 70), mode='bilinear', align_corners=False)
+        
+        combined_output = self.proj(combined_output)
 
         # CRF
-        last_output: torch.Tensor = self.CCrf(combined_output, self.feature_map['feature'])
-        return last_output, aux_loss
+        # last_output: torch.Tensor = self.CCrf(combined_output, self.feature_map['feature'])
+        return combined_output, aux_loss
     
     def _process_activation_group(
         self,
@@ -618,7 +677,7 @@ class MOEOperator(BaseModel, name='MOE'):
         k: int,                         # 选择的 top-k（传入值）
         batch_size: int,
         device,
-        type_weights: Optional[torch.Tensor] = None,  # [B, T] —— 速度图类型权重(T=5或3)，None 表示不使用分组结构
+        type_weights: Optional[torch.Tensor] = None,  # [B, T] —— 速度图类型权重，T=v_type_num，None 表示不使用分组结构
         **kwargs,
     ) -> List[torch.Tensor]:
         """
@@ -639,18 +698,64 @@ class MOEOperator(BaseModel, name='MOE'):
         - 自动统一空间分辨率到最常见的目标形状（避免不同专家输出形状不一致）
         - 所有异常（专家抛错/None、插值失败、cat失败）都有零张量兜底
         """
-        
-        top_k = k  # 统一命名
-        C = self.out_channels
-        T = self.v_type_num
+        top_k = int(k)
+        if top_k <= 0:
+            return []
 
-        # ==========（可选）统一输入尺寸给专家；默认关闭以保留原始 T×R 语义 ==========
-        if self.config.get('resize_input_for_experts', False):
-            try:
-                x = F.interpolate(x, size=(256, 256), mode='bilinear', align_corners=True)
-            except Exception as e:
+        if expert_indices is None:
+            raise ValueError("expert_indices 为空，无法获取路由结果。")
+        if expert_indices.size(1) < top_k:
+            raise ValueError(f"expert_indices 的列数不足以支持 top_k={top_k}")
+
+        if routing_weights is None:
+            routing_weights = torch.ones(batch_size, top_k, device=device, dtype=x.dtype)
+        elif routing_weights.size(1) < top_k:
+            raise ValueError(f"routing_weights 的列数不足以支持 top_k={top_k}")
+        else:
+            routing_weights = routing_weights.to(device=device, dtype=x.dtype)
+
+        C = self.out_channels
+        total_experts = len(self.experts)
+        types_per_group = self.v_type_num
+        grouped_mode = type_weights is not None
+
+        if grouped_mode:
+            if type_weights.dim() == 1:
+                type_weights = type_weights.view(1, -1).expand(batch_size, -1)
+            if type_weights.size(0) != batch_size:
+                raise ValueError(
+                    f"type_weights batch 维度与输入不一致：{type_weights.size(0)} vs {batch_size}"
+                )
+            if type_weights.size(1) != types_per_group:
                 if self.is_logger:
-                    print(f"[WARN] 输入插值到(256,256)失败：{e}，保持原始形状 {tuple(x.shape)}")
+                    print(
+                        f"[WARN] type_weights 列数 {type_weights.size(1)} 与 v_type_num "
+                        f"{types_per_group} 不一致，降级为直接专家模式。"
+                    )
+                grouped_mode = False
+                type_weights = None
+
+        if grouped_mode:
+            expected_total = self.num_experts * types_per_group
+            experts_per_group = total_experts // max(1, self.num_experts)
+            if (
+                expected_total == 0
+                or total_experts < expected_total
+                or total_experts % types_per_group != 0
+                or experts_per_group != types_per_group
+            ):
+                if self.is_logger:
+                    print(
+                        f"[WARN] 专家数量 {total_experts} 与分组结构不匹配（期望 {expected_total}），"
+                        "降级为直接专家模式。"
+                    )
+                grouped_mode = False
+                type_weights = None
+            else:
+                type_weights = type_weights.to(device=device, dtype=x.dtype)
+            T = types_per_group
+        
+        T = types_per_group
 
         def _zeros_like_x(bsz: int, channels: int, like: torch.Tensor) -> torch.Tensor:
             return torch.zeros(bsz, channels, *like.shape[2:], device=like.device, dtype=like.dtype)
@@ -728,20 +833,32 @@ class MOEOperator(BaseModel, name='MOE'):
 
         if type_weights is not None:
             # ------------------------- 分组模式（组内 T 子模型按类型权重加权） -------------------------
-            T = self.v_type_num
+            T = types_per_group
+            experts_per_group = total_experts // max(1, self.num_experts)
 
             for k_idx in range(top_k):
                 group_ids: torch.Tensor = expert_indices[:, k_idx]   # [B]
                 group_wts: torch.Tensor = routing_weights[:, k_idx]  # [B]
+                group_wts = group_wts.to(device=device, dtype=x.dtype)
                 batch_outputs: List[torch.Tensor] = []
 
                 for b in range(batch_size):
                     g = int(group_ids[b].item())  # 组ID
+                    if g < 0 or g >= self.num_experts:
+                        if self.is_logger:
+                            print(f"[WARN] 路由得到的组索引 {g} 超出范围，使用零张量代替。")
+                        batch_outputs.append(_zeros_like_x(1, C, x[b:b+1]))
+                        continue
                     weighted_sum = None
                     # 组内 T 个子模型（速度图类型 0..T-1），全局索引：g*T + t
                     for t in range(T):
-                        expert_idx = g * T + t
-                        out_bt = _safe_call_expert(expert_idx, x[b:b+1])  # [1, C, h, w]
+                        expert_idx = g * experts_per_group + t
+                        if expert_idx >= total_experts:
+                            if self.is_logger:
+                                print(f"[WARN] 访问专家索引 {expert_idx} 越界，填充零张量。")
+                            out_bt = _zeros_like_x(1, C, x[b:b+1])
+                        else:
+                            out_bt = _safe_call_expert(expert_idx, x[b:b+1])  # [1, C, h, w]
 
                         # 日志：记录 (g,t) 的输出形状
                         if self.is_logger:
@@ -753,16 +870,18 @@ class MOEOperator(BaseModel, name='MOE'):
 
                         weighted_sum = out_bt if weighted_sum is None else (weighted_sum + out_bt)
 
+                    if weighted_sum is None:
+                        weighted_sum = _zeros_like_x(1, C, x[b:b+1])
                     # 该样本在组 g 内的加权和
                     batch_outputs.append(weighted_sum)
 
                 collected.append((batch_outputs, group_wts))
-
         else:
             # ------------------------- 直接专家模式（无分组） -------------------------
             for k_idx in range(top_k):
                 indices: torch.Tensor = expert_indices[:, k_idx]   # [B]
                 weights: torch.Tensor = routing_weights[:, k_idx]  # [B]
+                weights = weights.to(device=device, dtype=x.dtype)
                 batch_outputs: List[torch.Tensor] = []
 
                 for b in range(batch_size):
@@ -821,14 +940,14 @@ class MOEOperator(BaseModel, name='MOE'):
             return [torch.zeros(batch_size, C, *target_shape, device=device, dtype=x.dtype) for _ in range(top_k)]
 
         if self.is_logger and len(shape_log) > 0:
-            # 打印若干条样例形状以辅助调试（避免刷屏）
+            # 打印若干条样例形状以辅助调试
             print("[DEBUG] 专家/组内子模型输出形状样例（最多每类展示3条）：")
             shown = 0
             for key, shapes in shape_log.items():
                 print(f"  {key}: {shapes[:3]}{' ...' if len(shapes) > 3 else ''}")
                 shown += 1
                 if shown >= 20:  # 控制日志长度
-                    print("  ...（更多省略）")
+                    print("  ... ")
                     break
 
         return outputs
@@ -924,4 +1043,5 @@ class MOEOperator(BaseModel, name='MOE'):
             
             expert.load_state_dict(torch.load(expert_path))
         
-        print(f"成功加载 {self.num_experts} 个专家模型") 
+        print(f"成功加载 {self.num_experts} 个专家模型")
+        

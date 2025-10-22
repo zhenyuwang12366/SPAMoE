@@ -3,10 +3,15 @@ import os
 import argparse
 import wandb
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config.seismic_moe_config import SeismicMOEConfig
+from config.seismic_moe_config import SeismicMOEConfig, SPECIFIC_TYPE_VARIANTS
 import neuralop.mpu.comm as comm
 from neuralop.training import setup
 from neuralop.utils import get_wandb_api_key, count_model_params
+
+_SPECIFIC_ALLOWED_FAMILIES = (
+    set(SPECIFIC_TYPE_VARIANTS.keys()) |
+    {variant for variants in SPECIFIC_TYPE_VARIANTS.values() for variant in variants}
+)
 
 
 def _build_runtime_context(
@@ -264,8 +269,16 @@ def get_seismic_config(args: argparse.Namespace):
                 config.v_type_num = len(mapped_types)
 
     # 判断is_specific与选择family是否匹配
-    if config.is_specific and config.family not in ['curve_vel', 'flat_vel', 'curve_fault', 'flat_fault', 'style_style']:
-        raise ValueError(f"{config.family} 与 {config.is_specific} 不匹配")
+    if config.is_specific and config.family not in _SPECIFIC_ALLOWED_FAMILIES:
+        raise ValueError(
+            f"{config.family} 与细分类配置不匹配，可选细分类包括: {sorted(_SPECIFIC_ALLOWED_FAMILIES)}"
+        )
+    
+    if args.is_resize:
+        config.is_resize = args.is_resize
+
+        config.H_size = args.H_size
+        config.W_size = args.W_size
     
     #-------------- 设置完毕 -----------#
     runtime_ctx = _build_runtime_context(

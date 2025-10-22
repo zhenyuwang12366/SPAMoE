@@ -1,4 +1,10 @@
 import argparse
+from config.seismic_moe_config import SPECIFIC_TYPE_VARIANTS
+
+_SPECIFIC_BASE_FAMILIES = set(SPECIFIC_TYPE_VARIANTS.keys())
+_SPECIFIC_VARIANT_FAMILIES = {variant for variants in SPECIFIC_TYPE_VARIANTS.values() for variant in variants}
+_FAMILY_CHOICES = ['vel', 'style', 'fault', 'all']
+_FAMILY_CHOICES.extend(sorted(_SPECIFIC_BASE_FAMILIES | _SPECIFIC_VARIANT_FAMILIES))
 
 def build_argparser_and_parse(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="地震数据MOE训练和推理")
@@ -7,8 +13,8 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='运行模式: 训练或推理')
     parser.add_argument('--data_dir', type=str, default=None,
                         help='数据目录路径')
-    parser.add_argument('--family', type=str, default=None, choices=['vel', 'style', 'fault', 'all', 'curve_vel', 'flat_vel', 'curve_fault', 'flat_fault', 'style_style'],
-                        help='数据集系列: vel, style, fault 或 all')
+    parser.add_argument('--family', type=str, default=None, choices=_FAMILY_CHOICES,
+                        help='数据集系列，可选通用 (vel/style/fault/all) 或细分类别 (如 curve_vel_a)')
     parser.add_argument('--batch_size', type=int, default=None,
                         help='批次大小')
     parser.add_argument('--epochs', type=int, default=None,
@@ -163,6 +169,10 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='学习率（默认值由配置文件决定，可通过此参数覆盖）')
     parser.add_argument('--resume_path', type=str, default=None,
                         help='恢复训练的checkpoint路径，如 best_model_xxx.pt')
+    
+    parser.add_argument('--is_resize', action='store_true')
+    parser.add_argument('--H_size', type=int, default=256)
+    parser.add_argument('--W_size', type=int, default=256)
     
     # Loss related
     parser.add_argument('-g1v', '--lambda_g1v', type=float, default=1.0)

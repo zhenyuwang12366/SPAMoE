@@ -1,10 +1,19 @@
-from typing import Dict,Iterable,Any,List,Optional
+from typing import Dict, Iterable, Any, List, Optional
 import torch
-from collections import OrderedDict,defaultdict
+from collections import OrderedDict, defaultdict
 import torch.nn as nn
 from neuralop.models import ExpertFactory
 import re
 import os
+from pathlib import Path
+
+from config.seismic_moe_config import SPECIFIC_TYPE_VARIANTS
+
+_SPECIFIC_VARIANT_TO_BASE = {
+    variant: base
+    for base, variants in SPECIFIC_TYPE_VARIANTS.items()
+    for variant in variants
+}
 
 def _strip_prefixes(key: str, prefixes: Iterable[str]) -> str:
     for p in prefixes:
@@ -179,12 +188,48 @@ def load_factory(
             
     return experts # [FNO0, FNO1, FNO2, FNO3, FNO4, WNO0,...., MNO4,..., LNO4]
 
-_SPECIFIC_PAT = re.compile(
-    r'best_expert_(?P<name>\w+)_(?P<i>\d+)_(?P<shape>\w+)_(?P<label>\w+)\.pt$'
+_SPECIFIC_BASE_DEFAULT_VARIANT = {
+    base: variants[0] for base, variants in SPECIFIC_TYPE_VARIANTS.items()
+}
+_EXPERT_FILE_PATTERN = re.compile(
+    r'^best_expert_(?P<name>.+)_(?P<i>\d+)_(?P<label>.+)\.pt$'
 )
-_NORMAL_PAT = re.compile(
-    r'best_expert_(?P<name>\w+)_(?P<i>\d+)_(?P<label>\w+)\.pt$'
-)
+
+
+def _resolve_specific_label(raw_label: str, id_map: Dict[str, int]) -> Optional[str]:
+    """
+    将 checkpoint 文件名中的标签映射到 `type_dict['specific']` 的键。
+    支持以下格式：
+      - 精确的细分类名（curve_vel_a）
+      - 基础类别名（curve_vel），默认映射到 variants[0]
+      - 旧格式组合（curve_vel 等），或前缀组合（curve_vel_xx）
+    """
+    if raw_label in id_map:
+        return raw_label
+
+    if raw_label in SPECIFIC_TYPE_VARIANTS:
+        for variant in SPECIFIC_TYPE_VARIANTS[raw_label]:
+            if variant in id_map:
+                return variant
+
+    if raw_label in _SPECIFIC_VARIANT_TO_BASE:
+        # 原始标签可能是已知的细分类，但 type_dict 尚未覆盖；尝试返回同名或基础默认
+        if raw_label in id_map:
+            return raw_label
+        base = _SPECIFIC_VARIANT_TO_BASE[raw_label]
+        for variant in SPECIFIC_TYPE_VARIANTS.get(base, ()):
+            if variant in id_map:
+                return variant
+
+    tokens = raw_label.split('_')
+    if len(tokens) >= 2:
+        base_candidate = '_'.join(tokens[:2])
+        if base_candidate in SPECIFIC_TYPE_VARIANTS:
+            for variant in SPECIFIC_TYPE_VARIANTS[base_candidate]:
+                if variant in id_map:
+                    return variant
+
+    return None
 def load_moe_experts(
     experts_config: List[Any],
     in_channels: int,
@@ -200,7 +245,7 @@ def load_moe_experts(
     Args:
         model_path (str): 专家保存的文件路径,
             保存的文件名：不细化版本: best_expert_{experts_name}_{i}_{vel/fault/style}.pt\
-                        细化版本: best_expert_{experts_name}_{i}_{curve/flat/style}_{vel/fault/style}.pt
+                        细化版本: best_expert_{experts_name}_{i}_{curve_vel_a}.pt（或 curve_fault_b / flat_vel_a 等）
             
             按math分成FNO, WNO, MNO, LNO四类，每类有多种速度图类型, 直接读取, 每类以\
             
@@ -213,36 +258,33 @@ def load_moe_experts(
         raise ValueError(f"{model_path}不是有效路径")
     
     # 只取 .pt
-    experts_file = [f for f in os.listdir(model_path) if f.endswith('.pt')]
+    experts_file = sorted(f for f in os.listdir(model_path) if f.endswith('.pt'))
     
     # 组装: expert_id -> List[{v_type_id: sd}]
     grouped: Dict[str, List[Dict[int, Any]]] = defaultdict(list) #Dict[str(type), list]
     
-    if(is_specific):
+    if is_specific:
         id_map = type_dict.get('specific', {})
-        # 获取所有.pt文件, best_expert_{experts_name}_{i}_{curve/flat/style}_{vel/fault/style}.pt
+        if not id_map:
+            raise ValueError("type_dict['specific'] 为空，无法映射细分类别。")
         for f in experts_file:
-            m = _SPECIFIC_PAT.match(f)
+            stem = Path(f).stem
+            m = _EXPERT_FILE_PATTERN.match(stem)
             if not m:
-                # 兼容 split 解析
-                parts = f.split('_')
-                if len(parts) >= 6 and parts[0] == 'best' and parts[1] == 'expert':
-                    expert_id = parts[3]
-                    shape = parts[4]
-                    label = parts[5].split('.')[0]
-                else:
-                    print(f"[WARN] 文件名不匹配 specific 模式, 跳过: {f}")
-                    continue
-            else:
-                expert_id = m.group('i')
-                shape = m.group('shape')
-                label = m.group('label')
-            
-            key = f"{shape}_{label}"
-            if key not in id_map:
-                print(f"[WARN] specific 类型映射缺失 {key}, 跳过: {f}")
+                print(f"[WARN] 文件名不匹配细化专家模式, 跳过: {f}")
                 continue
-            v_type = id_map[key]
+            expert_id = m.group('i')
+            raw_label = m.group('label')
+
+            mapped_label = _resolve_specific_label(raw_label, id_map)
+
+            if mapped_label is None:
+                print(f"[WARN] specific 类型映射缺失 {raw_label}, 跳过: {f}")
+                continue
+            if mapped_label != raw_label and raw_label not in id_map:
+                print(f"[INFO] 将细化标签 {raw_label} 映射为 {mapped_label}（使用默认匹配）。")
+
+            v_type = id_map[mapped_label]
             
             ckpt = torch.load(
                 os.path.join(model_path, f),
@@ -258,20 +300,16 @@ def load_moe_experts(
             grouped[expert_id].append({v_type: expert_sd})            
     else:
         id_map = type_dict.get('normal', {})
+        if not id_map:
+            raise ValueError("type_dict['normal'] 为空，无法映射普通类别。")
         for f in experts_file:
-            m = _NORMAL_PAT.match(f)
+            stem = Path(f).stem
+            m = _EXPERT_FILE_PATTERN.match(stem)
             if not m:
-                # 兼容 split 解析（宽松）
-                parts = f.split('_')
-                if len(parts) >= 5 and parts[0] == 'best' and parts[1] == 'expert':
-                    expert_id = parts[3]
-                    label = parts[4].split('.')[0]
-                else:
-                    print(f"[WARN] 文件名不匹配 normal 模式，跳过：{f}")
-                    continue
-            else:
-                expert_id = m.group('i')
-                label = m.group('label')
+                print(f"[WARN] 文件名不匹配普通专家模式，跳过：{f}")
+                continue
+            expert_id = m.group('i')
+            label = m.group('label')
 
             if label not in id_map:
                 print(f"[WARN] normal 类型映射缺失 {label}，跳过：{f}")
