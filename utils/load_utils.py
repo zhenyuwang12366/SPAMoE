@@ -1,4 +1,4 @@
-from typing import Dict, Iterable, Any, List, Optional
+from typing import Dict, Iterable, Any, List, Optional, Tuple, Union
 import torch
 from collections import OrderedDict, defaultdict
 import torch.nn as nn
@@ -20,6 +20,94 @@ def _strip_prefixes(key: str, prefixes: Iterable[str]) -> str:
         if key.startswith(p):
             return key[len(p):]
     return key
+
+
+def _extract_encoder_state_dict(
+    source: Any,
+    *,
+    strip_prefixes: Iterable[str] = ("module.",),
+) -> Dict[str, torch.Tensor]:
+    """
+    从任意形式的 checkpoint 中解析 encoder 的 state_dict。
+    支持多种常见存储格式：
+      - 直接是 state_dict
+      - {'encoder_state_dict': state_dict}
+      - {'state_dict': state_dict}
+    并自动剥离 DDP 保存时的 ``module.`` 等前缀。
+    """
+
+    if source is None:
+        raise ValueError("encoder checkpoint 为空，无法加载。")
+
+    if not isinstance(source, dict):
+        raise TypeError(f"无法解析类型为 {type(source)} 的 encoder checkpoint。期望字典或 state_dict。")
+
+    if "encoder_state_dict" in source:
+        state_dict = source["encoder_state_dict"]
+    elif "state_dict" in source:
+        state_dict = source["state_dict"]
+    else:
+        state_dict = source
+
+    if not isinstance(state_dict, dict):
+        raise ValueError("encoder checkpoint 中缺少有效的 state_dict。")
+
+    cleaned: Dict[str, torch.Tensor] = {}
+    for key, tensor in state_dict.items():
+        if not isinstance(key, str):
+            continue
+        new_key = _strip_prefixes(key, strip_prefixes)
+        cleaned[new_key] = tensor
+
+    if not cleaned:
+        raise ValueError("encoder state_dict 解析为空，请检查保存格式。")
+
+    return cleaned
+
+
+def load_encoder_weights(
+    encoder: nn.Module,
+    checkpoint: Optional[Union[str, Dict[str, Any]]],
+    *,
+    map_location: Union[str, torch.device] = "cpu",
+    strict: bool = False,
+    strip_prefixes: Iterable[str] = ("module.",),
+) -> Tuple[List[str], List[str]]:
+    """
+    将 encoder checkpoint 加载到给定模型中。
+
+    Parameters
+    ----------
+    encoder : nn.Module
+        待加载权重的编码器实例。
+    checkpoint : str | dict | None
+        编码器权重来源。可以是文件路径、包含 state_dict 的字典，或 ``None``（此时直接返回）。
+    map_location : 设备映射
+        当 checkpoint 为路径时，用于 torch.load 的 map_location。
+    strict : bool
+        是否严格匹配 state_dict。
+    strip_prefixes : Iterable[str]
+        需要剥离的前缀（用于 DDP 保存时带有 ``module.`` 的情况）。
+
+    Returns
+    -------
+    (missing_keys, unexpected_keys) : Tuple[List[str], List[str]]
+        ``load_state_dict`` 返回的缺失和多余键列表。
+    """
+
+    if checkpoint is None:
+        return [], []
+
+    if isinstance(checkpoint, str):
+        if not os.path.exists(checkpoint):
+            raise FileNotFoundError(f"Encoder checkpoint 不存在: {checkpoint}")
+        loaded = torch.load(checkpoint, map_location=map_location)
+    else:
+        loaded = checkpoint
+
+    state_dict = _extract_encoder_state_dict(loaded, strip_prefixes=strip_prefixes)
+    missing, unexpected = encoder.load_state_dict(state_dict, strict=strict)
+    return list(missing), list(unexpected)
 
 def get_expert_dict(
     ckpt: Dict[str, Any],
@@ -327,7 +415,7 @@ def load_moe_experts(
                 continue
 
             expert_sd = get_expert_dict(ckpt)
-            grouped[expert_id].append({v_type: expert_sd}) # [FNO(3), WNO(3), MNO(3), LNO(3)]
+            grouped[expert_id].append({v_type: expert_sd}) # [FNO(10), WNO(10), MNO(10), LNO(10)]
     
     # 对 expert_id 做数字序排序, 保证顺序稳定  
     try:

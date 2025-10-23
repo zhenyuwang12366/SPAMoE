@@ -3,12 +3,15 @@ import glob
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from typing import Dict, List, Tuple, Union, Optional
+from typing import Dict, List, Tuple, Optional
 import re
 from pathlib import Path
 import torch.nn.functional as F
 from config.seismic_moe_config import SeismicMOEConfig, SPECIFIC_TYPE_VARIANTS
 
+# ---------------------------
+# SPECIFIC 家族映射（保留你的逻辑）
+# ---------------------------
 _SPECIFIC_VARIANT_TO_BASE = {
     variant: base
     for base, variants in SPECIFIC_TYPE_VARIANTS.items()
@@ -18,22 +21,38 @@ _SPECIFIC_BASE_FAMILIES = set(SPECIFIC_TYPE_VARIANTS.keys())
 _SPECIFIC_VARIANT_FAMILIES = set(_SPECIFIC_VARIANT_TO_BASE.keys())
 _ALLOWED_SPECIFIC_FAMILIES = _SPECIFIC_BASE_FAMILIES | _SPECIFIC_VARIANT_FAMILIES
 
+# ---------------------------
+# 目录名规范化 / 提取
+# ---------------------------
+def _to_snake_lower(name: str) -> str:
+    """
+    目录名规范化为小写蛇形：
+      CurveVel_B -> curve_vel_b
+      FlatFault_a -> flat_fault_a
+    """
+    name = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', name)
+    name = name.replace('-', '_').replace('__', '_')
+    return name.lower()
+
+def _infer_type_dir_name_from_input_file(p: str) -> str:
+    """
+    从输入文件路径推断类型目录名：
+      vel/style: .../<TypeDir>/data/dataXX.npy -> <TypeDir>
+      fault:     .../<TypeDir>/seis_...npy    -> <TypeDir>
+    """
+    path = Path(p)
+    parent = path.parent.name
+    if parent in ("data", "model"):
+        return path.parent.parent.name
+    return path.parent.name
+
+
 class SeismicDataset(Dataset):
     """
     用于地震数据的数据集类
-    
-    处理OpenFWI数据集中的地震波形数据和对应的速度图
-    
-    Parameters
-    ----------
-    data_dir : str
-        数据目录路径
-    family : str
-        数据集系列，可选 'vel', 'style', 'fault' 或 'all'
-    is_specific : bool
-        是否细化分类, 细化后: 'curve_vel_a/b', 'flat_vel_a/b', 'curve_fault_a/b', 'flat_fault_a/b', 'style_style_a/b'
-    split : str
-        数据集分割，可选 'train' 或 'test'
+    - 读取 OpenFWI 风格数据（vel/style: data/model；fault: seis/vel 配对）
+    - 由目录名推断标签（严格只允许 *_a / *_b 结尾），通过 config.type_id_specific 映射为 id
+    - __getitem__ 返回 input/output 以及 v_type/type_name
     """
     def __init__(
         self,
@@ -41,17 +60,29 @@ class SeismicDataset(Dataset):
         family: str = 'all',
         is_specific: bool = False,
         split: str = 'train',
+        concat_channels: bool = False,
+        config: Optional[SeismicMOEConfig] = None,   # ★ 新增：用于取 type_id_specific
+        processor: Optional[object] = None,          # ★ 新增：数据处理器（可为 None）
     ):
         self.data_dir = data_dir
         self.family = family.lower()
         self.split = split
-        self.index_map = [] #[(file_idx, sample_idx)]
-        self.input_tensors = []
-        self.output_tensors = []
+        self.index_map: List[Tuple[int, int]] = []
+        self.input_tensors: List[torch.Tensor] = []
+        self.output_tensors: List[torch.Tensor] = []
         self.is_specific = is_specific
+        self.concat_channels = bool(concat_channels)
         self._specific_target_family: Optional[str] = None
-        
-        # 验证参数
+
+        # 新增：保存 config / processor / 标签容器
+        if config is None:
+            raise ValueError("SeismicDataset 需要传入 config（用于 type_id_specific 小写映射）")
+        self.config: SeismicMOEConfig = config
+        self.processor = processor
+        self.labels: List[int] = []
+        self.type_names: List[str] = []
+
+        # 验证参数（保留你的原逻辑）
         if not is_specific:
             if self.family not in ['vel', 'style', 'fault', 'all']:
                 raise ValueError(f"不支持的数据集系列: {self.family}")
@@ -64,39 +95,86 @@ class SeismicDataset(Dataset):
 
         if self.split not in ['train', 'test']:
             raise ValueError(f"不支持的数据集分割: {self.split}")
-        # 加载数据
+
+        # 加载文件路径
         self._load_data()
-        
-        # 扫描所有文件，记录每个样本的索引
+
+        # 建立 (file_idx, sample_idx) 索引
         for file_idx, file in enumerate(self.input_files):
             data = np.load(file, mmap_mode='r')  # lazy load
             num_samples = data.shape[0]
             for sample_idx in range(num_samples):
                 self.index_map.append((file_idx, sample_idx))
-                
-        # 加载到内存
+
+        # 预加载到内存（同步标签）
         self._preload_into_memory()
-            
-        # 计算归一化统计量
+
+        # 统计量
         self._compute_stats()
-    
+
     def _preload_into_memory(self):
-        for i in range(len(self.input_files)):
+        # 小写键的映射字典
+        type_id_map: Dict[str, int] = getattr(self.config, "type_id_specific", None)
+        if not isinstance(type_id_map, dict) or not type_id_map:
+            raise ValueError("config.type_id_specific 必须是非空字典（键全小写）。")
+
+        for i, input_path in enumerate(self.input_files):
             try:
-                input_array = np.load(self.input_files[i], allow_pickle=True)
+                input_array = np.load(input_path, allow_pickle=True)
+                output_array = None
                 if self.output_files[i] is not None:
                     output_array = np.load(self.output_files[i], allow_pickle=True)
-                for j in range(input_array.shape[0]):
-                    input_data = np.concatenate([input_array[j][k] for k in range(5)], axis=1)
-                    input_tensor = torch.from_numpy(input_data.astype(np.float32)).unsqueeze(0)  # 1×1000×350
+
+                # —— 目录名 → 规范化 → 校验 a/b 结尾 → 映射 id —— #
+                type_dir_raw = _infer_type_dir_name_from_input_file(input_path)   # e.g., FlatFault_a
+                type_key = _to_snake_lower(type_dir_raw)                          # e.g., flat_fault_a
+
+                if not (type_key.endswith('_a') or type_key.endswith('_b')):
+                    raise ValueError(
+                        f"目录名 '{type_dir_raw}' 规范化为 '{type_key}'，但未以 '_a' 或 '_b' 结尾。"
+                        "仅允许 a/b 后缀（不允许数字）。"
+                    )
+                if type_key not in type_id_map:
+                    raise KeyError(
+                        f"目录名 '{type_dir_raw}' → '{type_key}' 不在 config.type_id_specific 中。"
+                        f"（示例键：{list(type_id_map.keys())[:6]} ... 共 {len(type_id_map)} 项）"
+                    )
+                label_id = int(type_id_map[type_key])
+
+                num_samples = input_array.shape[0]
+                for j in range(num_samples):
+                    sample_np = input_array[j]
+
+                    # (H,W) 或 (C,H,W) 或 对象数组(通道列表)
+                    if isinstance(sample_np, np.ndarray) and sample_np.dtype != object:
+                        input_np = sample_np.astype(np.float32, copy=False)
+                        if input_np.ndim == 2:
+                            input_np = np.expand_dims(input_np, axis=0)
+                    else:
+                        channels = [np.asarray(ch, dtype=np.float32) for ch in sample_np]
+                        input_np = np.stack(channels, axis=0)
+
+                    if self.concat_channels and input_np.ndim == 3 and input_np.shape[0] > 1:
+                        merged_np = np.concatenate([input_np[c] for c in range(input_np.shape[0])], axis=-1)
+                        input_np = merged_np[np.newaxis, ...]
+
+                    input_tensor = torch.from_numpy(np.ascontiguousarray(input_np))
                     self.input_tensors.append(input_tensor)
 
-                    if self.output_files[i] is not None:  # b*h*w
-                        output_tensor = torch.from_numpy(output_array[j].astype(np.float32))  # 1×70×70
+                    if output_array is not None:
+                        output_np = np.asarray(output_array[j], dtype=np.float32)
+                        if output_np.ndim == 2:
+                            output_np = np.expand_dims(output_np, axis=0)
+                        output_tensor = torch.from_numpy(np.ascontiguousarray(output_np))
                         self.output_tensors.append(output_tensor)
+
+                    # 与样本对齐的标签/类别名
+                    self.labels.append(label_id)
+                    self.type_names.append(type_key)
+
             except Exception as e:
                 print(f"读取第{i}个文件失败: {e}")
-                
+
     def _load_data(self):
         """
         加载数据文件路径  
@@ -104,7 +182,7 @@ class SeismicDataset(Dataset):
         self.input_files = []
         self.output_files = []
 
-        def want_family(group: str, variant: str | None) -> bool:
+        def want_family(group: str, variant: Optional[str]) -> bool:
             """根据 family / is_specific 判定是否保留该目录"""
             target_family = self._specific_target_family or self.family
             if not getattr(self, 'is_specific', False):
@@ -150,7 +228,7 @@ class SeismicDataset(Dataset):
                     continue
 
                 if group == 'fault':
-                    # Fault：同目录下 seis_?{n}_1_{i}.npy ↔ vel_{n}_1_{i}.npy
+                    # Fault：seis_?{n}_1_{i}.npy ↔ vel_{n}_1_{i}.npy
                     pattern = re.compile(r"seis_?(\d+)_1_(\d+)\.npy")
                     seis_files = sorted(glob.glob(os.path.join(sub_path, 'seis*.npy')))
                     for seis_file in seis_files:
@@ -213,14 +291,16 @@ class SeismicDataset(Dataset):
     def _compute_stats(self):
         """从已加载的内存数据中计算归一化统计量"""
         n_total = int(len(self.input_tensors))
-        n_samples = int(min(n_total * 0.03, 300))  # 3%最多不超过300个
+        if n_total == 0:
+            return
+        n_samples = int(min(max(1, n_total * 0.03), 300))  # 3%最多不超过300个
         sample_indices = np.random.choice(n_total, n_samples, replace=False)
 
         # 计算输入的统计量
         input_values = []
         for idx in sample_indices:
             try:
-                input_tensor = self.input_tensors[idx]  # shape: [1, 1000, 350]
+                input_tensor = self.input_tensors[idx]  # shape: [C, H, W]
                 flat = input_tensor.view(-1)  # 展平为 1D
                 sample_points = flat[torch.randperm(flat.numel())[:min(1000, flat.numel())]]
                 input_values.append(sample_points)
@@ -232,16 +312,14 @@ class SeismicDataset(Dataset):
             self.input_min = float(torch.min(input_all))
             self.input_max = float(torch.max(input_all))
             self.input_mean = float(torch.mean(input_all))
-            self.input_std = float(torch.std(input_all))
-            if self.input_std == 0:
-                self.input_std = 1.0
+            self.input_std = float(torch.std(input_all)) or 1.0
 
         # 计算输出的统计量（仅 train 阶段）
         if self.split == 'train' and hasattr(self, 'output_tensors') and self.output_tensors:
             output_values = []
             for idx in sample_indices:
                 try:
-                    output_tensor = self.output_tensors[idx]  # shape: [1, 70, 70]
+                    output_tensor = self.output_tensors[idx]  # shape: [C_out, H_out, W_out]
                     flat = output_tensor.view(-1)
                     sample_points = flat[torch.randperm(flat.numel())[:min(1000, flat.numel())]]
                     output_values.append(sample_points)
@@ -253,117 +331,87 @@ class SeismicDataset(Dataset):
                 self.output_min = float(torch.min(output_all))
                 self.output_max = float(torch.max(output_all))
                 self.output_mean = float(torch.mean(output_all))
-                self.output_std = float(torch.std(output_all))
-                if self.output_std == 0:
-                    self.output_std = 1.0
+                self.output_std = float(torch.std(output_all)) or 1.0
             
     def getStats(self):
         return {
-            'input_max' : self.input_max,
-            'input_min' : self.input_min,
-            'input_mean' : self.input_mean,
-            'input_std' : self.input_std,
-            'output_max' : self.output_max,
-            'output_min' : self.output_min,
-            'output_mean' : self.output_mean,
-            'output_std' : self.output_std
+            'input_max' : getattr(self, 'input_max', None),
+            'input_min' : getattr(self, 'input_min', None),
+            'input_mean' : getattr(self, 'input_mean', None),
+            'input_std' : getattr(self, 'input_std', None),
+            'output_max' : getattr(self, 'output_max', None),
+            'output_min' : getattr(self, 'output_min', None),
+            'output_mean' : getattr(self, 'output_mean', None),
+            'output_std' : getattr(self, 'output_std', None),
         }
         
     def __len__(self):
         return len(self.input_tensors)
          
     def __getitem__(self, idx):
-        # 加载输入数据
         try:
             file_idx, _  = self.index_map[idx]
-        
-            # 获取输入文件名（对测试集预测有用）
             input_filename = os.path.basename(self.input_files[file_idx])
             
-            # 处理训练集和测试集
-            if self.split == 'train': # 训练集和验证集
-                # 返回配对的输入和输出
+            if self.split == 'train':  # 训练/验证
                 sample = {
                     'input': self.input_tensors[idx].clone(),
                     'output': self.output_tensors[idx].clone(),
+                    'v_type': torch.tensor(self.labels[idx], dtype=torch.long),  # ★ 新增：标签
+                    'type_name': self.type_names[idx],                            # ★ 新增：类别名（小写蛇形）
                     'input_file': input_filename
                 }
-            else:  # 测试集
-                # 只返回输入数据
+            else:  # 测试
                 sample = {
                     'input': self.input_tensors[idx].clone(),
-                    'input_file': input_filename.split('.')[0]  # 去除扩展名
+                    'v_type': torch.tensor(self.labels[idx], dtype=torch.long),
+                    'type_name': self.type_names[idx],
+                    'input_file': input_filename.split('.')[0]
                 }
+
+            # ★ 可选：processor 在这里生效（若你要 resize/规范化等）
+            if self.processor is not None:
+                sample = self.processor(sample)
             return sample
             
         except Exception as e:
             print(f"加载样本 {idx} 失败: {e}")
-            # 返回一个空样本，或者重新尝试另一个索引
             if idx + 1 < len(self):
                 return self.__getitem__(idx + 1)
             else:
                 return self.__getitem__(0)
     
     def get_input_size(self):
-        """获取输入数据的形状"""
-        # 加载第一个输入文件，获取形状
-        try:
-            data = self.input_tensors
-            if data.shape[0] > 1:
-                return data[0].shape
-            else:
-                return data.shape
-        except Exception as e:
-            print(f"获取输入大小失败: {e}")
+        if len(self.input_tensors) == 0:
             return None
+        return tuple(self.input_tensors[0].shape)
     
     def get_output_size(self):
-        """获取输出数据的形状"""
-        if self.split == 'test':
+        if self.split == 'test' or len(self.output_tensors) == 0:
             return None
-        
-        try:
-            data = self.output_tensors
-            if data.shape[0] > 1:
-                return data[0].shape
-            else:
-                return data.shape
-        except Exception as e:
-            print(f"获取输出大小失败: {e}")
-            return None
+        return tuple(self.output_tensors[0].shape)
+
 
 class SeismicDataProcessor:
     """
-    地震数据处理器
-    
-    用于预处理地震数据，包括维度转换、通道调整等
-    
-    Parameters
-    ----------
-    channel_dim : int, optional
-        通道维度，默认为1
-    input_transform : callable, optional
-        额外的输入转换函数，默认为None
-    output_transform : callable, optional
-        额外的输出转换函数，默认为None
+    地震数据处理器：可做通道重排、可选 resize/pad、外部 transform
     """
     def __init__(
         self,
         channel_dim: int = 0,
-        input_transform : callable = None,
-        output_transform : callable = None,
+        input_transform : Optional[callable] = None,
+        output_transform : Optional[callable] = None,
         config: SeismicMOEConfig = None,
     ):
         assert config is not None, "please input config in data_processor"
         self.config = config
         self.channel_dim = channel_dim
-        # input_transform可以使用transforms中写好的类
         self.input_transform = input_transform
         self.output_transform = output_transform
 
     def _flexible_resize(
         self,
-        x:torch.Tensor,
+        x: torch.Tensor,
         keep: bool = False,
         size: Optional[Tuple[int, int]] = None,
         mode: str = "bilinear",
@@ -374,132 +422,74 @@ class SeismicDataProcessor:
     ) -> torch.Tensor:
         """
         可选自动pad + resize 的统一函数
-        - 若 keep=True: 尺寸保持不变
-        - 若 size 给定: resize 到指定大小
-        - 若 auto_pad=True: 自动对 H/W 不相等的输入反射填充为正方形
-        
-        参数:
-        x: (B, C, H, W)
-        keep: 是否保持原尺寸
-        size: 目标尺寸 (H_out, W_out)
-        mode: 插值模式 ('bilinear'/'nearest'/'area'/...)
-        align_corners: 对齐角点（线性族插值建议 False）
-        antialias: 是否抗锯齿
-        auto_pad: 是否自动pad成正方形
-        pad_mode: pad 模式 ('reflect'/'replicate'/'constant' 等)
+        输入 x: (C, H, W)  -> 内部临时变成 (1,C,H,W)
         """
         x = x.unsqueeze(0)
         if keep:
-            x = x.squeeze(0)
-            return x
+            return x.squeeze(0)
         _, C, H, W = x.shape
         if auto_pad and H != W:
-            # 目标正方形边长
             M = max(H, W)
-            # 计算各方向 pad
             pad_h = M - H
             pad_w = M - W
             pad_top = pad_h // 2
             pad_bottom = pad_h - pad_top
             pad_left = pad_w // 2
             pad_right = pad_w - pad_left
-            # pad 参数按 (left, right, top, bottom)
             pad = (pad_left, pad_right, pad_top, pad_bottom)
             x = F.pad(x, pad, mode=pad_mode)
 
         if size is None:
-            raise ValueError("Must specify `size` when keep=False")
+            return x.squeeze(0)
 
         if x.shape[-2:] == tuple(size):
-            x = x.squeeze(0)
-            return x
+            return x.squeeze(0)
 
         _align = align_corners if mode in {"linear", "bilinear", "bicubic", "trilinear"} else None
         x = F.interpolate(x, size=size, mode=mode, align_corners=_align, antialias=antialias)
-        x = x.squeeze(0)
-        return x
+        return x.squeeze(0)
     
-    def __call__(self, sample):
-        """
-        处理地震数据或速度图
+    def __call__(self, sample: Dict):
+        # 输入
+        if 'input' in sample and sample['input'] is not None:
+            x = sample['input']  # (C,H,W)
+            if x.ndim == 2:
+                x = x.unsqueeze(0)
 
-        Args:
-            sample : dict 包含input和output, input为torch.Tensor 形状为(1, 1000, 350) output为torch.Tensor 形状为(1, 70, 70)
-
-        Returns:
-            sample : 预处理后的dict 包含input和output, input为torch.Tensor 形状为(1, 1000, 350) output为torch.Tensor 形状为(1, 70, 70)
-        """
-        # 获取输入和输出
-        if 'input' in sample:
+            # 通道重排（如需要）
+            if self.channel_dim == 1:
+                # (C,H,W) -> 这里保持不动（如需可自行扩展）
+                pass
+            elif self.channel_dim == -1:
+                pass
             
-            x = sample['input']
-            # 输入数据现在是地震数据或数据文件
-            # 地震数据维度调整
-            # 输入数据形状为 (num_sources, time_steps, num_receivers)
-            
-            # 将震源维度作为通道维度
-            if self.channel_dim == 0:
-                # 调整为 (num_sources, time_steps, num_receivers)，第0维作为通道维
-                pass  # 默认已经是这个形状
-            else:
-                # 移动通道维度到指定位置
-                if self.channel_dim == 1: # 第一维作为通道维
-                    # (num_sources, time_steps, num_receivers) -> (time_steps, num_receivers, num_sources)
-                    x = torch.permute(x, (1, 2, 0))
-                elif self.channel_dim == -1: # 最后一维作为通道维
-                    # (num_sources, time_steps, num_receivers) -> (num_receivers, num_sources, time_steps)
-                    x = torch.permute(x, (2, 0, 1))
-            
-            # 应用额外的转换
-            # log
             if self.input_transform:
                 x = self.input_transform(x)
-                
+
+            # 可选 resize
+            resize_enabled = bool(getattr(self.config, 'is_resize', 0))
+            target_h = getattr(self.config, 'H_size', None)
+            target_w = getattr(self.config, 'W_size', None)
+            if resize_enabled:
+                if target_h is None or target_w is None:
+                    target_size = tuple(x.shape[2:])
+                else:
+                    target_size = (int(target_h), int(target_w))
+                x = self._flexible_resize(
+                    x, keep=False, size=target_size,
+                    mode="bilinear", align_corners=True,
+                    antialias=True, auto_pad=True, pad_mode="reflect",
+                )
             sample['input'] = x
 
-        # 处理输出
+        # 输出
         if 'output' in sample and sample['output'] is not None:
             y = sample['output']
-            
-            # 输出数据现在是速度图或模型文件
-            # 如果输出是2D数据，添加通道维度
-            if len(y.shape) == 2:
-                # (height, width) -> (1, height, width)
+            if y.ndim == 2:
                 y = y.unsqueeze(0)
-            
-            # 应用额外的转换
             if self.output_transform:
                 y = self.output_transform(y)
-                
             sample['output'] = y
-        
-        # 变换数据大小
-        # ==========（可选）统一输入尺寸给专家；默认关闭以保留原始 T×R 语义 ==========
-        for key in ['input']:
-            if key in sample and sample[key] is not None:
-                x = sample[key]
-                resize_enabled = bool(self.config.is_resize)
-                target_h = self.config.H_size
-                target_w = self.config.W_size
-                if resize_enabled:
-                    if target_h is None or target_w is None:
-                        target_size = tuple(x.shape[2:])
-                    else:
-                        target_size = (int(target_h), int(target_w))
-                else:
-                    target_size = tuple(x.shape[2:])
-
-                x = self._flexible_resize(
-                    x,
-                    keep=not resize_enabled,
-                    size=target_size,
-                    mode="bilinear",
-                    align_corners=True,
-                    antialias=True,
-                    auto_pad=True,
-                    pad_mode="reflect",
-                )
-                sample[key] = x
         
         return sample
 
@@ -511,60 +501,38 @@ def create_seismic_dataloader(
     batch_size: int = 16,
     shuffle: bool = True,
     num_workers: int = 4,
-    normalize_inputs: bool = True,
-    normalize_outputs: bool = True,
+    normalize_inputs: bool = True,   # 未用到，保留兼容
+    normalize_outputs: bool = True,  # 未用到，保留兼容
     channel_dim: int = 1,
     input_transform = None,
-    output_transform = None
+    output_transform = None,
+    concat_channels: bool = False,
+    config: Optional[SeismicMOEConfig] = None,  # ★ 新增：必须传入
 ):
     """
     创建地震数据加载器
-    
-    Parameters
-    ----------
-    data_dir : str
-        数据目录路径
-    family : str, optional
-        数据集系列，可选 'vel', 'style', 'fault' 或 'all'，默认为'all'
-    split : str, optional
-        数据集分割，可选 'train' 或 'test'，默认为'train'
-    batch_size : int, optional
-        批次大小，默认为16
-    shuffle : bool, optional
-        是否打乱数据，默认为True
-    num_workers : int, optional
-        数据加载工作进程数，默认为4
-    normalize_inputs : bool, optional
-        是否归一化输入数据，默认为True
-    normalize_outputs : bool, optional
-        是否归一化输出数据，默认为True
-    channel_dim : int, optional
-        通道维度，默认为1
-    input_transform : callable, optional
-        额外的输入转换函数，默认为None
-    output_transform : callable, optional
-        额外的输出转换函数，默认为None
-    
-    Returns
-    -------
-    dataloader : DataLoader
-        PyTorch数据加载器
-    dataset : SeismicDataset
-        数据集实例，用于访问归一化参数等
+    - 会从 config.type_id_specific 读取小写映射字典（如 flat_fault_a -> 6）
     """
-    # 创建数据集
+    assert config is not None, "create_seismic_dataloader 需要 config（含 type_id_specific 小写字典）"
+    # 处理器
+    processor = SeismicDataProcessor(
+        channel_dim=channel_dim,
+        input_transform=input_transform,
+        output_transform=output_transform,
+        config=config,
+    )
+
+    # 数据集（带标签输出）
     dataset = SeismicDataset(
         data_dir=data_dir,
         family=family,
         split=split,
-        transform=SeismicDataProcessor(
-            channel_dim=channel_dim,
-            input_transform=input_transform,
-            output_transform=output_transform
-        )
+        concat_channels=concat_channels,
+        config=config,          # ★ 提供 config（用于标签映射）
+        processor=processor,    # ★ 使处理器在 __getitem__ 生效
     )
     
-    # 创建数据加载器
+    # DataLoader
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -573,4 +541,4 @@ def create_seismic_dataloader(
         pin_memory=True
     )
     
-    return dataloader, dataset 
+    return dataloader, dataset

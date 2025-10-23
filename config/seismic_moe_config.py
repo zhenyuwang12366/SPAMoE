@@ -2,8 +2,6 @@
 用于地震数据的MOE (Mixture of Experts) 神经算子模型配置
 """
 
-from copy import deepcopy
-
 from .default_config import Default
 from .distributed import DistributedConfig
 
@@ -17,20 +15,6 @@ SPECIFIC_TYPE_VARIANTS = {
 }
 
 
-def expand_specific_configs(type_id_map: dict[str, int], base_cfg_map: dict[str, dict]) -> dict[int, dict]:
-    """
-    将以粗粒度类别为键的配置，扩展到具体的细分类别（例如 curve_vel → curve_vel_a/curve_vel_b）。
-    """
-    expanded: dict[int, dict] = {}
-    for base_name, cfg in base_cfg_map.items():
-        variants = SPECIFIC_TYPE_VARIANTS.get(base_name, (base_name,))
-        for variant in variants:
-            if variant not in type_id_map:
-                raise KeyError(f"Unknown specific velocity type variant '{variant}' (base '{base_name}').")
-            expanded[type_id_map[variant]] = deepcopy(cfg)
-    return expanded
-
-
 class SeismicMOEConfig(Default):
     """地震数据MOE神经算子的配置"""
     
@@ -41,6 +25,11 @@ class SeismicMOEConfig(Default):
     is_resize = False
     H_size = 256
     W_size = 256
+    concat_channels = True
+    moe_mode = 'standard'    # standard: 直接专家模式, group: 分组模式, velocity_type: 速度图类型模式
+    use_gpu_proxy = False
+    train_encoder = False
+    use_encoder = True
     # v_type_id dict
     type_id_specific = {
         'curve_vel_a': 0,
@@ -63,304 +52,6 @@ class SeismicMOEConfig(Default):
         'specific': type_id_specific,
         'normal': type_id_normal,
     }
-    
-    load_expert_configs = [
-        # 傅里叶域专家 - 适合捕捉频率特征 FNO
-        expand_specific_configs(type_id_specific, {
-            'flat_vel': {
-                'type': 'domain',
-                'domain_type': 'fourier',
-                'n_dim': 2,
-                'n_modes_height': 16,
-                'n_modes_width': 16,
-                'lifting_channel_ratio': 2,
-                'projection_channel_ratio': 2,
-                'n_layers': 8,
-                'hc': 64,
-            },
-            'flat_fault': {
-                'type': 'domain',
-                'domain_type': 'fourier',
-                'n_dim': 2,
-                'n_modes_height': 16,
-                'n_modes_width': 16,
-                'lifting_channel_ratio': 2,
-                'projection_channel_ratio': 2,
-                'n_layers': 8,
-                'hc': 64,
-            },
-            'curve_vel': {
-                'type': 'domain',
-                'domain_type': 'fourier',
-                'n_dim': 2,
-                'n_modes_height': 64,
-                'n_modes_width': 64,
-                'lifting_channel_ratio': 2,
-                'projection_channel_ratio': 2,
-                'n_layers': 8,
-                'hc': 128,
-            },
-            'curve_fault': {
-                'type': 'domain',
-                'domain_type': 'fourier',
-                'n_dim': 2,
-                'n_modes_height': 16,
-                'n_modes_width': 16,
-                'lifting_channel_ratio': 2,
-                'projection_channel_ratio': 2,
-                'n_layers': 8,
-                'hc': 64,
-            },
-            'style_style': {
-                'type': 'domain',
-                'domain_type': 'fourier',
-                'n_dim': 2,
-                'n_modes_height': 16,
-                'n_modes_width': 16,
-                'lifting_channel_ratio': 2,
-                'projection_channel_ratio': 2,
-                'n_layers': 8,
-                'hc': 64,
-            },
-        }),
-        # 小波域专家 - 适合处理局部特征和多尺度结构 WNO
-        expand_specific_configs(type_id_specific, {
-            'flat_vel': {
-                'type': 'domain',
-                'domain_type': 'wavelet',
-                'n_dim': 2,
-                'n_levels_height': 2,
-                'n_levels_width': 2,
-                'wavelet_type': 'haar',
-                'ensure_even_shapes': True,
-                'pad_mode': 'reflect',
-                'adaptive_padding': True,
-                'hc': 64,
-            },
-            'flat_fault': {
-                'type': 'domain',
-                'domain_type': 'wavelet',
-                'n_dim': 2,
-                'n_levels_height': 2,
-                'n_levels_width': 2,
-                'wavelet_type': 'haar',
-                'ensure_even_shapes': True,
-                'pad_mode': 'reflect',
-                'adaptive_padding': True,
-                'hc': 64,
-            },
-            'curve_vel': {
-                'type': 'domain',
-                'domain_type': 'wavelet',
-                'n_dim': 2,
-                'n_levels_height': 2,
-                'n_levels_width': 2,
-                'wavelet_type': 'haar',
-                'ensure_even_shapes': True,
-                'pad_mode': 'reflect',
-                'adaptive_padding': True,
-                'hc': 64,
-            },
-            'curve_fault': {
-                'type': 'domain',
-                'domain_type': 'wavelet',
-                'n_dim': 2,
-                'n_levels_height': 2,
-                'n_levels_width': 2,
-                'wavelet_type': 'haar',
-                'ensure_even_shapes': True,
-                'pad_mode': 'reflect',
-                'adaptive_padding': True,
-                'hc': 64,
-            },
-            'style_style': {
-                'type': 'domain',
-                'domain_type': 'wavelet',
-                'n_dim': 2,
-                'n_levels_height': 2,
-                'n_levels_width': 2,
-                'wavelet_type': 'haar',
-                'ensure_even_shapes': True,
-                'pad_mode': 'reflect',
-                'adaptive_padding': True,
-                'hc': 64,
-            },
-        }),
-        # 原生多尺度神经算子专家 - 专门处理多尺度地质结构 MNO
-        expand_specific_configs(type_id_specific, {
-            'flat_vel': {
-                'type': 'scale',
-                'scale_expert_type': 'native',
-                'n_dim': 2,
-                'n_scales': 3,
-                'scale_factors': [1.0, 0.5, 0.25],
-                'fusion_mode': 'hierarchical',
-                'n_layers': 3,
-                'hc': 64,
-            },
-            'flat_fault': {
-                'type': 'scale',
-                'scale_expert_type': 'native',
-                'n_dim': 2,
-                'n_scales': 3,
-                'scale_factors': [1.0, 0.5, 0.25],
-                'fusion_mode': 'hierarchical',
-                'n_layers': 3,
-                'hc': 64,
-            },
-            'curve_vel': {
-                'type': 'scale',
-                'scale_expert_type': 'native',
-                'n_dim': 2,
-                'n_scales': 3,
-                'scale_factors': [1.0, 0.6, 0.3],
-                'fusion_mode': 'hierarchical',
-                'n_layers': 4,
-                'hc': 128,
-            },
-            'curve_fault': {
-                'type': 'scale',
-                'scale_expert_type': 'native',
-                'n_dim': 2,
-                'n_scales': 3,
-                'scale_factors': [1.0, 0.5, 0.25],
-                'fusion_mode': 'hierarchical',
-                'n_layers': 3,
-                'hc': 64,
-            },
-            'style_style': {
-                'type': 'scale',
-                'scale_expert_type': 'native',
-                'n_dim': 2,
-                'n_scales': 3,
-                'scale_factors': [1.0, 0.5, 0.25],
-                'fusion_mode': 'hierarchical',
-                'n_layers': 3,
-                'hc': 64,
-            },
-        }),
-        # 局部处理专家 - 用于局部细节重建 LNO
-        expand_specific_configs(type_id_specific, {
-            'flat_vel': {
-                'type': 'local',
-                'local_type': 'basic',
-                'n_dim': 2,
-                'n_modes': (16, 16),
-                'disco_layers': True,
-                'diff_layers': True,
-                'n_layers': 3,
-                'default_in_shape': (256, 256),
-                'hc': 64,
-            },
-            'flat_fault': {
-                'type': 'local',
-                'local_type': 'basic',
-                'n_dim': 2,
-                'n_modes': (16, 16),
-                'disco_layers': True,
-                'diff_layers': True,
-                'n_layers': 3,
-                'default_in_shape': (256, 256),
-                'hc': 64,
-            },
-            'curve_vel': {
-                'type': 'local',
-                'local_type': 'basic',
-                'n_dim': 2,
-                'n_modes': (16, 16),
-                'disco_layers': True,
-                'diff_layers': True,
-                'n_layers': 3,
-                'default_in_shape': (256, 256),
-                'hc': 64,
-            },
-            'curve_fault': {
-                'type': 'local',
-                'local_type': 'basic',
-                'n_dim': 2,
-                'n_modes': (16, 16),
-                'disco_layers': True,
-                'diff_layers': True,
-                'n_layers': 3,
-                'default_in_shape': (256, 256),
-                'hc': 64,
-            },
-            'style_style': {
-                'type': 'local',
-                'local_type': 'basic',
-                'n_dim': 2,
-                'n_modes': (16, 16),
-                'disco_layers': True,
-                'diff_layers': True,
-                'n_layers': 3,
-                'default_in_shape': (256, 256),
-                'hc': 64,
-            },
-        }),
-        # 几何感知专家 - GeoFNO，聚焦规则网格的几何变形
-        expand_specific_configs(type_id_specific, {
-            'flat_vel': {
-                'type': 'geometry',
-                'geometry_type': 'geofno',
-                'modes1': 24,
-                'modes2': 24,
-                'n_fourier_layers': 5,
-                'code_dim': 42,
-                's1': 256,
-                's2': 256,
-                'is_mesh': True,
-                'hc': 96,
-            },
-            'flat_fault': {
-                'type': 'geometry',
-                'geometry_type': 'geofno',
-                'modes1': 24,
-                'modes2': 24,
-                'n_fourier_layers': 5,
-                'code_dim': 42,
-                's1': 256,
-                's2': 256,
-                'is_mesh': True,
-                'hc': 96,
-            },
-            'curve_vel': {
-                'type': 'geometry',
-                'geometry_type': 'geofno',
-                'modes1': 48,
-                'modes2': 48,
-                'n_fourier_layers': 6,
-                'code_dim': 42,
-                's1': 256,
-                's2': 256,
-                'is_mesh': True,
-                'hc': 160,
-            },
-            'curve_fault': {
-                'type': 'geometry',
-                'geometry_type': 'geofno',
-                'modes1': 32,
-                'modes2': 32,
-                'n_fourier_layers': 5,
-                'code_dim': 42,
-                's1': 256,
-                's2': 256,
-                'is_mesh': True,
-                'hc': 128,
-            },
-            'style_style': {
-                'type': 'geometry',
-                'geometry_type': 'geofno',
-                'modes1': 24,
-                'modes2': 24,
-                'n_fourier_layers': 5,
-                'code_dim': 42,
-                's1': 256,
-                's2': 256,
-                'is_mesh': True,
-                'hc': 96,
-            },
-        }),
-    ]
 
     # 数据集配置
     dataset_name = 'seismic'
@@ -372,6 +63,7 @@ class SeismicMOEConfig(Default):
     
     # MOE配置
     use_moe = False
+    moe_mode = 'standard'  # 'standard' | 'velocity_type'
     use_experts_path = None
     top_k = 1  # 选择前k个专家
     noisy_gating = True  # 是否使用噪声门控
@@ -382,7 +74,7 @@ class SeismicMOEConfig(Default):
     w_processor_type = 'linear'
     beta = 0.5
     is_specific = False
-    is_classier = False
+    is_classifier = False
     v_type_num = 0
     
     # 专家配置
@@ -454,6 +146,7 @@ class SeismicMOEConfig(Default):
     milestones = [60,90,110]
     scheduler_gamma = 0.3
     output_dir = './results'
+    log_root = './runs'
     lr_warmup_epochs = 5
     lr_warmup_factor = 1.0 / 3
     lr_warmup_method = 'linear'
@@ -490,12 +183,11 @@ class SeismicMOEConfig(Default):
     
     # 损失函数配置
     loss_fn = 'mse and mae'  # 均方误差损失
-    lambda_g1v = 1.0
-    lambda_g2v = 1.0
-    lambda_ssim = 0.5
-    lambda_grad = 0.1
-    lambda_grad_l1 = 0.0
-    lambda_fourier_mag_l1 = 0.0
+    lambda_g1v = 0.6
+    lambda_g2v = 0.4
+    lambda_grad_l1 = 0.15
+    lambda_fourier_mag_l1 = 0.10
+    lambda_ce = 0.2
     
     # 评估指标配置
     metrics = ['mse', 'mae', 'psnr']
@@ -510,3 +202,457 @@ class SeismicMOEConfig(Default):
         'log_output': False,
         'sweep': False
     } 
+    load_expert_configs = [
+        {
+            # FNO
+            type_id_specific['flat_vel_a']: {
+                'type': 'domain',
+                'domain_type': 'fourier',
+                'n_dim': 2,
+                'n_modes_height': 16,
+                'n_modes_width': 16,
+                'lifting_channel_ratio': 2,
+                'projection_channel_ratio': 2,
+                'n_layers': 8,
+                'hc': 64,
+            },
+            type_id_specific['flat_vel_b']: {
+                'type': 'domain',
+                'domain_type': 'fourier',
+                'n_dim': 2,
+                'n_modes_height': 16,
+                'n_modes_width': 16,
+                'lifting_channel_ratio': 2,
+                'projection_channel_ratio': 2,
+                'n_layers': 8,
+                'hc': 64,
+            },
+            type_id_specific['flat_fault_a']: {
+                'type': 'domain',
+                'domain_type': 'fourier',
+                'n_dim': 2,
+                'n_modes_height': 16,
+                'n_modes_width': 16,
+                'lifting_channel_ratio': 2,
+                'projection_channel_ratio': 2,
+                'n_layers': 8,
+                'hc': 64,
+            },
+            type_id_specific['flat_fault_b']: {
+                'type': 'domain',
+                'domain_type': 'fourier',
+                'n_dim': 2,
+                'n_modes_height': 16,
+                'n_modes_width': 16,
+                'lifting_channel_ratio': 2,
+                'projection_channel_ratio': 2,
+                'n_layers': 8,
+                'hc': 64,
+            },
+            type_id_specific['curve_vel_a']: {
+                'type': 'domain',
+                'domain_type': 'fourier',
+                'n_dim': 2,
+                'n_modes_height': 64,
+                'n_modes_width': 64,
+                'lifting_channel_ratio': 2,
+                'projection_channel_ratio': 2,
+                'n_layers': 8,
+                'hc': 128,
+            },
+            type_id_specific['curve_vel_b']: {
+                'type': 'domain',
+                'domain_type': 'fourier',
+                'n_dim': 2,
+                'n_modes_height': 64,
+                'n_modes_width': 64,
+                'lifting_channel_ratio': 2,
+                'projection_channel_ratio': 2,
+                'n_layers': 8,
+                'hc': 128,
+            },
+            type_id_specific['curve_fault_a']: {
+                'type': 'domain',
+                'domain_type': 'fourier',
+                'n_dim': 2,
+                'n_modes_height': 16,
+                'n_modes_width': 16,
+                'lifting_channel_ratio': 2,
+                'projection_channel_ratio': 2,
+                'n_layers': 8,
+                'hc': 64,
+            },
+            type_id_specific['curve_fault_b']: {
+                'type': 'domain',
+                'domain_type': 'fourier',
+                'n_dim': 2,
+                'n_modes_height': 16,
+                'n_modes_width': 16,
+                'lifting_channel_ratio': 2,
+                'projection_channel_ratio': 2,
+                'n_layers': 8,
+                'hc': 64,
+            },
+            type_id_specific['style_style_a']: {
+                'type': 'domain',
+                'domain_type': 'fourier',
+                'n_dim': 2,
+                'n_modes_height': 16,
+                'n_modes_width': 16,
+                'lifting_channel_ratio': 2,
+                'projection_channel_ratio': 2,
+                'n_layers': 8,
+                'hc': 64,
+            },
+            type_id_specific['style_style_b']: {
+                'type': 'domain',
+                'domain_type': 'fourier',
+                'n_dim': 2,
+                'n_modes_height': 16,
+                'n_modes_width': 16,
+                'lifting_channel_ratio': 2,
+                'projection_channel_ratio': 2,
+                'n_layers': 8,
+                'hc': 64,
+            },
+        },
+        {
+            # WNO
+            type_id_specific['flat_vel_a']: {
+                'type': 'domain',
+                'domain_type': 'wavelet',
+                'n_dim': 2,
+                'n_levels_height': 2,
+                'n_levels_width': 2,
+                'wavelet_type': 'haar',
+                'ensure_even_shapes': True,
+                'pad_mode': 'reflect',
+                'adaptive_padding': True,
+                'hc': 64,
+            },
+            type_id_specific['flat_vel_b']: {
+                'type': 'domain',
+                'domain_type': 'wavelet',
+                'n_dim': 2,
+                'n_levels_height': 2,
+                'n_levels_width': 2,
+                'wavelet_type': 'haar',
+                'ensure_even_shapes': True,
+                'pad_mode': 'reflect',
+                'adaptive_padding': True,
+                'hc': 64,
+            },
+            type_id_specific['flat_fault_a']: {
+                'type': 'domain',
+                'domain_type': 'wavelet',
+                'n_dim': 2,
+                'n_levels_height': 2,
+                'n_levels_width': 2,
+                'wavelet_type': 'haar',
+                'ensure_even_shapes': True,
+                'pad_mode': 'reflect',
+                'adaptive_padding': True,
+                'hc': 64,
+            },
+            type_id_specific['flat_fault_b']: {
+                'type': 'domain',
+                'domain_type': 'wavelet',
+                'n_dim': 2,
+                'n_levels_height': 2,
+                'n_levels_width': 2,
+                'wavelet_type': 'haar',
+                'ensure_even_shapes': True,
+                'pad_mode': 'reflect',
+                'adaptive_padding': True,
+                'hc': 64,
+            },
+            type_id_specific['curve_vel_a']: {
+                'type': 'domain',
+                'domain_type': 'wavelet',
+                'n_dim': 2,
+                'n_levels_height': 2,
+                'n_levels_width': 2,
+                'wavelet_type': 'haar',
+                'ensure_even_shapes': True,
+                'pad_mode': 'reflect',
+                'adaptive_padding': True,
+                'hc': 64,
+            },
+            type_id_specific['curve_vel_b']: {
+                'type': 'domain',
+                'domain_type': 'wavelet',
+                'n_dim': 2,
+                'n_levels_height': 2,
+                'n_levels_width': 2,
+                'wavelet_type': 'haar',
+                'ensure_even_shapes': True,
+                'pad_mode': 'reflect',
+                'adaptive_padding': True,
+                'hc': 64,
+            },
+            type_id_specific['curve_fault_a']: {
+                'type': 'domain',
+                'domain_type': 'wavelet',
+                'n_dim': 2,
+                'n_levels_height': 2,
+                'n_levels_width': 2,
+                'wavelet_type': 'haar',
+                'ensure_even_shapes': True,
+                'pad_mode': 'reflect',
+                'adaptive_padding': True,
+                'hc': 64,
+            },
+            type_id_specific['curve_fault_b']: {
+                'type': 'domain',
+                'domain_type': 'wavelet',
+                'n_dim': 2,
+                'n_levels_height': 2,
+                'n_levels_width': 2,
+                'wavelet_type': 'haar',
+                'ensure_even_shapes': True,
+                'pad_mode': 'reflect',
+                'adaptive_padding': True,
+                'hc': 64,
+            },
+            type_id_specific['style_style_a']: {
+                'type': 'domain',
+                'domain_type': 'wavelet',
+                'n_dim': 2,
+                'n_levels_height': 2,
+                'n_levels_width': 2,
+                'wavelet_type': 'haar',
+                'ensure_even_shapes': True,
+                'pad_mode': 'reflect',
+                'adaptive_padding': True,
+                'hc': 64,
+            },
+            type_id_specific['style_style_b']: {
+                'type': 'domain',
+                'domain_type': 'wavelet',
+                'n_dim': 2,
+                'n_levels_height': 2,
+                'n_levels_width': 2,
+                'wavelet_type': 'haar',
+                'ensure_even_shapes': True,
+                'pad_mode': 'reflect',
+                'adaptive_padding': True,
+                'hc': 64,
+            },
+        },
+        {
+            # MNO
+            type_id_specific['flat_vel_a']: {
+                'type': 'scale',
+                'scale_expert_type': 'native',
+                'n_dim': 2,
+                'n_scales': 3,
+                'scale_factors': [1.0, 0.5, 0.25],
+                'fusion_mode': 'hierarchical',
+                'n_layers': 3,
+                'hc': 64,
+            },
+            type_id_specific['flat_vel_b']: {
+                'type': 'scale',
+                'scale_expert_type': 'native',
+                'n_dim': 2,
+                'n_scales': 3,
+                'scale_factors': [1.0, 0.5, 0.25],
+                'fusion_mode': 'hierarchical',
+                'n_layers': 3,
+                'hc': 64,
+            },
+            type_id_specific['flat_fault_a']: {
+                'type': 'scale',
+                'scale_expert_type': 'native',
+                'n_dim': 2,
+                'n_scales': 3,
+                'scale_factors': [1.0, 0.5, 0.25],
+                'fusion_mode': 'hierarchical',
+                'n_layers': 3,
+                'hc': 64,
+            },
+            type_id_specific['flat_fault_b']: {
+                'type': 'scale',
+                'scale_expert_type': 'native',
+                'n_dim': 2,
+                'n_scales': 3,
+                'scale_factors': [1.0, 0.5, 0.25],
+                'fusion_mode': 'hierarchical',
+                'n_layers': 3,
+                'hc': 64,
+            },
+            type_id_specific['curve_vel_a']: {
+                'type': 'scale',
+                'scale_expert_type': 'native',
+                'n_dim': 2,
+                'n_scales': 3,
+                'scale_factors': [1.0, 0.6, 0.3],
+                'fusion_mode': 'hierarchical',
+                'n_layers': 4,
+                'hc': 128,
+            },
+            type_id_specific['curve_vel_b']: {
+                'type': 'scale',
+                'scale_expert_type': 'native',
+                'n_dim': 2,
+                'n_scales': 3,
+                'scale_factors': [1.0, 0.6, 0.3],
+                'fusion_mode': 'hierarchical',
+                'n_layers': 4,
+                'hc': 128,
+            },
+            type_id_specific['curve_fault_a']: {
+                'type': 'scale',
+                'scale_expert_type': 'native',
+                'n_dim': 2,
+                'n_scales': 3,
+                'scale_factors': [1.0, 0.5, 0.25],
+                'fusion_mode': 'hierarchical',
+                'n_layers': 3,
+                'hc': 64,
+            },
+            type_id_specific['curve_fault_b']: {
+                'type': 'scale',
+                'scale_expert_type': 'native',
+                'n_dim': 2,
+                'n_scales': 3,
+                'scale_factors': [1.0, 0.5, 0.25],
+                'fusion_mode': 'hierarchical',
+                'n_layers': 3,
+                'hc': 64,
+            },
+            type_id_specific['style_style_a']: {
+                'type': 'scale',
+                'scale_expert_type': 'native',
+                'n_dim': 2,
+                'n_scales': 3,
+                'scale_factors': [1.0, 0.5, 0.25],
+                'fusion_mode': 'hierarchical',
+                'n_layers': 3,
+                'hc': 64,
+            },
+            type_id_specific['style_style_b']: {
+                'type': 'scale',
+                'scale_expert_type': 'native',
+                'n_dim': 2,
+                'n_scales': 3,
+                'scale_factors': [1.0, 0.5, 0.25],
+                'fusion_mode': 'hierarchical',
+                'n_layers': 3,
+                'hc': 64,
+            },
+        },
+        {
+            # LNO
+            type_id_specific['flat_vel_a']: {
+                'type': 'local',
+                'local_type': 'basic',
+                'n_dim': 2,
+                'n_modes': (16, 16),
+                'disco_layers': True,
+                'diff_layers': True,
+                'n_layers': 3,
+                'default_in_shape': (256, 256),
+                'hc': 64,
+            },
+            type_id_specific['flat_vel_b']: {
+                'type': 'local',
+                'local_type': 'basic',
+                'n_dim': 2,
+                'n_modes': (16, 16),
+                'disco_layers': True,
+                'diff_layers': True,
+                'n_layers': 3,
+                'default_in_shape': (256, 256),
+                'hc': 64,
+            },
+            type_id_specific['flat_fault_a']: {
+                'type': 'local',
+                'local_type': 'basic',
+                'n_dim': 2,
+                'n_modes': (16, 16),
+                'disco_layers': True,
+                'diff_layers': True,
+                'n_layers': 3,
+                'default_in_shape': (256, 256),
+                'hc': 64,
+            },
+            type_id_specific['flat_fault_b']: {
+                'type': 'local',
+                'local_type': 'basic',
+                'n_dim': 2,
+                'n_modes': (16, 16),
+                'disco_layers': True,
+                'diff_layers': True,
+                'n_layers': 3,
+                'default_in_shape': (256, 256),
+                'hc': 64,
+            },
+            type_id_specific['curve_vel_a']: {
+                'type': 'local',
+                'local_type': 'basic',
+                'n_dim': 2,
+                'n_modes': (16, 16),
+                'disco_layers': True,
+                'diff_layers': True,
+                'n_layers': 3,
+                'default_in_shape': (256, 256),
+                'hc': 64,
+            },
+            type_id_specific['curve_vel_b']: {
+                'type': 'local',
+                'local_type': 'basic',
+                'n_dim': 2,
+                'n_modes': (16, 16),
+                'disco_layers': True,
+                'diff_layers': True,
+                'n_layers': 3,
+                'default_in_shape': (256, 256),
+                'hc': 64,
+            },
+            type_id_specific['curve_fault_a']: {
+                'type': 'local',
+                'local_type': 'basic',
+                'n_dim': 2,
+                'n_modes': (16, 16),
+                'disco_layers': True,
+                'diff_layers': True,
+                'n_layers': 3,
+                'default_in_shape': (256, 256),
+                'hc': 64,
+            },
+            type_id_specific['curve_fault_b']: {
+                'type': 'local',
+                'local_type': 'basic',
+                'n_dim': 2,
+                'n_modes': (16, 16),
+                'disco_layers': True,
+                'diff_layers': True,
+                'n_layers': 3,
+                'default_in_shape': (256, 256),
+                'hc': 64,
+            },
+            type_id_specific['style_style_a']: {
+                'type': 'local',
+                'local_type': 'basic',
+                'n_dim': 2,
+                'n_modes': (16, 16),
+                'disco_layers': True,
+                'diff_layers': True,
+                'n_layers': 3,
+                'default_in_shape': (256, 256),
+                'hc': 64,
+            },
+            type_id_specific['style_style_b']: {
+                'type': 'local',
+                'local_type': 'basic',
+                'n_dim': 2,
+                'n_modes': (16, 16),
+                'disco_layers': True,
+                'diff_layers': True,
+                'n_layers': 3,
+                'default_in_shape': (256, 256),
+                'hc': 64,
+            },
+        },
+    ]

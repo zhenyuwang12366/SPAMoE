@@ -40,7 +40,7 @@ bash scripts/run_distributed_seismic_moe.sh \
   --w_processor_type linear \
   --beta 0.5 \
   --is_specific \
-  --is_classier \
+  --is_classifier \
   --v_type_num 1 \
   --learning_rate 1e-4
 

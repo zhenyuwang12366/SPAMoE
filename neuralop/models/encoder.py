@@ -355,12 +355,12 @@ class Encoder_Dino(nn.Module):
 
         # 5) 全局表征 → 类型权重
         type_weight = self.type_act(self.type_head(global_repr))  # [B, num_types]
-
+        
         return latent_map, type_weight, global_repr
 
 def get_encoder(in_channels: int = 1, out_channels: int | None = None, num_types: int = 3) -> Encoder_Dino:
     """
-    供你的训练脚本调用的工厂方法
+    供训练脚本调用的工厂方法
     """
     if out_channels is None:
         out_channels = 64

@@ -5,6 +5,114 @@ import pandas as pd
 import torch
 import os
 import time
+from pathlib import Path
+from typing import Optional, Dict, Union, Any
+
+def save_type_predictions_txt(
+    logits: Optional[torch.Tensor],
+    batch: Dict[str, Any],
+    save_dir: Union[str, Path],
+    epoch: int,
+    config=None,                # 直接传 config（含 type_id_specific）
+    filename: str = "type_predictions.txt",
+    append: bool = True,
+    is_logger: bool = False,
+) -> Path:
+    """
+    将预测类型（未softmax的原始logits）与真实类型标签保存到本地txt文件。
+
+    Args:
+        logits: Tensor[B, num_types] 或 None。未softmax的原始logits。
+        batch:  DataLoader 的一个 batch，支持字段：
+                - 'label': Tensor[B] 或 list[int]
+                - 'input_file': list[str]（可选）
+        save_dir: 当前 epoch 的输出目录，例如 results_dir / f"vis_epoch_{epoch+1}"
+        epoch: 当前 epoch 编号
+        config: 包含 `type_id_specific` (str→int) 字典的配置对象
+        filename: 输出文件名
+        append: 是否追加写入（True=追加）
+        is_logger: 是否打印日志
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    txt_path = save_dir / filename
+
+    # ---- 自动反转 type_id_specific: str->int  →  int->str ----
+    id2name = {}
+    if hasattr(config, "type_id_specific"):
+        id2name = {v: k for k, v in getattr(config, "type_id_specific").items()}
+
+    # ---- 批次大小 ----
+    B = None
+    if isinstance(batch, dict):
+        for k in ('input', 'label', 'input_file'):
+            if k in batch:
+                v = batch[k]
+                if isinstance(v, torch.Tensor):
+                    B = v.shape[0]
+                    break
+                elif isinstance(v, (list, tuple)):
+                    B = len(v)
+                    break
+    if B is None and isinstance(logits, torch.Tensor):
+        B = logits.shape[0]
+    if B is None:
+        B = 0
+
+    # ---- 预测结果（未softmax，仅argmax）----
+    if isinstance(logits, torch.Tensor):
+        pred_prob = torch.softmax(logits, dim=-1)
+        pred_ids = torch.argmax(pred_prob, dim=-1).detach().cpu().tolist()
+        pred_prob = pred_prob.detach().cpu().tolist()
+    else:
+        pred_ids = [None] * B
+        pred_prob = [None] * B
+
+    # ---- 真实标签 ----
+    true_ids = [None] * B
+    if isinstance(batch, dict) and ('label' in batch):
+        t = batch['label']
+        if isinstance(t, torch.Tensor):
+            true_ids = t.detach().cpu().tolist()
+        elif isinstance(t, (list, tuple)):
+            true_ids = list(t)
+
+    # ---- 文件名（可选）----
+    file_names = ["" for _ in range(B)]
+    if isinstance(batch, dict) and ('input_file' in batch):
+        f = batch['input_file']
+        if isinstance(f, torch.Tensor):
+            file_names = [str(x) for x in f]
+        elif isinstance(f, (list, tuple)):
+            file_names = list(f)
+
+    # ---- 写入 txt ----
+    mode = "a" if append else "w"
+    try:
+        with open(txt_path, mode, encoding="utf-8") as f:
+            f.write(f"{'='*80}\n")
+            f.write(f"Epoch {epoch+1} Type Prediction Results (raw logits)\n")
+            f.write(f"{'='*80}\n")
+            for i in range(B):
+                pid = pred_ids[i]
+                tid = true_ids[i] if i < len(true_ids) else None
+                pname = id2name.get(pid, "N/A") if pid is not None else "N/A"
+                tname = id2name.get(tid, "N/A") if tid is not None else "N/A"
+                logits_row = pred_prob[i] if (pred_prob[i] is not None) else "None"
+                fname = file_names[i] if i < len(file_names) else ""
+
+                f.write(f"[{i:02d}] {fname}\n")
+                f.write(f"  Pred Type: {pname} (id={pid})\n")
+                f.write(f"  True Type: {tname} (id={tid})\n")
+                f.write(f"  Pred Logits: {logits_row}\n\n")
+
+        if is_logger:
+            print(f"[Visualization] Type predictions saved to: {txt_path}")
+    except Exception as e:
+        if is_logger:
+            print(f"[Visualization] Failed to save type predictions: {e}")
+
+    return txt_path
 
 def plot_loss_curve(log_file, save_path=None):
     """
@@ -59,10 +167,22 @@ def visualize_results(inputs, targets, predictions, save_dir='./results', max_sa
     for i in range(n_samples):
         fig, axes = plt.subplots(1, 3, figsize=(18, 6), constrained_layout=True)  
         
-        if len(inputs[i].shape) > 2:
-            input_data = inputs[i, 0].cpu().numpy()
+        input_tensor = inputs[i]
+        while input_tensor.dim() > 3 and input_tensor.shape[0] == 1:
+            input_tensor = input_tensor.squeeze(0)
+
+        if input_tensor.dim() == 3:
+            channels, height, width = input_tensor.shape
+            if channels > 1:
+                merged = input_tensor.permute(1, 0, 2).contiguous().view(height, channels * width)
+                input_data = merged.cpu().numpy()
+            else:
+                input_data = input_tensor.squeeze(0).cpu().numpy()
+        elif input_tensor.dim() == 2:
+            input_data = input_tensor.cpu().numpy()
         else:
-            input_data = inputs[i].cpu().numpy()
+            input_data = input_tensor.squeeze().cpu().numpy()
+
         im0 = axes[0].imshow(input_data, cmap='viridis', aspect='auto')
         axes[0].set_title('inputs data')
         fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
@@ -414,6 +534,7 @@ def analyze_fourier_domain(inputs, targets, predictions, save_dir='./results', m
             import traceback
             traceback.print_exc()
             continue
+        
 def analyze_fourier_domain_safe(inputs, targets, predictions, save_dir='./results', max_samples=4):
     """
     分析输入和输出速度波形图在傅里叶域的特点

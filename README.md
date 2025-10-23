@@ -54,7 +54,7 @@ In MOEOperator
 4. w_processor_type —— 弱专家输出融合器种类
 5. beta —— 强弱激活参数，beta越大，弱激活影响越大
 6. is_specific —— 文件名命名协议选择
-7. is_classier —— 是否使用分组专家网络 GMoE
+7. is_classifier —— 是否使用分组专家网络 GMoE
 
 ## 环境配置
 

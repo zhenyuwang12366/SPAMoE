@@ -22,32 +22,26 @@ python -c "import torch; print('PyTorch 版本:', torch.__version__)"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 bash scripts/run_distributed_seismic_moe.sh \
   --mode train \
+  --model_name FNO \
+  --use_encoder \
+  --concat_channels \
   --num_gpus 2 \
   --num_workers 10 \
   --data_dir /data1/home/teacher/teacher_s/t108790/DATAA \
-  --family curve_vel \
+  --family curve_vel_b \
   --is_specific \
   --batch_size 32 \
   --epochs 100 \
-  --output_dir ../results/seismic_moe_${SLURM_JOB_NAME}_${SLURM_JOB_ID} \
+  --output_dir ../results \
   --top_k 1 \
   --choose_experts 0 \
-  --WNO_n_levels_height 4 \
-  --WNO_n_levels_width 3 \
   --hidden_channels 96 \
-  --WNO_n_layers 5 \
-  --WNO_block_n_layers 2 \
-  --WNO_dropout_rate 0.13560967258978462 \
-  --wavelet_type db8 \
   --learning_rate 0.00026711555047527854 \
   --weight_decay 0.08952068376871994 \
   --scheduler_gamma 0.2966237496749535 \
   --accum_steps 1 \
   --FNO_n_layers 4 \
-  --MNO_n_layers 3 \
-  --LNO_n_layers 5 \
   --lambda_g1v 0.43947650935102966 \
   --lambda_g2v 0.35339805101397564 \
   --lambda_grad_l1 0.15 \
-  --lambda_fourier_mag_l1 0.05 \
-  --use_amp
+  --lambda_fourier_mag_l1 0.05

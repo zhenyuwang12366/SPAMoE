@@ -9,14 +9,28 @@ _FAMILY_CHOICES.extend(sorted(_SPECIFIC_BASE_FAMILIES | _SPECIFIC_VARIANT_FAMILI
 def build_argparser_and_parse(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="地震数据MOE训练和推理")
     
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'inference','overfit1','overfit1_test'],
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'inference','train_encoder'],
                         help='运行模式: 训练或推理')
+    parser.add_argument('--model_name', type=str, default='MOE')
     parser.add_argument('--data_dir', type=str, default=None,
                         help='数据目录路径')
     parser.add_argument('--family', type=str, default=None, choices=_FAMILY_CHOICES,
                         help='数据集系列，可选通用 (vel/style/fault/all) 或细分类别 (如 curve_vel_a)')
     parser.add_argument('--batch_size', type=int, default=None,
-                        help='批次大小')
+                        help='训练批次大小')
+    parser.add_argument('--test_batch_size', type=int, default=None,
+                        help='验证/测试批次大小')
+    parser.add_argument('--n_train_samples', type=int, default=None,
+                        help='训练子集样本数（None 表示全部）')
+    parser.add_argument('--n_test_samples', type=int, default=None,
+                        help='测试子集样本数（None 表示全部）')
+    parser.add_argument('--channel_dim', type=int, default=None,
+                        help='输入张量中通道所在的维度')
+    parser.add_argument('--concat_channels', dest='concat_channels', action='store_true',
+                        help='将多通道波形按宽度拼接成单通道表示')
+    parser.add_argument('--no_concat_channels', dest='concat_channels', action='store_false',
+                        help='保留显式通道维度')
+    parser.set_defaults(concat_channels=None)
     parser.add_argument('--epochs', type=int, default=None,
                         help='训练轮数')
     parser.add_argument('--num_workers', type=int, default=4,
@@ -25,6 +39,11 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='随机种子')
     parser.add_argument('--use_amp', action='store_true', 
                         help='是否使用混合精度训练')
+    parser.add_argument('--mixed_precision', dest='mixed_precision', action='store_true',
+                        help='启用混合精度推理/训练模式')
+    parser.add_argument('--disable_mixed_precision', dest='mixed_precision', action='store_false',
+                        help='禁用混合精度模式')
+    parser.set_defaults(mixed_precision=None)
     
     parser.add_argument('--lr_warmup_epochs', type=int, default=5,
                         help='学习率预热轮数（按 epoch 计）')
@@ -50,9 +69,31 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='L2正则化')
     parser.add_argument('--accum_steps', type=int, default=1,
                         help='梯度累计步数')
+    parser.add_argument('--use_onecycle', dest='use_onecycle', action='store_true',
+                        help='启用 OneCycle 学习率策略')
+    parser.add_argument('--disable_onecycle', dest='use_onecycle', action='store_false',
+                        help='禁用 OneCycle 学习率策略')
+    parser.set_defaults(use_onecycle=None)
+    parser.add_argument('--early_stop', action='store_true',
+                        help='启用早停')
+    parser.add_argument('--early_stop_patience', type=int, default=None,
+                        help='早停耐心轮数')
+    parser.add_argument('--early_stop_min_delta', type=float, default=None,
+                        help='早停最小改进值')
+    parser.add_argument('--early_stop_warmup_epochs', type=int, default=None,
+                        help='早停开始前的预热轮数')
+    parser.add_argument('--eval_interval', type=int, default=None,
+                        help='验证间隔（单位：epoch）')
+    parser.add_argument('--verbose', dest='verbose', action='store_true',
+                        help='输出更详细的日志')
+    parser.add_argument('--quiet', dest='verbose', action='store_false',
+                        help='最小化日志输出')
+    parser.set_defaults(verbose=None)
     
     parser.add_argument('--output_dir', type=str, default='./results',
                         help='结果保存目录')
+    parser.add_argument('--log_root', type=str, default=None,
+                        help='TensorBoard 日志根目录，默认使用 runs 子目录')
     parser.add_argument('--model_path', type=str, default=None,
                         help='推理模式下使用的模型路径')
     parser.add_argument('--vis_freq', type=int, default=5,
@@ -69,7 +110,7 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
     parser.add_argument('--top_k', type=int, default=1,
                         help='选择前k个专家')
     parser.add_argument('--choose_experts',nargs='+', type=int, default=[0],
-                        help='专家选择, FNO:0, WNO:1, MNO:2, LNO:3, GeoFNO:4')
+                        help='专家选择, FNO:0, WNO:1, MNO:2, LNO:3')
     
     parser.add_argument('--FNO_n_modes_height', type=int, default=16,
                         help='高度傅里叶变换后保留的模态数量')
@@ -109,26 +150,6 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='WNO通道MLP的dropout比例')
     parser.add_argument('--WNO_channel_mlp_expansion', type=float, default=None,
                         help='WNO通道MLP的扩展倍率')
-
-    parser.add_argument('--GeoFNO_modes1', type=int, default=None,
-                        help='GeoFNO 保留的傅里叶模态数量（高度方向），None 表示使用配置文件默认值')
-    parser.add_argument('--GeoFNO_modes2', type=int, default=None,
-                        help='GeoFNO 保留的傅里叶模态数量（宽度方向），None 表示使用配置文件默认值')
-    parser.add_argument('--GeoFNO_n_fourier_layers', type=int, default=None,
-                        help='GeoFNO 中 Fourier block 的层数')
-    parser.add_argument('--GeoFNO_code_dim', type=int, default=None,
-                        help='GeoFNO 条件向量长度')
-    parser.add_argument('--GeoFNO_s1', type=int, default=None,
-                        help='GeoFNO 内部的参考网格高度')
-    parser.add_argument('--GeoFNO_s2', type=int, default=None,
-                        help='GeoFNO 内部的参考网格宽度')
-    parser.add_argument('--GeoFNO_width', type=int, default=None,
-                        help='GeoFNO 主干宽度（hidden channels）')
-    parser.add_argument('--GeoFNO_is_mesh', dest='GeoFNO_is_mesh', action='store_true',
-                        help='强制 GeoFNO 在前向中使用 mesh 模式')
-    parser.add_argument('--GeoFNO_disable_is_mesh', dest='GeoFNO_is_mesh', action='store_false',
-                        help='禁用 GeoFNO 的 mesh 模式')
-    parser.set_defaults(GeoFNO_is_mesh=None)
     
     parser.add_argument('--MNO_n_scales', type=int, default=3,
                         help='总共使用的尺度')
@@ -146,22 +167,39 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='moe使用的专家模型存放路径')
     parser.add_argument('--use_moe', action='store_true',
                         help='是否使用moe, 使用会冻结专家模型')
+    parser.add_argument('--moe_mode', type=str, default='standard',
+                        choices=['standard', 'velocity_type'],
+                        help="MOE运行模式：'standard' 使用路由/融合，'velocity_type' 直接按类型权重融合预训练专家")
     parser.add_argument('--router_type', type=str, default='basic',
                         help='路由器类型: \'basic\'/\'adamv\'')
+    parser.add_argument('--router_hidden_dim', type=int, default=None,
+                        help='路由器隐藏层宽度')
     parser.add_argument('--fusion_type', type=str, default='linear',
                         help='专家组间融合方式: \'linear\'/\'attention\'/\'swa\'/\'basic(sum)\'')
     parser.add_argument('--s_processor_type', type=str, default='linear',
                         help='强专家组内融合方式: \'linear\'/\'attention\'/\'mean\'/\'sum\'')
     parser.add_argument('--w_processor_type', type=str, default='linear',
                         help='弱专家组内融合方式: \'linear\'/\'attention\'/\'mean\'/\'sum\'')
+    parser.add_argument('--enable_noisy_gating', dest='noisy_gating', action='store_true',
+                        help='启用带噪声门控')
+    parser.add_argument('--disable_noisy_gating', dest='noisy_gating', action='store_false',
+                        help='禁用带噪声门控')
+    parser.set_defaults(noisy_gating=None)
     parser.add_argument('--beta', type=float, default=0.5,
                         help='强弱激活参数，beta越大，弱激活影响越大')
     parser.add_argument('--is_specific', action='store_true',
                         help='是否细化种类')
-    parser.add_argument('--is_classier', action='store_true',
+    parser.add_argument('--is_classifier', action='store_true',
                         help='是否使用分组专家网络')
     parser.add_argument('--v_type_num', type=int, default=None,
                         help='速度类型数量，用于控制分类器输出维度及专家分组')
+    parser.add_argument('--use_gpu_proxy', action='store_true',
+                        help='启用专家显存代理以缓解显存压力')
+    parser.add_argument('--use_encoder', dest='use_encoder', action='store_true',
+                        help='启用 encoder，将输入先编码再送入 MoE')
+    parser.add_argument('--disable_encoder', dest='use_encoder', action='store_false',
+                        help='禁用 encoder，直接将原始输入送入 MoE')
+    parser.set_defaults(use_encoder=None)
 
     parser.add_argument('--hidden_channels', type=int, default=128,
                         help='隐藏通道数（默认值由配置文件决定，可通过此参数覆盖）')
@@ -169,16 +207,19 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='学习率（默认值由配置文件决定，可通过此参数覆盖）')
     parser.add_argument('--resume_path', type=str, default=None,
                         help='恢复训练的checkpoint路径，如 best_model_xxx.pt')
+    parser.add_argument('--encoder_path', type=str, default=None,
+                        help='单独加载encoder的checkpoint路径，并在训练时冻结其参数')
     
     parser.add_argument('--is_resize', action='store_true')
     parser.add_argument('--H_size', type=int, default=256)
     parser.add_argument('--W_size', type=int, default=256)
     
     # Loss related
-    parser.add_argument('-g1v', '--lambda_g1v', type=float, default=1.0)
-    parser.add_argument('-g2v', '--lambda_g2v', type=float, default=1.0)
-    parser.add_argument('--lambda_grad_l1', type=float, default=0.0)
-    parser.add_argument('--lambda_fourier_mag_l1', type=float, default=0.0)
+    parser.add_argument('-g1v', '--lambda_g1v', type=float, default=0.6)
+    parser.add_argument('-g2v', '--lambda_g2v', type=float, default=0.4)
+    parser.add_argument('--lambda_grad_l1', type=float, default=0.15)
+    parser.add_argument('--lambda_fourier_mag_l1', type=float, default=0.10)
+    parser.add_argument('--lambda_ce', type=float, default=0.20)
     
     # Performance related
     parser.add_argument('--profile_timing', action='store_true',

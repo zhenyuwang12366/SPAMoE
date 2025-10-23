@@ -1,40 +1,22 @@
+# -*- coding: utf-8 -*-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os
 from pathlib import Path
 from typing import List, Dict, Union, Tuple, Callable, Optional
-import numpy as np
-from torchvision.models import resnet50, ResNet50_Weights
 from collections import Counter
 
 from .base_model import BaseModel
-from ..layers.channel_mlp import ChannelMLP
 from .task_router import TaskAwareRouter
 from ..layers.spectral_convolution import SpectralConv
-from .expert_factory import ExpertFactory
 from .task_dependent_router import TaskDependentRouter
 from .SWActivate import GroupActMerge, SWActMerge
 from .merge_processer import MeanMix, SumMix, LinearMix, AttentionMix
 from torch.nn.parameter import UninitializedParameter
+from .expert_memory_proxy import ExpertMemoryProxy
 
+# ============================== Router ==============================
 class Router(nn.Module):
-    """
-    路由器模块，负责将输入分配给最合适的专家
-    
-    Parameters
-    ----------
-    input_dim : int
-        输入特征维度
-    num_experts : int
-        专家数量
-    hidden_dim : int, optional
-        路由器隐藏层维度
-    top_k : int, optional
-        选择前k个专家
-    noisy_gating : bool, optional
-        是否使用噪声门控机制
-    """
     def __init__(
         self,
         input_dim: int,
@@ -49,68 +31,42 @@ class Router(nn.Module):
         self.num_experts = num_experts
         self.top_k = min(top_k, num_experts)
         self.noisy_gating = noisy_gating
-        self.alpha = alpha # aux负载均衡损失因子
-        
-        # 路由器网络
+        self.alpha = alpha
         self.router = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, num_experts)
         )
-        
+
     def forward(self, x):
-        """
-        返回:
-        top_k_weights: [B, k]
-        top_k_indices: [B, k]
-        w_weights:     [B, w_k] or None
-        w_indices:     [B, w_k] or None
-        aux_loss:      scalar tensor or None( eval )
-        """
-        logits = self.router(x)                             # [B, N]
-
+        logits = self.router(x)
         if self.noisy_gating and self.training:
-            noise_scale = 1.0
-            logits = logits + torch.randn_like(logits) * noise_scale
+            logits = logits + torch.randn_like(logits)
+        routing_weights = F.softmax(logits, dim=-1)
 
-        routing_weights = F.softmax(logits, dim=-1)         # [B, N]
-
-        # --- top-k 主专家 ---
         top_k = int(self.top_k)
         num_experts = int(self.num_experts)
-        assert num_experts > 0 and 1 <= top_k <= num_experts, f"num_experts: {num_experts}, top_k: {top_k}"
+        assert num_experts > 0 and 1 <= top_k <= num_experts
 
         top_k_weights, top_k_indices = torch.topk(
             routing_weights, k=top_k, dim=-1, largest=True, sorted=True
-        )                                                   # [B, k], [B, k]
-
-        # 归一化
+        )
         top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
-        # --- 弱激活专家（从“未被 top-k 选中”的剩余里挑） ---
         w_top_k = num_experts - top_k
         if w_top_k > 0:
-            # 构造与 routing_weights 同形状的选择掩码: 被 top-k 选中的位置为 True
             B, N = routing_weights.shape
             selected_mask = torch.zeros(B, N, dtype=torch.bool, device=routing_weights.device)
-            # scatter_ 支持 bool，按行把 top_k_indices 位置置 True
             selected_mask.scatter_(dim=1, index=top_k_indices, src=torch.ones_like(top_k_indices, dtype=torch.bool))
-
-            # 把已选中的位置屏蔽为 -inf，从“剩余位置”再取最大的 w_top_k
             remaining = routing_weights.clone().masked_fill(selected_mask, float('-inf'))
-
-            # 若 num_experts == top_k，这里全是 -inf；但我们有 w_top_k>0 的判断保证不会走到这里
             w_weights, w_indices = torch.topk(remaining, k=w_top_k, dim=-1, largest=True, sorted=True)
-            # 将 -inf 安全归一化（如果极端情况下全是 -inf，会得到 nan，故先替换为 0）
             w_weights = torch.where(torch.isfinite(w_weights), w_weights, torch.zeros_like(w_weights))
             w_weights = w_weights / w_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
         else:
             w_weights, w_indices = None, None
 
-        # --- aux（负载均衡损失） ---
         if self.training and getattr(self, "alpha", 0.0) > 0.0:
             if top_k_indices.numel() == 0 or routing_weights.numel() == 0:
-                # 空 batch 情况：返回零标量，保持图连接，避免 DDP 不一致
                 aux_loss = routing_weights.sum() * 0.0
             else:
                 idx = top_k_indices.reshape(-1).to(dtype=torch.long)
@@ -122,7 +78,9 @@ class Router(nn.Module):
             aux_loss = None
 
         return top_k_weights, top_k_indices, w_weights, w_indices, aux_loss
-    
+
+
+# ============================== ContinuousCRF（可选） ==============================
 class ContinuousCRF(nn.Module):
     def __init__(self, window_size=5, num_iterations=5, lambda_feat=1.0, lambda_pos=1.0):
         super().__init__()
@@ -130,51 +88,33 @@ class ContinuousCRF(nn.Module):
         self.num_iterations = num_iterations
         self.lambda_feat = lambda_feat
         self.lambda_pos = lambda_pos
-
-        # 可学习参数：pairwise 权重 w ≥ 0
         self.w = nn.Parameter(torch.tensor(1.0))
-    
+
     def forward(self, unary_pred, features):
-        """
-        unary_pred: CNN 输出速度预测 [B, 1, H, W]
-        features: 最后一层 decoder 特征图 [B, C, H, W]
-        """
         B, _, H, W = unary_pred.shape
         _, C, _, _ = features.shape
         device = unary_pred.device
 
-        # 初始 mean field 分布
         mu = unary_pred.clone()
         for _ in range(self.num_iterations):
             mu_new = torch.zeros_like(mu)
-
             for dx in range(-self.window_size, self.window_size + 1):
                 for dy in range(-self.window_size, self.window_size + 1):
-                    if dx == 0 and dy == 0:
-                        continue
-
-                    # 平移 feature 和 mu
+                    if dx == 0 and dy == 0: continue
                     f_shift = self.shift_tensor(features, dx, dy)
                     mu_shift = self.shift_tensor(mu, dx, dy)
-
-                    # 计算 feature 相似度
                     diff_feat = (features - f_shift).pow(2).sum(dim=1, keepdim=True)
                     diff_pos = (dx**2 + dy**2)
-
                     weight = torch.exp(-self.lambda_feat * diff_feat - self.lambda_pos * diff_pos)
                     mu_new += weight * mu_shift
-
-            # 归一化更新
             norm_factor = 1 + self.w * (2 * self.window_size + 1)**2
             mu = (unary_pred + self.w * mu_new) / norm_factor
-
-        return mu  # CRF refined prediction
+        return mu
 
     def shift_tensor(self, x, dx, dy):
         B, C, H, W = x.shape
         shifted = torch.zeros_like(x)
 
-        # 计算有效区域的起止 index，让 src 和 tgt 尺寸一致
         if dx >= 0:
             src_x1, src_x2 = 0, H - dx
             tgt_x1, tgt_x2 = dx, H
@@ -189,10 +129,11 @@ class ContinuousCRF(nn.Module):
             src_y1, src_y2 = -dy, W
             tgt_y1, tgt_y2 = 0, W + dy
 
-        # 确保 source 和 target 区域 shape 相同
         shifted[:, :, tgt_x1:tgt_x2, tgt_y1:tgt_y2] = x[:, :, src_x1:src_x2, src_y1:src_y2]
         return shifted
-    
+
+
+# ============================== 轻量编码块（可选） ==============================
 class ConvBNAct(nn.Module):
     def __init__(self, in_ch, out_ch, k=3, s=1, p=1):
         super().__init__()
@@ -217,15 +158,8 @@ class ResidualBlock(nn.Module):
         return self.act(self.f(x) + x)
 
 class AdaptiveDownsample(nn.Module):
-    """
-    根据输入形状自适应选择 stride：
-    - 长条形(高>>宽)：优先 (2,1)
-    - 长条形(宽>>高)：优先 (1,2)
-    - 否则：(2,2)
-    """
     def __init__(self, ch_in, ch_out):
         super().__init__()
-        # 这里 stride 在 forward 里动态决定；卷积核/通道提前定义
         self.conv_21 = ConvBNAct(ch_in, ch_out, k=3, s=(2,1), p=1)
         self.conv_12 = ConvBNAct(ch_in, ch_out, k=3, s=(1,2), p=1)
         self.conv_22 = ConvBNAct(ch_in, ch_out, k=3, s=(2,2), p=1)
@@ -233,58 +167,38 @@ class AdaptiveDownsample(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         aspect = H / max(W, 1)
-        if aspect > 1.5:                    # 高明显更长：优先压 H 维
-            return self.conv_21(x)
-        if aspect < 1 / 1.5:                # 宽明显更长：优先压 W 维
-            return self.conv_12(x)
-        else:
-            return self.conv_22(x)
+        if aspect > 1.5: return self.conv_21(x)
+        if aspect < 1 / 1.5: return self.conv_12(x)
+        return self.conv_22(x)
 
 class TimeSpaceProjectorFlexible(nn.Module):
-    """
-    输入:  B x 1 x H x W  (H,W ∈ {1000×350, 350×350, 256×256, 1000/int × 350/int, ...})
-    输出:  B x 1 x 70 x 70
-    """
     def __init__(self, base_ch=32, bottleneck_depth=3, min_side_target=96):
         super().__init__()
-        self.min_side_target = min_side_target  # 下采样的“安全带”
-        # Stem
+        self.min_side_target = min_side_target
         self.stem = nn.Sequential(
             ConvBNAct(1, base_ch,   k=3, s=1, p=1),
             ConvBNAct(base_ch, base_ch, k=3, s=1, p=1),
         )
-        # 预备几级可复用的自适应下采样（共享结构、顺序堆叠）
         down_channels = [
-            (base_ch, base_ch * 2),      # 32 -> 64
-            (base_ch * 2, base_ch * 4),  # 64 -> 128
-            (base_ch * 4, base_ch * 4),  # 128(保持)
-            (base_ch * 4, base_ch * 4),  # 128(保持)
-            (base_ch * 4, base_ch * 4),  # 额外冗余一层，兼容更大输入
+            (base_ch, base_ch * 2),
+            (base_ch * 2, base_ch * 4),
+            (base_ch * 4, base_ch * 4),
+            (base_ch * 4, base_ch * 4),
+            (base_ch * 4, base_ch * 4),
         ]
-        self.down_stages = nn.ModuleList(
-            AdaptiveDownsample(cin, cout) for cin, cout in down_channels
-        )
-        self.min_required_down_stages = 2  # 至少叠两层，确保达到 base_ch*4 通道
-
-        # bottleneck 残差堆叠
+        self.down_stages = nn.ModuleList(AdaptiveDownsample(cin, cout) for cin, cout in down_channels)
+        self.min_required_down_stages = 2
         ch = base_ch*4
-        blocks = []
-        for _ in range(bottleneck_depth):
-            blocks.append(ResidualBlock(ch, expansion=2))
-        self.bottleneck = nn.Sequential(*blocks)
-
-        # 轻量上增强+投影
+        self.bottleneck = nn.Sequential(*[ResidualBlock(ch, expansion=2) for _ in range(bottleneck_depth)])
         self.head = nn.Sequential(
-            ConvBNAct(ch, ch//2, k=3, s=1, p=1),   # 64
-            ConvBNAct(ch//2, ch//4, k=3, s=1, p=1),# 32
+            ConvBNAct(ch, ch//2, k=3, s=1, p=1),
+            ConvBNAct(ch//2, ch//4, k=3, s=1, p=1),
             nn.Conv2d(ch//4, 1, kernel_size=3, stride=1, padding=1, bias=True)
         )
-        # 最终 70x70 对齐
         self.out_pool = nn.AdaptiveAvgPool2d((70, 70))
 
     def forward(self, x):
         x = self.stem(x)
-        # 自适应下采样，直到最短边 ≤ 96 或者用完下采样模块
         H, W = x.shape[-2:]
         need_force_down = min(H, W) > self.min_side_target
         for idx, d in enumerate(self.down_stages):
@@ -294,43 +208,14 @@ class TimeSpaceProjectorFlexible(nn.Module):
             H, W = x.shape[-2:]
             if need_force_down and idx + 1 >= self.min_required_down_stages:
                 need_force_down = False
-
         x = self.bottleneck(x)
         x = self.head(x)
-        x = self.out_pool(x)  # 保证 Bx1x70x70
+        x = self.out_pool(x)
         return x
-    
+
+
+# ============================== MOEOperator ==============================
 class MOEOperator(BaseModel, name='MOE'):
-    """
-    多专家混合神经算子 (Mixture of Experts Neural Operator)
-    
-    该模型集成了多种不同类型的神经算子专家，包括不同域专家、尺度专家和几何专家。
-    
-    Parameters
-    ----------
-    experts : List[nn.Module]
-        专家模型列表
-    in_channels : int
-        输入通道数
-    out_channels : int
-        输出通道数
-    hidden_channels : int
-        隐藏层通道数
-    top_k : int, optional
-        每次选择的专家数量，默认为2
-    noisy_gating : bool, optional
-        是否使用噪声门控，默认为True
-    fusion_type : str, optional
-        专家输出融合方式，可选'linear'或'attention'，默认为'linear'
-    router_hidden_dim : int, optional
-        路由器隐藏层维度，默认为256
-    router_type : str, optional
-        路由器类型，可选'basic'或'task_aware'，默认为'basic'
-    task_dim : int, optional
-        任务特征维度，当router_type为'task_aware'时有效，默认为0
-    routing_mode : str, optional
-        路由模式，当router_type为'task_aware'时有效，默认为'input'
-    """
     def __init__(
         self,
         experts: List[nn.Module],
@@ -347,268 +232,186 @@ class MOEOperator(BaseModel, name='MOE'):
         is_logger: bool = False,
         v_type_num: Optional[int] = None,
         batch_size: int = 0,
+        moe_mode: str = 'standard',
         **kwargs
     ):
         super().__init__()
         self.config = kwargs
+        self.moe_mode = moe_mode
+        self.config.setdefault('moe_mode', moe_mode)
 
-        # 保存参数
+        valid_modes = {'standard', 'group', 'velocity_type'}
+        if self.moe_mode not in valid_modes:
+            raise ValueError(f"Unsupported moe_mode: {self.moe_mode}")
+
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.hidden_channels = hidden_channels
         self.top_k = top_k
-        
+
         if v_type_num is None:
             self.v_type_num = 10 if self.config.get('is_specific', True) else 3
         else:
             self.v_type_num = v_type_num
-            
-        # 专家列表
+
+        if self.moe_mode == 'velocity_type' and (self.v_type_num is None or self.v_type_num <= 0):
+            self.v_type_num = len(experts)
+
+        # 专家列表（索引即身份）
         self.experts = nn.ModuleList(experts)
-        if self.config.get('is_classier', False):
-            if self.config.get('is_specific', True):
-                self.num_experts = int(len(experts) / self.v_type_num)
-            else:
-                self.num_experts = int(len(experts) / self.v_type_num)
+
+        # >>> 显存管理透明代理（开关可由 config 控制）
+        use_proxy = self.config.get('use_expert_memory_proxy', True)
+        self.expert_proxy: Optional[ExpertMemoryProxy] = None
+        if use_proxy:
+            self.expert_proxy = ExpertMemoryProxy(
+                experts=list(self.experts),
+                device=self.config.get('device', 'cuda'),
+                cache_size=self.config.get('expert_cache_size', 2),
+                amp_dtype=(torch.float16 if self.config.get('proxy_fp16', True) else None),
+                convert_param_dtype_on_gpu=self.config.get('proxy_convert_param_dtype', True),
+                safety_ratio=self.config.get('proxy_safety_ratio', 1.2),
+                measure_on_first_use=self.config.get('proxy_measure_on_first_use', True),
+            )
+
+        # 派生属性
+        if self.moe_mode == 'velocity_type':
+            self.num_experts = len(experts)
+            self.types_per_group = 0
+        elif self.moe_mode == 'group':
+            self.types_per_group = int(self.v_type_num)
+            if self.types_per_group <= 0:
+                raise ValueError("group 模式需要正整数的 v_type_num。")
+            if len(experts) % self.types_per_group != 0 and is_logger:
+                print(f"[WARN] 专家数量 {len(experts)} 不能被每组类型数 {self.types_per_group} 整除，将按整除结果截断。")
+            self.num_experts = max(1, len(experts) // self.types_per_group)
         else:
             self.num_experts = len(experts)
+            self.types_per_group = 0
 
         self.noisy_gating = noisy_gating
         self.fusion_type = fusion_type
         self.router_type = router_type
         self._type_weight_warned = False
 
-        # 确保 top_k 不超过专家数量
-        self.top_k = min(self.top_k, self.num_experts)
-        # 得出弱专家组专家数
-        self.w_k = max(0, self.num_experts - top_k)
+        if self.moe_mode == 'velocity_type':
+            self.router_type = 'velocity_type'
 
-        # -------- 路由器 --------
-        if self.num_experts > 1:
-            self.alpha: float = 0.1
-        else:
-            self.alpha: float = 0.0
-        if self.router_type == 'task_aware' and self.fusion_type == 'swa':
-            raise ValueError("task_aware 路由当前不支持 'swa' 融合（缺少弱组）。")
-        if router_type == 'basic':
-            self.router = Router(
-                input_dim=in_channels,
-                num_experts=self.num_experts,
-                hidden_dim=router_hidden_dim,
-                top_k=self.top_k,
-                noisy_gating=noisy_gating,
-                alpha = self.alpha,
-            )
-        elif router_type == 'task_aware':
-            self.router = TaskAwareRouter(
-                input_dim=in_channels,
-                task_dim=task_dim,
-                num_experts=self.num_experts,
-                hidden_dim=router_hidden_dim,
-                top_k=self.top_k,
-                noisy_gating=noisy_gating,
-                routing_mode=routing_mode,
-            )
-        elif router_type == 'adamv':
-            self.router = TaskDependentRouter(
-                input_dim=in_channels,
-                num_experts=self.num_experts,
-                hidden_dim=router_hidden_dim,
-                bsz=batch_size,
-                noisy_gating=noisy_gating,
-                alpha = self.alpha,
-            )
-        else:
-            raise ValueError(f"不支持的路由器类型: {router_type}")
+        if self.moe_mode != 'velocity_type':
+            self.top_k = min(self.top_k, self.num_experts)
+            self.w_k = max(0, self.num_experts - top_k)
 
-        # -------- s_processor / w_processor --------
-        for t in ['s_processor', 'w_processor']:
-            cfg_key = f'{t}_type'
-            module = None
-            if self.config.get(cfg_key, None) == 'linear':
+            if self.num_experts > 1:
+                self.alpha: float = 0.1
+            else:
+                self.alpha: float = 0.0
+
+            if self.router_type == 'task_aware' and self.fusion_type == 'swa':
+                raise ValueError("task_aware 路由当前不支持 'swa' 融合。")
+
+            if router_type == 'basic':
+                self.router = Router(
+                    input_dim=in_channels,
+                    num_experts=self.num_experts,
+                    hidden_dim=router_hidden_dim,
+                    top_k=self.top_k,
+                    noisy_gating=noisy_gating,
+                    alpha=self.alpha,
+                )
+            elif router_type == 'task_aware':
+                self.router = TaskAwareRouter(
+                    input_dim=in_channels,
+                    task_dim=task_dim,
+                    num_experts=self.num_experts,
+                    hidden_dim=router_hidden_dim,
+                    top_k=self.top_k,
+                    noisy_gating=noisy_gating,
+                    routing_mode=routing_mode,
+                )
+            elif router_type == 'adamv':
+                self.router = TaskDependentRouter(
+                    input_dim=in_channels,
+                    num_experts=self.num_experts,
+                    hidden_dim=router_hidden_dim,
+                    bsz=batch_size,
+                    noisy_gating=noisy_gating,
+                    alpha=self.alpha,
+                )
+            else:
+                raise ValueError(f"不支持的路由器类型: {router_type}")
+
+            # s_processor / w_processor
+            for t in ['s_processor', 'w_processor']:
+                cfg_key = f'{t}_type'
+                module = None
                 k = self.top_k if t == 's_processor' else self.w_k
-                module = LinearMix(k, self.in_channels)
-            elif self.config.get(cfg_key, None) == 'attention':
-                k = self.top_k if t == 's_processor' else self.w_k
-                module = AttentionMix(
-                    input_resolution=256, patch_size=16, in_channels=self.in_channels,out_channels=self.in_channels,
-                    width=512, layers=6, heads=8, num_experts=k,
+                if self.config.get(cfg_key, None) == 'linear':
+                    module = LinearMix(k, self.in_channels)
+                elif self.config.get(cfg_key, None) == 'attention':
+                    module = AttentionMix(
+                        input_resolution=256, patch_size=16, in_channels=self.in_channels,out_channels=self.in_channels,
+                        width=512, layers=6, heads=8, num_experts=k,
+                        use_cls_expert=False,
+                    )
+                elif self.config.get(cfg_key, None) == 'mean':
+                    module = MeanMix(self.out_channels)
+                elif self.config.get(cfg_key, None) == 'sum':
+                    module = SumMix(self.out_channels)
+                setattr(self, t, module)
+
+            # 融合层
+            if fusion_type == 'linear':
+                self.fusion = LinearMix(self.top_k, self.in_channels)
+            elif fusion_type == 'attention':
+                self.fusion = AttentionMix(
+                    input_resolution=256, patch_size=16, in_channels=self.in_channels, out_channels=self.in_channels,
+                    width=512, layers=6, heads=8, num_experts=self.top_k,
                     use_cls_expert=False,
                 )
-            elif self.config.get(cfg_key, None) == 'mean':
-                module = MeanMix(self.out_channels)
-            elif self.config.get(cfg_key, None) == 'sum':
-                module = SumMix(self.out_channels)
-            setattr(self, t, module)
-        
-        # -------- 融合层 --------
-        if fusion_type == 'linear':
-            self.fusion = LinearMix(self.top_k, self.in_channels)
-        elif fusion_type == 'attention':
-            self.fusion = AttentionMix(
-                input_resolution=256, patch_size=16, in_channels=self.in_channels, out_channels=self.in_channels,
-                width=512, layers=6, heads=8, num_experts=self.top_k,
-                use_cls_expert=False,
-            )
-        elif fusion_type == 'swa':
-            self.s_act = GroupActMerge(processor=self.s_processor)
-            self.w_act = GroupActMerge(processor=self.w_processor)
-            self.sw_act = SWActMerge(beta=self.config.get('beta', 0.5))
-        elif fusion_type == 'basic':
-            self.fusion = SumMix(self.in_channels)
+            elif fusion_type == 'swa':
+                self.s_act = GroupActMerge(processor=self.s_processor)
+                self.w_act = GroupActMerge(processor=self.w_processor)
+                self.sw_act = SWActMerge(beta=self.config.get('beta', 0.5))
+            elif fusion_type == 'basic':
+                self.fusion = SumMix(self.in_channels)
+            else:
+                raise ValueError(f"未支持的融合类型: {fusion_type}")
         else:
-            raise ValueError(f"未支持的融合类型: {fusion_type}")
+            self.top_k = 0
+            self.w_k = 0
+            self.alpha = 0.0
+            self.router = None
+            for attr in ['s_processor', 'w_processor', 'fusion', 's_act', 'w_act', 'sw_act']:
+                setattr(self, attr, None)
 
         self.proj = nn.Conv2d(in_channels, 1, 1)
-        # -------- 时域→空域投影（B,1,T,R -> B,1,70,70）--------
-        # 如用 AMP，调试阶段可把 inplace=False 更稳
-        # self.time_to_space_projection = TimeSpaceProjectorFlexible()
-
-        # -------- CRF 与特征 Map --------
-        # self.CCrf = ContinuousCRF()
-        # self.feature_map = {}
-        # hook_target = getattr(self.time_to_space_projection, 'head', None)
-        # if isinstance(hook_target, nn.Sequential) and len(hook_target) >= 2:
-        #     self._feature_hook_handle = hook_target[-2].register_forward_hook(self.hook_fn)
-        # else:
-        #     self._feature_hook_handle = self.time_to_space_projection.register_forward_hook(self.hook_fn)
-
         self.is_logger = is_logger
-
-        # ========= 统一初始化：放在最后 =========
         self.reset_parameters_()
 
-    # --------------- 初始化策略 ---------------
-    def reset_parameters_(self):
-        """按照当前 MOE 架构对所有可学习组件进行初始化。"""
-        neg_slope = 0.2
-
-        def _init_linear(layer: nn.Linear):
-            weight = getattr(layer, 'weight', None)
-            if isinstance(weight, UninitializedParameter):
-                # 延迟参数（LazyLinear 等）在第一次 forward 时再由 PyTorch 初始化
-                return
-            if weight is not None:
-                nn.init.xavier_uniform_(weight, gain=1.0)
-            bias = getattr(layer, 'bias', None)
-            if bias is not None:
-                nn.init.zeros_(bias)
-
-        def _init_basic(module: nn.Module):
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(
-                    module.weight,
-                    a=neg_slope,
-                    mode='fan_in',
-                    nonlinearity='leaky_relu',
-                )
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.BatchNorm2d):
-                if module.weight is not None:
-                    nn.init.ones_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Linear):
-                _init_linear(module)
-            elif isinstance(module, SpectralConv):
-                # SpectralConv 自带初始化逻辑
-                if hasattr(module, 'reset_parameters'):
-                    module.reset_parameters()
-
-        def _apply_basic(module: Optional[nn.Module]):
-            if module is not None:
-                module.apply(_init_basic)
-
-        def _init_composite(module: Optional[nn.Module]):
-            if module is None:
-                return
-            if hasattr(module, 'reset_parameters_'):
-                module.reset_parameters_()
-            elif hasattr(module, 'reset_parameters'):
-                module.reset_parameters()
-            else:
-                module.apply(_init_basic)
-
-        # 1) 输入到输出的主干映射
-        # _apply_basic(self.time_to_space_projection)
-
-        if getattr(self, 'CCrf', None) is not None:
-            if hasattr(self.CCrf, 'apply'):
-                self.CCrf.apply(_init_basic)
-            if hasattr(self.CCrf, 'w'):
-                nn.init.constant_(self.CCrf.w, 1.0)
-
-        # 2) 专家：优先使用其自带的 reset 接口
-        for expert in self.experts:
-            if hasattr(expert, 'reset_parameters'):
-                expert.reset_parameters()
-            elif hasattr(expert, 'reset_parameters_'):
-                expert.reset_parameters_()
-            else:
-                expert.apply(_init_basic)
-
-        # 3) 路由器：通用初始化 + 最后一层置零保证均匀起步
-        if getattr(self, 'router', None) is not None:
-            self.router.apply(_init_basic)
-            last_linear = None
-            for module in self.router.modules():
-                if isinstance(module, nn.Linear):
-                    last_linear = module
-            if last_linear is not None and not isinstance(getattr(last_linear, 'weight', None), UninitializedParameter):
-                nn.init.zeros_(last_linear.weight)
-                if last_linear.bias is not None:
-                    nn.init.zeros_(last_linear.bias)
-
-        # 4) s_processor / w_processor
-        for name in ('s_processor', 'w_processor'):
-            _init_composite(getattr(self, name, None))
-
-        # 5) 融合头
-        if self.fusion_type == 'linear':
-            _init_composite(getattr(self, 'fusion', None))
-        elif self.fusion_type == 'attention':
-            if hasattr(self, 'fusion') and hasattr(self.fusion, 'reset_parameters'):
-                self.fusion.reset_parameters()
-        elif self.fusion_type == 'swa':
-            if getattr(self, 's_act', None) is not None:
-                _init_composite(getattr(self.s_act, 'processor', None))
-            if getattr(self, 'w_act', None) is not None:
-                _init_composite(getattr(self.w_act, 'processor', None))
-            # sw_act 无可学习参数
-
-        # 6) 线性分类头（仅在启用分类器时存在）
-        if getattr(self, 'config', {}).get('is_classier', False) and hasattr(self, 'fc'):
-            _init_linear(self.fc)
-
-    # --------------- Hook：为 CRF 准备特征图 ---------------
-    # def hook_fn(self, module: nn.Module, input: Tuple[torch.Tensor], output: torch.Tensor):
-    #     features = input[0].detach()
-    #     features = F.interpolate(features, size=(70, 70), mode='bilinear', align_corners=True)
-    #     self.feature_map['feature'] = features
-
-    # --------------- 前向传播 ---------------
+    # ---------------- Forward ----------------
     def forward(self, x, class_weights, task_features=None, **kwargs) -> Tuple[torch.Tensor]:
+        if self.moe_mode == 'velocity_type':
+            return self._forward_velocity_type(x, class_weights, **kwargs)
+
         batch_size = x.shape[0]
         device = x.device
 
-        expect_group_mode = (
-            class_weights is not None
-            and getattr(self, 'config', {}).get('is_classier', False)
-            and len(self.experts) >= self.v_type_num
-        )
-        if expect_group_mode:
-            type_weights = class_weights
+        if self.moe_mode == 'group':
+            if class_weights is None:
+                type_weights = None
+                if self.is_logger and not self._type_weight_warned:
+                    print("[WARN] 未提供类型权重，分组模式将退化为普通专家模式。")
+                    self._type_weight_warned = True
+            else:
+                type_weights = class_weights
         else:
             type_weights = None
             if class_weights is not None and self.is_logger and not self._type_weight_warned:
-                print("[WARN] 忽略 encoder 提供的类型权重：当前配置未启用分组专家或专家数量不足。")
+                print("[WARN] 当前 moe_mode 非 'group'，忽略 encoder 的类型权重。")
                 self._type_weight_warned = True
 
-        # x: [B,C,1000,350] -> 对 C H W 做均值
-        x_flat = x.mean(dim=(2, 3)).view(batch_size, -1)  # [B, in_channels]
+        x_flat = x.mean(dim=(2, 3)).view(batch_size, -1)
 
-        # 路由
         if self.router_type == 'basic':
             s_weights, s_indices, w_weights, w_indices, aux_loss = self.router(x_flat)
         elif self.router_type == 'adamv':
@@ -620,7 +423,6 @@ class MOEOperator(BaseModel, name='MOE'):
             w_weights = w_indices = None
             aux_loss = None
 
-        # list[b,C,H,W] len = k
         s_outputs = self._process_activation_group(
             x=x,
             expert_indices=s_indices,
@@ -644,59 +446,177 @@ class MOEOperator(BaseModel, name='MOE'):
                 kwargs=kwargs,
             )
 
-        # 合并专家输出
         s_combined = torch.stack(s_outputs, dim=1)  # (B, k, C, h, w)
         if self.fusion_type == 'swa':
             w_combined = torch.stack(w_outputs, dim=1)
 
-        # 融合层
         if self.fusion_type == 'swa':
             s_combined = self.s_act(s_outputs)
             w_combined = self.w_act(w_outputs)
             combined_output = self.sw_act(s_combined, w_combined)
         else:
             combined_output = self.fusion(s_combined)
-            
-        # b,C,h,w 调整输出尺寸到 (B,1,70,70)
-        if combined_output.shape[2] != 70:
-            # combined_output = self.time_to_space_projection(combined_output)
-            bc_size = combined_output.shape[:2]
-            combined_output = F.interpolate(combined_output, size=(70, 70), mode='bilinear', align_corners=False)
-        
-        combined_output = self.proj(combined_output)
 
-        # CRF
-        # last_output: torch.Tensor = self.CCrf(combined_output, self.feature_map['feature'])
+        if combined_output.shape[2] != 70 or combined_output.shape[3] != 70:
+            combined_output = F.interpolate(combined_output, size=(70, 70), mode='bilinear', align_corners=False)
+        combined_output = self.proj(combined_output)
         return combined_output, aux_loss
-    
+
+    def _forward_velocity_type(self, x: torch.Tensor, class_weights: Optional[torch.Tensor], **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        batch_size = x.shape[0]
+        device = x.device
+
+        num_available = len(self.experts)
+        if num_available == 0:
+            raise RuntimeError("velocity_type 模式需要至少一个专家。")
+
+        weights = class_weights
+        if weights is None:
+            if self.is_logger:
+                print("[WARN] type_weights 未提供，使用均匀权重。")
+            num_types = min(self.v_type_num or num_available, num_available)
+            weights = torch.ones(batch_size, num_types, device=device, dtype=x.dtype) / float(num_types)
+        else:
+            if weights.dim() == 1:
+                weights = weights.view(1, -1).expand(batch_size, -1)
+            elif weights.dim() == 2 and weights.size(0) == 1 and batch_size > 1:
+                weights = weights.expand(batch_size, -1)
+            elif weights.dim() == 2 and weights.size(0) != batch_size:
+                raise ValueError(f"type_weights batch 大小 {weights.size(0)} 与输入 {batch_size} 不匹配")
+            elif weights.dim() != 2:
+                raise ValueError(f"Unsupported type_weights shape: {tuple(weights.shape)}")
+            weights = weights.to(device=device, dtype=x.dtype)
+
+        expected_types = self.v_type_num or weights.size(1)
+        total_experts = num_available
+        num_types = min(expected_types, weights.size(1), total_experts)
+        if num_types <= 0:
+            raise ValueError("velocity_type 模式需要至少一个专家与对应类型权重。")
+        if num_types < weights.size(1) and self.is_logger:
+            print(f"[WARN] type_weights 列数 {weights.size(1)} 超过可用专家数量 {total_experts}，仅使用前 {num_types} 个。")
+
+        weights = weights[:, :num_types]
+        C = self.out_channels if self.out_channels > 0 else x.shape[1]
+
+        def _zeros_like() -> torch.Tensor:
+            spatial = x.shape[2:] if x.dim() > 2 else (1, 1)
+            return torch.zeros(batch_size, C, *spatial, device=device, dtype=x.dtype)
+
+        outputs: List[torch.Tensor] = []
+        spatial_shapes: List[Tuple[int, ...]] = []
+
+        for idx in range(num_types):
+            try:
+                if self.expert_proxy is None:
+                    out = self.experts[idx](x, **kwargs)
+                else:
+                    out = self.expert_proxy.forward_expert(idx, x, **kwargs)
+                if out is None:
+                    raise RuntimeError("expert returned None")
+            except Exception as exc:
+                if self.is_logger:
+                    print(f"[WARN] 速度类型专家 {idx} 前向失败: {exc}")
+                out = _zeros_like()
+
+            if not torch.is_tensor(out):
+                if self.is_logger:
+                    print(f"[WARN] 速度类型专家 {idx} 返回非张量，使用零张量代替。")
+                out = _zeros_like()
+
+            if out.dim() == 3: out = out.unsqueeze(1)
+            elif out.dim() == 2: out = out.view(batch_size, -1, 1, 1)
+            elif out.dim() < 2: out = out.view(batch_size, 1, 1, 1)
+            elif out.dim() > 4: out = out.view(out.size(0), out.size(1), out.size(2), -1)
+            if out.size(0) != batch_size:
+                if self.is_logger:
+                    print(f"[WARN] 专家 {idx} 输出 batch 大小 {out.size(0)} 异常，使用零张量替换。")
+                out = _zeros_like()
+
+            outputs.append(out)
+            spatial_shapes.append(tuple(out.shape[2:]))
+
+        if not outputs:
+            combined = _zeros_like()
+            return combined, None
+
+        target_shape = self._most_common_shape(spatial_shapes, default_shape=tuple(outputs[0].shape[2:]))
+        aligned = [self._resize_to_shape(out, target_shape) for out in outputs]
+        stacked = torch.stack(aligned, dim=1)  # [B, T, C, H, W]
+        weight_tensor = weights.view(batch_size, num_types, 1, 1, 1)
+        combined = (stacked * weight_tensor).sum(dim=1)
+
+        if combined.shape[2] != 70 or combined.shape[3] != 70:
+            combined = F.interpolate(combined, size=(70, 70), mode='bilinear', align_corners=False)
+        combined = self.proj(combined)
+        return combined, None
+
+    # ---------------- 工具：按专家聚合 & 回填 ----------------
+    def _pack_by_expert(self, indices_1d: torch.Tensor, x: torch.Tensor):
+        """
+        indices_1d: [B] 每个样本的 expert_idx（已是 experts 的直接索引）
+        x:          [B, C, H, W]
+        返回:
+          routed: {expert_idx -> x_sub_cat [n_e, C, H, W]}
+          meta  : {expert_idx -> (positions_list, sizes_list)}  # 回填需要
+        """
+        routed, meta = {}, {}
+        for pos, eid in enumerate(indices_1d.tolist()):
+            x_slice = x[pos:pos+1]  # [1,C,H,W]
+            if eid not in routed:
+                routed[eid] = [x_slice]
+                meta[eid] = ([pos], [1])
+            else:
+                routed[eid].append(x_slice)
+                meta[eid][0].append(pos)
+                meta[eid][1].append(1)
+        for eid in routed:
+            routed[eid] = torch.cat(routed[eid], dim=0).contiguous()
+        return routed, meta
+
+    def _scatter_back(self,
+                      y_by_expert: Dict[int, torch.Tensor],
+                      meta,
+                      B: int,
+                      C: int,
+                      shape_hw: Tuple[int, int],
+                      device,
+                      dtype):
+        """
+        y_by_expert: {expert_idx: y_sub_cat [n_e, C, H, W]}
+        meta       : _pack_by_expert 返回的 meta
+        返回: y_full [B, C, H, W]
+        """
+        H, W = shape_hw
+        y_full = torch.zeros(B, C, H, W, device=device, dtype=dtype)
+        for eid, y_sub in y_by_expert.items():
+            positions, _ = meta[eid]
+            for i, pos in enumerate(positions):
+                y_full[pos:pos+1] = y_sub[i:i+1]
+        return y_full
+
+    # ---------------- 核心：批处理版激活组计算 ----------------
+    @torch.no_grad()
     def _process_activation_group(
         self,
         x: torch.Tensor,
-        expert_indices: torch.Tensor,   # [B, top_k] —— 每个样本被路由到的组/专家ID
-        routing_weights: torch.Tensor,  # [B, top_k] —— 对应的路由权重
-        k: int,                         # 选择的 top-k（传入值）
+        expert_indices: torch.Tensor,   # [B, top_k]
+        routing_weights: torch.Tensor,  # [B, top_k]
+        k: int,
         batch_size: int,
         device,
-        type_weights: Optional[torch.Tensor] = None,  # [B, T] —— 速度图类型权重，T=v_type_num，None 表示不使用分组结构
+        type_weights: Optional[torch.Tensor] = None,  # [B, T] 或 None
         **kwargs,
     ) -> List[torch.Tensor]:
         """
-        计算 Router 选出的 top-k 组/专家的输出，并乘以对应的路由权重。
-        返回长度为 top_k 的列表，每个元素形状为 [B, C, H, W]。
-
-        两种模式：
-        1) 分组模式（type_weights != None）：
-        - 每个“组 g”包含 T 个子模型（速度图类型 0..T-1）
-        - 对组内子模型输出按 type_weights[b, t] 加权求和，得到该组在样本 b 的输出
-        - 再乘以该组的路由权重 routing_weights[b, k_idx]
-
-        2) 直接专家模式（type_weights == None）：
-        - Router 直接把每个样本路由到某个专家（不区分组内子模型）
-        - 乘以对应路由权重
-
-        额外特性：
-        - 自动统一空间分辨率到最常见的目标形状（避免不同专家输出形状不一致）
-        - 所有异常（专家抛错/None、插值失败、cat失败）都有零张量兜底
+        返回长度为 k 的列表，每个元素是 [B, C, H, W]（已经乘以该列的 routing 权重）。
+        - 直接专家模式（无 type_weights）：每列 k_idx：
+            1) 按 expert_idx 聚合 -> {eid: [n_e,C,H,W]}
+            2) 一次 forward_many
+            3) 回填到 [B,C,H,W] 并乘以 routing 权重
+        - 分组模式（有 type_weights, 组内 T 专家 × 类型权重）：
+            1) 将 (group_id, t) 展开为 eid=group_id*T+t，按 eid 聚合
+            2) 一次 forward_many
+            3) 对每个样本按 t 用 type_weights[b,t] 累加，再乘以该列 routing 权重
         """
         top_k = int(k)
         if top_k <= 0:
@@ -704,302 +624,251 @@ class MOEOperator(BaseModel, name='MOE'):
 
         if expert_indices is None:
             raise ValueError("expert_indices 为空，无法获取路由结果。")
-        if expert_indices.size(1) < top_k:
-            raise ValueError(f"expert_indices 的列数不足以支持 top_k={top_k}")
 
         if routing_weights is None:
             routing_weights = torch.ones(batch_size, top_k, device=device, dtype=x.dtype)
-        elif routing_weights.size(1) < top_k:
-            raise ValueError(f"routing_weights 的列数不足以支持 top_k={top_k}")
         else:
             routing_weights = routing_weights.to(device=device, dtype=x.dtype)
 
-        C = self.out_channels
+        C = self.out_channels if self.out_channels > 0 else x.size(1)
         total_experts = len(self.experts)
-        types_per_group = self.v_type_num
-        grouped_mode = type_weights is not None
+        grouped_mode = (self.moe_mode == 'group') and (type_weights is not None)
 
+        # 检查分组模式一致性
         if grouped_mode:
             if type_weights.dim() == 1:
                 type_weights = type_weights.view(1, -1).expand(batch_size, -1)
             if type_weights.size(0) != batch_size:
-                raise ValueError(
-                    f"type_weights batch 维度与输入不一致：{type_weights.size(0)} vs {batch_size}"
-                )
-            if type_weights.size(1) != types_per_group:
+                raise ValueError(f"type_weights batch 维度不一致: {type_weights.size(0)} vs {batch_size}")
+            T = self.types_per_group
+            if type_weights.size(1) != T:
                 if self.is_logger:
-                    print(
-                        f"[WARN] type_weights 列数 {type_weights.size(1)} 与 v_type_num "
-                        f"{types_per_group} 不一致，降级为直接专家模式。"
-                    )
-                grouped_mode = False
-                type_weights = None
-
-        if grouped_mode:
-            expected_total = self.num_experts * types_per_group
-            experts_per_group = total_experts // max(1, self.num_experts)
-            if (
-                expected_total == 0
-                or total_experts < expected_total
-                or total_experts % types_per_group != 0
-                or experts_per_group != types_per_group
-            ):
-                if self.is_logger:
-                    print(
-                        f"[WARN] 专家数量 {total_experts} 与分组结构不匹配（期望 {expected_total}），"
-                        "降级为直接专家模式。"
-                    )
+                    print(f"[WARN] type_weights 列={type_weights.size(1)} 与组内专家数 T={T} 不一致，降级为直接模式。")
                 grouped_mode = False
                 type_weights = None
             else:
-                type_weights = type_weights.to(device=device, dtype=x.dtype)
-            T = types_per_group
-        
-        T = types_per_group
-
-        def _zeros_like_x(bsz: int, channels: int, like: torch.Tensor) -> torch.Tensor:
-            return torch.zeros(bsz, channels, *like.shape[2:], device=like.device, dtype=like.dtype)
-
-        def _safe_call_expert(expert_idx: int, x_slice: torch.Tensor) -> torch.Tensor:
-            """
-            安全地调用 self.experts[expert_idx](x_slice, **kwargs)
-            若异常或返回 None，用零张量兜底，形状为 [1, C, H, W]
-            """
-            try:
-                out = self.experts[expert_idx](x_slice, **kwargs)
-                if out is None:
+                expected_total = self.num_experts * T
+                experts_per_group = total_experts // max(1, self.num_experts)
+                if (expected_total == 0 or total_experts < expected_total
+                    or total_experts % T != 0 or experts_per_group != T):
                     if self.is_logger:
-                        print(f"[WARN] 专家 {expert_idx} 返回 None，使用零张量代替")
-                    return _zeros_like_x(1, C, x_slice)
-                return out
-            except Exception as e:
-                if self.is_logger:
-                    print(f"[ERROR] 专家 {expert_idx} 处理异常：{e}，使用零张量代替")
-                return _zeros_like_x(1, C, x_slice)
-
-        def _most_common_target_shape(all_shapes: List[Tuple[int, ...]]) -> Tuple[int, ...]:
-            """
-            从收集的空间形状中选出维度数最常见、且每个维度大小最常见的 target_shape
-            """
-            if not all_shapes:
-                # 回退：使用当前 x 的空间维度
-                return tuple(x.shape[2:])
-
-            ndims = [len(s) for s in all_shapes]
-            # 选择最常见的维度数
-            target_ndim = Counter(ndims).most_common(1)[0][0]
-            shapes_same_ndim = [s for s in all_shapes if len(s) == target_ndim]
-            # 在每个维度上采用最常见的大小
-            target = []
-            for d in range(target_ndim):
-                dim_sizes = [s[d] for s in shapes_same_ndim]
-                target.append(Counter(dim_sizes).most_common(1)[0][0])
-            return tuple(target)
-
-        def _resize_to(out: torch.Tensor, target_shape: Tuple[int, ...]) -> torch.Tensor:
-            """
-            将 out 插值到 target_shape，保持 [B, C, ...] 结构
-            """
-            if out.dim() < 4 or out.shape[2:] == target_shape:
-                return out
-            try:
-                if len(target_shape) == 3:
-                    mode = 'trilinear'
-                elif len(target_shape) == 2:
-                    mode = 'bilinear'
+                        print(f"[WARN] 专家数量 {total_experts} 与分组结构不匹配（期望 {expected_total}），降级为直接模式。")
+                    grouped_mode = False
+                    type_weights = None
                 else:
-                    mode = 'linear'
-                return F.interpolate(out, size=target_shape, mode=mode, align_corners=True)
-            except Exception as e:
-                if self.is_logger:
-                    print(f"[ERROR] 插值失败: {e}；用零张量兜底。in={tuple(out.shape)} target={target_shape}")
-                return torch.zeros(out.shape[0], out.shape[1], *target_shape, device=out.device, dtype=out.dtype)
+                    type_weights = type_weights.to(device=device, dtype=x.dtype)
 
-        def _apply_sample_weights(batch_tensor: torch.Tensor, sample_wts: torch.Tensor) -> torch.Tensor:
-            """
-            batch_tensor: [B, C, H, W]
-            sample_wts  : [B] 或 [B, 1]
-            返回逐样本广播乘权的结果
-            """
-            if sample_wts.dim() == 1:
-                sample_wts = sample_wts.view(-1, 1, 1, 1)
-            elif sample_wts.dim() == 2 and sample_wts.shape[1] == 1:
-                sample_wts = sample_wts.view(-1, 1, 1, 1)
-            return batch_tensor * sample_wts
+        outputs_per_k: List[torch.Tensor] = []
 
-        collected: List[Tuple[List[torch.Tensor], torch.Tensor]] = []
-        # 仅用于日志：记录每个（组, 子模型）或专家的输出形状
-        shape_log = {}
+        for k_idx in range(top_k):
+            indices_k: torch.Tensor = expert_indices[:, k_idx]   # [B]
+            weights_k: torch.Tensor = routing_weights[:, k_idx]  # [B]
+            weights_k = weights_k.to(device=device, dtype=x.dtype)
 
-        if type_weights is not None:
-            # ------------------------- 分组模式（组内 T 子模型按类型权重加权） -------------------------
-            T = types_per_group
-            experts_per_group = total_experts // max(1, self.num_experts)
+            if not grouped_mode:
+                # -------- 直接专家模式：一次 per-expert mini-batch 前向 --------
+                routed, meta = self._pack_by_expert(indices_k, x)
 
-            for k_idx in range(top_k):
-                group_ids: torch.Tensor = expert_indices[:, k_idx]   # [B]
-                group_wts: torch.Tensor = routing_weights[:, k_idx]  # [B]
-                group_wts = group_wts.to(device=device, dtype=x.dtype)
-                batch_outputs: List[torch.Tensor] = []
+                if not routed:
+                    outputs_per_k.append(torch.zeros(batch_size, C, *x.shape[2:], device=device, dtype=x.dtype))
+                    continue
 
+                # 一次前向（代理 or 直连）
+                if getattr(self, "expert_proxy", None) is not None:
+                    y_by_eid = self.expert_proxy.forward_many(routed)
+                else:
+                    y_by_eid = {eid: self.experts[eid](x_sub, **kwargs) for eid, x_sub in routed.items()}
+
+                # 统一空间形状
+                spatial_shapes = [tuple(y.shape[2:]) for y in y_by_eid.values() if y.dim() >= 4]
+                target_shape = self._most_common_shape(spatial_shapes, default_shape=tuple(x.shape[2:]))
+                for eid in list(y_by_eid.keys()):
+                    y_by_eid[eid] = self._resize_to_shape(y_by_eid[eid], target_shape).contiguous()
+
+                # 回填为 [B,C,H,W]
+                y_full = self._scatter_back(y_by_eid, meta, batch_size, C, target_shape, device, x.dtype)
+                # 逐样本乘以该列的 routing 权重
+                y_full = y_full * weights_k.view(-1, 1, 1, 1)
+                outputs_per_k.append(y_full)
+
+            else:
+                # -------- 分组模式：把 (group, t) 展开为具体专家，合一批处理 --------
+                T = self.types_per_group
+                routed: Dict[int, torch.Tensor] = {}
+                meta: Dict[int, Tuple[List[int], List[int]]] = {}
+
+                group_ids = indices_k  # [B]
                 for b in range(batch_size):
-                    g = int(group_ids[b].item())  # 组ID
-                    if g < 0 or g >= self.num_experts:
-                        if self.is_logger:
-                            print(f"[WARN] 路由得到的组索引 {g} 超出范围，使用零张量代替。")
-                        batch_outputs.append(_zeros_like_x(1, C, x[b:b+1]))
+                    g = int(group_ids[b].item())
+                    if not (0 <= g < self.num_experts):
                         continue
-                    weighted_sum = None
-                    # 组内 T 个子模型（速度图类型 0..T-1），全局索引：g*T + t
                     for t in range(T):
-                        expert_idx = g * experts_per_group + t
-                        if expert_idx >= total_experts:
-                            if self.is_logger:
-                                print(f"[WARN] 访问专家索引 {expert_idx} 越界，填充零张量。")
-                            out_bt = _zeros_like_x(1, C, x[b:b+1])
+                        eid = g * T + t
+                        if eid >= total_experts:
+                            continue
+                        x_slice = x[b:b+1]
+                        if eid not in routed:
+                            routed[eid] = [x_slice]
+                            meta[eid] = ([b], [1])
                         else:
-                            out_bt = _safe_call_expert(expert_idx, x[b:b+1])  # [1, C, h, w]
+                            routed[eid].append(x_slice)
+                            meta[eid][0].append(b)
+                            meta[eid][1].append(1)
 
-                        # 日志：记录 (g,t) 的输出形状
-                        if self.is_logger:
-                            shape_log.setdefault(("group", g, t), []).append(tuple(out_bt.shape))
+                if not routed:
+                    outputs_per_k.append(torch.zeros(batch_size, C, *x.shape[2:], device=device, dtype=x.dtype))
+                    continue
 
-                        # 乘以类型权重（标量）
-                        tw = type_weights[b, t].view(1, 1, 1, 1)  # [1,1,1,1]
-                        out_bt = out_bt * tw
+                # 拼接 mini-batch
+                for eid in routed:
+                    routed[eid] = torch.cat(routed[eid], dim=0).contiguous()
 
-                        weighted_sum = out_bt if weighted_sum is None else (weighted_sum + out_bt)
+                # 一次前向（代理 or 直连）
+                if getattr(self, "expert_proxy", None) is not None:
+                    y_by_eid = self.expert_proxy.forward_many(routed)
+                else:
+                    y_by_eid = {eid: self.experts[eid](x_sub, **kwargs) for eid, x_sub in routed.items()}
 
-                    if weighted_sum is None:
-                        weighted_sum = _zeros_like_x(1, C, x[b:b+1])
-                    # 该样本在组 g 内的加权和
-                    batch_outputs.append(weighted_sum)
+                # 统一空间形状
+                spatial_shapes = [tuple(y.shape[2:]) for y in y_by_eid.values() if y.dim() >= 4]
+                target_shape = self._most_common_shape(spatial_shapes, default_shape=tuple(x.shape[2:]))
+                for eid in list(y_by_eid.keys()):
+                    y_by_eid[eid] = self._resize_to_shape(y_by_eid[eid], target_shape).contiguous()
 
-                collected.append((batch_outputs, group_wts))
-        else:
-            # ------------------------- 直接专家模式（无分组） -------------------------
-            for k_idx in range(top_k):
-                indices: torch.Tensor = expert_indices[:, k_idx]   # [B]
-                weights: torch.Tensor = routing_weights[:, k_idx]  # [B]
-                weights = weights.to(device=device, dtype=x.dtype)
-                batch_outputs: List[torch.Tensor] = []
+                # 组内按 t 加权累加到样本位
+                H, W = target_shape
+                y_group = torch.zeros(batch_size, C, H, W, device=device, dtype=x.dtype)
+                for eid, y_sub in y_by_eid.items():
+                    positions, _ = meta[eid]
+                    local_t = eid % T
+                    for i, pos in enumerate(positions):
+                        tw = type_weights[pos, local_t]   # 标量
+                        y_group[pos:pos+1] += y_sub[i:i+1] * tw
 
-                for b in range(batch_size):
-                    expert_idx = int(indices[b].item())
-                    out_bt = _safe_call_expert(expert_idx, x[b:b+1])  # [1, C, h, w]
+                # 乘以该列的路由权重
+                y_group = y_group * weights_k.view(-1, 1, 1, 1)
+                outputs_per_k.append(y_group)
 
-                    if self.is_logger:
-                        shape_log.setdefault(("expert", expert_idx), []).append(tuple(out_bt.shape))
+        return outputs_per_k
 
-                    batch_outputs.append(out_bt)
+    # ---------------- 其它工具 & 初始化 ----------------
+    @staticmethod
+    def _most_common_shape(shapes: List[Tuple[int, ...]], default_shape: Tuple[int, ...]) -> Tuple[int, ...]:
+        if not shapes:
+            return default_shape
+        ndims = [len(s) for s in shapes]
+        target_ndim = Counter(ndims).most_common(1)[0][0]
+        candidates = [s for s in shapes if len(s) == target_ndim]
+        result = []
+        for dim in range(target_ndim):
+            dim_sizes = [s[dim] for s in candidates]
+            result.append(Counter(dim_sizes).most_common(1)[0][0])
+        return tuple(result)
 
-                collected.append((batch_outputs, weights))
-
-        # ----------------------------- 形状对齐：确定目标空间大小 -----------------------------
-        # 收集所有输出的空间形状
-        all_spatial_shapes: List[Tuple[int, ...]] = []
-        for batch_outputs, _ in collected:
-            for out in batch_outputs:
-                if out is not None and out.dim() >= 4:
-                    all_spatial_shapes.append(tuple(out.shape[2:]))
-
-        if not all_spatial_shapes:
-            # 所有输出都无效时兜底：返回 top_k 个 [B, C, Hx, Wx] 的零张量（Hx,Wx 取自 x）
+    def _resize_to_shape(self, tensor: torch.Tensor, target_shape: Tuple[int, ...]) -> torch.Tensor:
+        if tensor.dim() < 4 or tensor.shape[2:] == target_shape:
+            return tensor
+        try:
+            if len(target_shape) == 2:
+                mode = 'bilinear'
+            elif len(target_shape) == 3:
+                mode = 'trilinear'
+            else:
+                mode = 'linear'
+            return F.interpolate(tensor, size=target_shape, mode=mode, align_corners=False)
+        except Exception as exc:
             if self.is_logger:
-                print("[WARN] 没有有效输出，返回零张量列表")
-            return [torch.zeros(batch_size, C, *x.shape[2:], device=device, dtype=x.dtype) for _ in range(top_k)]
+                print(f"[WARN] 插值到 {target_shape} 失败：{exc}，使用零张量替代。")
+            return tensor.new_zeros(tensor.size(0), tensor.size(1), *target_shape)
 
-        target_shape = _most_common_target_shape(all_spatial_shapes)
-        if self.is_logger:
-            print(f"[INFO] 目标形状（对齐用）: {target_shape}")
+    def reset_parameters_(self):
+        neg_slope = 0.2
 
-        # ----------------------------- 对齐 + 按样本路由权重加权 -----------------------------
-        outputs: List[torch.Tensor] = []
-        for batch_outputs, sample_wts in collected:
-            adjusted = []
-            for out in batch_outputs:
-                out_adj = _resize_to(out, target_shape)
-                adjusted.append(out_adj)
+        def _init_linear(layer: nn.Linear):
+            weight = getattr(layer, 'weight', None)
+            if isinstance(weight, UninitializedParameter):
+                return
+            if weight is not None:
+                nn.init.xavier_uniform_(weight, gain=1.0)
+            bias = getattr(layer, 'bias', None)
+            if bias is not None:
+                nn.init.zeros_(bias)
 
-            # 尝试合并为 [B, C, H, W]
-            try:
-                stacked = torch.cat(adjusted, dim=0)  # [B, C, H, W]
-            except Exception as e:
-                if self.is_logger:
-                    bad_shapes = [tuple(a.shape) for a in adjusted]
-                    print(f"[ERROR] 合并组/专家输出失败：{e}；形状列表：{bad_shapes}；跳过该条目")
-                # 跳过这个 k_idx
-                continue
+        def _init_basic(module: nn.Module):
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, a=neg_slope, mode='fan_in', nonlinearity='leaky_relu')
+                if module.bias is not None: nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.BatchNorm2d):
+                if module.weight is not None: nn.init.ones_(module.weight)
+                if module.bias   is not None: nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Linear):
+                _init_linear(module)
+            elif isinstance(module, SpectralConv):
+                if hasattr(module, 'reset_parameters'): module.reset_parameters()
 
-            weighted = _apply_sample_weights(stacked, sample_wts)  # [B, C, H, W]
-            outputs.append(weighted)
+        def _apply_basic(module: Optional[nn.Module]):
+            if module is not None: module.apply(_init_basic)
 
-        if not outputs:
-            if self.is_logger:
-                print("[WARN] 没有有效的组/专家输出，返回零张量列表")
-            return [torch.zeros(batch_size, C, *target_shape, device=device, dtype=x.dtype) for _ in range(top_k)]
+        def _init_composite(module: Optional[nn.Module]):
+            if module is None: return
+            if hasattr(module, 'reset_parameters_'):
+                module.reset_parameters_()
+            elif hasattr(module, 'reset_parameters'):
+                module.reset_parameters()
+            else:
+                module.apply(_init_basic)
 
-        if self.is_logger and len(shape_log) > 0:
-            # 打印若干条样例形状以辅助调试
-            print("[DEBUG] 专家/组内子模型输出形状样例（最多每类展示3条）：")
-            shown = 0
-            for key, shapes in shape_log.items():
-                print(f"  {key}: {shapes[:3]}{' ...' if len(shapes) > 3 else ''}")
-                shown += 1
-                if shown >= 20:  # 控制日志长度
-                    print("  ... ")
-                    break
+        if getattr(self, 'CCrf', None) is not None:
+            if hasattr(self.CCrf, 'apply'): self.CCrf.apply(_init_basic)
+            if hasattr(self.CCrf, 'w'): nn.init.constant_(self.CCrf.w, 1.0)
 
-        return outputs
-            
+        for expert in self.experts:
+            if hasattr(expert, 'reset_parameters'): expert.reset_parameters()
+            elif hasattr(expert, 'reset_parameters_'): expert.reset_parameters_()
+            else: expert.apply(_init_basic)
+
+        if getattr(self, 'router', None) is not None:
+            self.router.apply(_init_basic)
+            last_linear = None
+            for module in self.router.modules():
+                if isinstance(module, nn.Linear):
+                    last_linear = module
+            if last_linear is not None and not isinstance(getattr(last_linear, 'weight', None), UninitializedParameter):
+                nn.init.zeros_(last_linear.weight)
+                if last_linear.bias is not None: nn.init.zeros_(last_linear.bias)
+
+        for name in ('s_processor', 'w_processor'):
+            _init_composite(getattr(self, name, None))
+
+        if self.fusion_type == 'linear':
+            _init_composite(getattr(self, 'fusion', None))
+        elif self.fusion_type == 'attention':
+            if hasattr(self, 'fusion') and hasattr(self.fusion, 'reset_parameters'):
+                self.fusion.reset_parameters()
+        elif self.fusion_type == 'swa':
+            if getattr(self, 's_act', None) is not None:
+                _init_composite(getattr(self.s_act, 'processor', None))
+            if getattr(self, 'w_act', None) is not None:
+                _init_composite(getattr(self.w_act, 'processor', None))
+
+        if getattr(self, 'config', {}).get('is_classifier', False) and hasattr(self, 'fc'):
+            _init_linear(self.fc)
+
     def get_expert_distribution(self, x, task_features=None):
-        """
-        获取专家分配分布
-        
-        Parameters
-        ----------
-        x : torch.Tensor
-            输入张量
-        task_features : torch.Tensor, optional
-            任务特征，当router_type为'task_aware'时使用
-            
-        Returns
-        -------
-        torch.Tensor
-            专家分配分布
-        """
         batch_size = x.shape[0]
-        
-        # 提取输入特征进行路由
         x_flat = x.view(batch_size, -1, self.in_channels).mean(dim=1)
-        
-        # 获取专家分配分布
         if hasattr(self.router, 'get_expert_distribution'):
-            # 对于TaskAwareRouter
             return self.router.get_expert_distribution(x_flat, task_features)
         else:
-            # 对于基本Router，手动计算分布
             logits = self.router.router(x_flat)
             return F.softmax(logits, dim=-1)
-    
+
     def save_experts(self, save_dir):
-        """
-        保存每个专家模型到指定目录
-        
-        Parameters
-        ----------
-        save_dir : str
-            保存目录
-        """
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 保存每个专家
         for i, expert in enumerate(self.experts):
             expert_path = save_dir / f"expert_{i}.pt"
             torch.save(expert.state_dict(), expert_path)
-        
-        # 保存专家元数据
         metadata = {
             'num_experts': self.num_experts,
             'in_channels': self.in_channels,
@@ -1008,40 +877,20 @@ class MOEOperator(BaseModel, name='MOE'):
             'router_type': self.router_type
         }
         torch.save(metadata, save_dir / "metadata.pt")
-    
+
     def load_experts(self, load_dir):
-        """
-        从指定目录加载专家模型
-        
-        Parameters
-        ----------
-        load_dir : str
-            加载目录
-        """
         load_dir = Path(load_dir)
-        
-        # 验证目录存在
         if not load_dir.exists():
             raise ValueError(f"专家目录不存在: {load_dir}")
-        
-        # 加载元数据
         metadata_path = load_dir / "metadata.pt"
         if not metadata_path.exists():
             raise ValueError(f"元数据文件不存在: {metadata_path}")
-        
         metadata = torch.load(metadata_path)
-        
-        # 验证专家数量
         if metadata['num_experts'] != self.num_experts:
             raise ValueError(f"专家数量不匹配: 期望 {self.num_experts}，实际 {metadata['num_experts']}")
-        
-        # 加载每个专家
         for i, expert in enumerate(self.experts):
             expert_path = load_dir / f"expert_{i}.pt"
             if not expert_path.exists():
                 raise ValueError(f"专家文件不存在: {expert_path}")
-            
             expert.load_state_dict(torch.load(expert_path))
-        
         print(f"成功加载 {self.num_experts} 个专家模型")
-        

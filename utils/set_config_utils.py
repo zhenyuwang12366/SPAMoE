@@ -6,7 +6,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.seismic_moe_config import SeismicMOEConfig, SPECIFIC_TYPE_VARIANTS
 import neuralop.mpu.comm as comm
 from neuralop.training import setup
-from neuralop.utils import get_wandb_api_key, count_model_params
+from neuralop.utils import get_wandb_api_key
 
 _SPECIFIC_ALLOWED_FAMILIES = (
     set(SPECIFIC_TYPE_VARIANTS.keys()) |
@@ -41,6 +41,11 @@ def _build_runtime_context(
 def get_seismic_config(args: argparse.Namespace):
     # 加载配置
     config = SeismicMOEConfig()
+    if getattr(args, "model_name", None):
+        config.model_name = args.model_name
+    
+    if args.mode == 'train_encoder':
+        config.train_encoder = True
     
     # 更新配置
     # 代码解释：如果用户在命令行中传入了参数 --data_dir，那就用用户的这个路径；否则，就使用默认路径 "/data1/wuruoyu/waveform-inversion"。
@@ -65,18 +70,32 @@ def get_seismic_config(args: argparse.Namespace):
         # 设置默认数据目录为新路径
         config.data_dir = r"/root/autodl-tmp/FWINO/FWINO_data"
     config.output_dir = args.output_dir
+    if getattr(args, "log_root", None):
+        config.log_root = args.log_root
 
         #解释见onenote1
     if args.family:
         config.family = args.family
     if args.batch_size:
         config.batch_size = args.batch_size
+    if args.test_batch_size is not None:
+        config.test_batch_size = args.test_batch_size
     if args.epochs:
         config.epochs = args.epochs
     if args.learning_rate:
         config.learning_rate = args.learning_rate
     if args.hidden_channels:
         config.hidden_channels = args.hidden_channels
+    if args.n_train_samples is not None:
+        config.n_train_samples = args.n_train_samples
+    if args.n_test_samples is not None:
+        config.n_test_samples = args.n_test_samples
+    if args.channel_dim is not None:
+        config.channel_dim = args.channel_dim
+    if args.concat_channels is not None:
+        config.concat_channels = args.concat_channels
+    if args.mixed_precision is not None:
+        config.mixed_precision = args.mixed_precision
     if args.lr_warmup_epochs is not None:
         config.lr_warmup_epochs = args.lr_warmup_epochs
     if args.use_amp:
@@ -85,9 +104,9 @@ def get_seismic_config(args: argparse.Namespace):
     config.lr_warmup_method = args.lr_warmup_method
     config.lr_scheduler_type = args.lr_scheduler_type
     config.milestones = list(args.milestones)
-    if args.weight_decay:
+    if args.weight_decay is not None:
         config.weight_decay = args.weight_decay
-    if args.scheduler_gamma:
+    if args.scheduler_gamma is not None:
         config.scheduler_gamma = args.scheduler_gamma
     config.lr_cosine_tmax_epochs = args.lr_cosine_tmax_epochs
     config.lr_cosine_restart_t0_epochs = args.lr_cosine_restart_t0_epochs
@@ -95,6 +114,24 @@ def get_seismic_config(args: argparse.Namespace):
     config.lr_cosine_eta_min = args.lr_cosine_eta_min
     if args.accum_steps is not None:
         config.accum_steps = args.accum_steps
+    if args.use_onecycle is not None:
+        config.use_onecycle = args.use_onecycle
+    if args.early_stop:
+        config.early_stop = True
+    if args.use_encoder is not None:
+        config.use_encoder = args.use_encoder
+    if args.use_moe:
+        config.use_moe = True
+    if args.early_stop_patience is not None:
+        config.early_stop_patience = args.early_stop_patience
+    if args.early_stop_min_delta is not None:
+        config.early_stop_min_delta = args.early_stop_min_delta
+    if args.early_stop_warmup_epochs is not None:
+        config.early_stop_warmup_epochs = args.early_stop_warmup_epochs
+    if args.eval_interval is not None:
+        config.eval_interval = args.eval_interval
+    if args.verbose is not None:
+        config.verbose = args.verbose
   
     accum_steps = config.accum_steps
     use_amp = config.use_amp
@@ -154,23 +191,6 @@ def get_seismic_config(args: argparse.Namespace):
     # LNO config setting
     config.expert_configs[3]['n_modes'] = tuple(args.LNO_n_modes)
     config.expert_configs[3]['n_layers'] = args.LNO_n_layers
-    # GeoFNO config setting (index 4)
-    if len(config.expert_configs) > 4 and args.GeoFNO_modes1 is not None:
-        config.expert_configs[4]['modes1'] = args.GeoFNO_modes1
-    if len(config.expert_configs) > 4 and args.GeoFNO_modes2 is not None:
-        config.expert_configs[4]['modes2'] = args.GeoFNO_modes2
-    if len(config.expert_configs) > 4 and args.GeoFNO_n_fourier_layers is not None:
-        config.expert_configs[4]['n_fourier_layers'] = args.GeoFNO_n_fourier_layers
-    if len(config.expert_configs) > 4 and args.GeoFNO_code_dim is not None:
-        config.expert_configs[4]['code_dim'] = args.GeoFNO_code_dim
-    if len(config.expert_configs) > 4 and args.GeoFNO_s1 is not None:
-        config.expert_configs[4]['s1'] = args.GeoFNO_s1
-    if len(config.expert_configs) > 4 and args.GeoFNO_s2 is not None:
-        config.expert_configs[4]['s2'] = args.GeoFNO_s2
-    if len(config.expert_configs) > 4 and args.GeoFNO_width is not None:
-        config.expert_configs[4]['hc'] = args.GeoFNO_width
-    if len(config.expert_configs) > 4 and args.GeoFNO_is_mesh is not None:
-        config.expert_configs[4]['is_mesh'] = args.GeoFNO_is_mesh
     
     print(f'FNO:n_modes_height:{config.expert_configs[0]["n_modes_height"]}')
     print(f'FNO:n_modes_width:{config.expert_configs[0]["n_modes_width"]}')
@@ -225,14 +245,26 @@ def get_seismic_config(args: argparse.Namespace):
     # 设置损失函数加权系数
     config.lambda_g1v = args.lambda_g1v
     config.lambda_g2v = args.lambda_g2v
+    if hasattr(args, "lambda_grad") and args.lambda_grad is not None:
+        config.lambda_grad = args.lambda_grad
+    if hasattr(args, "lambda_ssim") and args.lambda_ssim is not None:
+        config.lambda_ssim = args.lambda_ssim
     if hasattr(args, "lambda_grad_l1"):
         config.lambda_grad_l1 = args.lambda_grad_l1
     if hasattr(args, "lambda_fourier_mag_l1"):
         config.lambda_fourier_mag_l1 = args.lambda_fourier_mag_l1
     
+    # 设置 MOE 模式
+    if hasattr(args, "moe_mode") and args.moe_mode:
+        config.moe_mode = args.moe_mode
+    
     # 设置路由形式
     if args.router_type:
         config.router_type = args.router_type
+    if hasattr(args, "router_hidden_dim") and args.router_hidden_dim is not None:
+        config.router_hidden_dim = args.router_hidden_dim
+    if hasattr(args, "noisy_gating") and args.noisy_gating is not None:
+        config.noisy_gating = args.noisy_gating
     
     # 设置专家组间融合方式
     if args.fusion_type:
@@ -247,14 +279,16 @@ def get_seismic_config(args: argparse.Namespace):
     # 设置强弱激活参数
     if args.beta:
         config.beta = args.beta
+    if args.use_gpu_proxy:
+        config.use_gpu_proxy = True
     
     # 设置细化种类
     if args.is_specific:
         config.is_specific = args.is_specific
     
     # 设置是否使用分组专家网络
-    if args.is_classier:
-        config.is_classier = args.is_classier
+    if args.is_classifier:
+        config.is_classifier = args.is_classifier
 
     # 设置速度类型数量（分类数）
     if hasattr(args, "v_type_num") and args.v_type_num is not None:

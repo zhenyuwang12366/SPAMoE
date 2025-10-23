@@ -25,3 +25,11 @@ python -m pdb scripts/train_seismic_moe.py \
   --choose_experts 1 \
   --wavelet_type db4 \
   --vis_freq 5
+
+240,726,96
+
+48, 726, 96*5=480 -- Linear --> 1000, 350
+
+5,1000,70
+
+1, 1000, 350

@@ -6,29 +6,28 @@ import optuna
 import os
 import sys
 import math
+import json
 import numpy as np
 import torch
 import torch.nn as nn
 from typing import Optional, Callable
 import tqdm
 from pathlib import Path
+from datetime import datetime
 from torch.nn.parallel import DistributedDataParallel as DDP
-
+import torch.nn.functional as F
 import wandb
 from torch.utils.data import DataLoader, random_split, Subset, DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms import Compose
-import transforms as T
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import scripts.transforms as T
 from neuralop.models import MOEOperator, ExpertFactory
 from neuralop.models.encoder import get_encoder
-# from neuralop.models.classifier import get_classifier
-from neuralop.training import setup
-from neuralop.data.datasets import SeismicDataset, create_seismic_dataloader
-from neuralop.utils import get_wandb_api_key, count_model_params
-from config.seismic_moe_config import SeismicMOEConfig
-import neuralop.mpu.comm as comm
+from neuralop.data.datasets import SeismicDataset
+from neuralop.utils import count_model_params
 from scripts.scheduler import (
     WarmupMultiStepLR,
     WarmupCosineLR,
@@ -36,8 +35,9 @@ from scripts.scheduler import (
 )
 from neuralop.losses import L1L2Loss, SobelLoss, FourierMag_L1
 from utils import *
- 
+
 print("-----------------------------------------------------------")
+
 
 def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     """
@@ -67,6 +67,8 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         family=config.family,
         is_specific=config.is_specific,
         split='train',
+        concat_channels=config.concat_channels,
+        config=config
     )
     
     # 分割数据集为训练集和验证集
@@ -219,21 +221,50 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         print(f"隐藏通道数: {config.hidden_channels}")
         print(f"专家数量: {len(config.expert_configs)}")
 
-    # 先构建 encoder，估计编码后张量的通道数用于 MoE
-    encoder_model = get_encoder(in_channels=1, out_channels=128, num_types=10)
-    if not config.is_classier and hasattr(encoder_model, "type_head"):
-        for p in encoder_model.type_head.parameters():
-            p.requires_grad_(False)
-    encoder_model.eval()
-    with torch.no_grad():
-        encoder_probe, _, _ = encoder_model(sample_batch['input'])
-    moe_in_channels = encoder_probe.shape[1]
-    del encoder_probe
-    encoder_model.train()
-    config.moe_in_channels = moe_in_channels
+    encoder_model = None
+    encoder_freeze = False
+    if config.use_encoder:
+        encoder_model = get_encoder(
+            in_channels=config.in_channels,
+            out_channels=128,
+            num_types=10
+        )
 
-    if is_logger:
-        print(f"Encoder 输出通道数(供 MoE 使用): {moe_in_channels}")
+        if getattr(args, "encoder_path", None):
+            missing, unexpected = load_encoder_weights(
+                encoder_model,
+                args.encoder_path,
+                map_location="cpu",
+                strict=False,
+            )
+            if is_logger:
+                print(f"[Encoder] 已从 {args.encoder_path} 加载预训练权重。")
+                if missing:
+                    print(f"[Encoder] 缺失参数: {missing}")
+                if unexpected:
+                    print(f"[Encoder] 未使用参数: {unexpected}")
+            for p in encoder_model.parameters():
+                p.requires_grad_(False)
+            encoder_freeze = True
+
+        encoder_model.eval()
+
+        with torch.no_grad():
+            encoder_probe, _, _ = encoder_model(sample_batch['input'])
+        moe_in_channels = encoder_probe.shape[1]
+        del encoder_probe
+        if encoder_freeze:
+            encoder_model.eval()
+        else:
+            encoder_model.train()
+        if is_logger:
+            print(f"Encoder 输出通道数(供 MoE 使用): {moe_in_channels}")
+    else:
+        moe_in_channels = config.in_channels
+        if is_logger:
+            print("[Encoder] use_encoder=False，直接将原始输入送入 MoE。")
+
+    config.moe_in_channels = moe_in_channels
 
     if config.use_moe and config.use_experts_path:
         experts = load_moe_experts(
@@ -266,34 +297,31 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         noisy_gating=config.noisy_gating,
         fusion_type=config.fusion_type,
         router_hidden_dim=config.router_hidden_dim,
+        moe_mode=getattr(config, "moe_mode", "standard"),
         is_logger=is_logger,
         router_type=config.router_type,
         s_processor_type = config.s_processor_type,
         w_processor_type = config.w_processor_type,
         beta = config.beta,
         is_specific = config.is_specific,
-        is_classier = config.is_classier,
+        is_classifier = config.is_classifier,
         batch_size=config.batch_size,
         v_type_num=config.v_type_num,
+        use_expert_memory_proxy=config.use_gpu_proxy
     )
 
     # 移动模型到设备
     if config.distributed.use_distributed:
-        encoder_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(encoder_model).to(device)
-        # classifier_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(classifier_model).to(device)
+        if encoder_model is not None:
+            encoder_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(encoder_model).to(device)
         moe_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(moe_model).to(device)
-        encoder_model = DDP(
-            encoder_model, device_ids=[device.index],
-            output_device=device.index,
-            static_graph=False,
-            find_unused_parameters=False,
-        )
-        # classifier_model = DDP(
-        #     classifier_model, device_ids=[device.index],
-        #     output_device=device.index,
-        #     static_graph=False,
-        #     find_unused_parameters=False,
-        # )
+        if encoder_model is not None:
+            encoder_model = DDP(
+                encoder_model, device_ids=[device.index],
+                output_device=device.index,
+                static_graph=False,
+                find_unused_parameters=False,
+            )
         trainable_model = DDP(
             moe_model, device_ids=[device.index],
             output_device=device.index,
@@ -302,12 +330,17 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             gradient_as_bucket_view=False,
         )
     else:
-        encoder_model = encoder_model.to(device)
-        # classifier_model = classifier_model.to(device)
+        if encoder_model is not None:
+            encoder_model = encoder_model.to(device)
         moe_model = moe_model.to(device)
         trainable_model = moe_model
     
     model = trainable_model
+
+    if encoder_model is not None and encoder_freeze:
+        encoder_model.eval()
+        if is_logger:
+            print("[Encoder] 已冻结 encoder 参数。")
  
     # Scale lr according to effective batch size
     if config.distributed.use_distributed and world_size > 2:
@@ -315,7 +348,11 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     else:
         lr = config.learning_rate
     optim_params = list(model.parameters())
-    optim_params += list(encoder_model.parameters())
+    encoder_requires_grad = False
+    if encoder_model is not None:
+        encoder_requires_grad = any(p.requires_grad for p in encoder_model.parameters())
+        if encoder_requires_grad:
+            optim_params += [p for p in encoder_model.parameters() if p.requires_grad]
     # optim_params += list(classifier_model.parameters())
     optimizer = torch.optim.AdamW(optim_params, lr=lr, betas=(0.9, 0.999), weight_decay=config.weight_decay)
     
@@ -363,58 +400,135 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     else:
         raise ValueError(f"Unsupported lr_scheduler_type: {scheduler_type}")
     
-    base_loss: Callable = L1L2Loss(config.lambda_g1v, config.lambda_g2v).to(device)
+    
     lambda_grad_l1 = float(getattr(config, "lambda_grad_l1", 0.0))
     lambda_fourier_mag_l1 = float(getattr(config, "lambda_fourier_mag_l1", 0.0))
+    lambda_ce = float(getattr(config, "lambda_ce", 0.0))
+    
+    base_loss: Callable = L1L2Loss(config.lambda_g1v, config.lambda_g2v).to(device)
     grad_loss_module = SobelLoss().to(device) if lambda_grad_l1 > 0 else None
     fourier_loss_module = FourierMag_L1().to(device) if lambda_fourier_mag_l1 > 0 else None
 
-    def criterion(pred: torch.Tensor, gt: torch.Tensor):
-        loss_dict = base_loss(pred, gt)
-        total_loss = loss_dict["loss"]
+    if config.train_encoder:
+        def criterion(pred: torch.Tensor, gt: torch.Tensor, logits: torch.Tensor, labels: torch.Tensor):
+            # ---- 基础 L1/L2 Loss ----
+            loss_dict = base_loss(pred, gt)
+            total_loss = loss_dict["loss"]
 
-        grad_val = pred.new_zeros(())
-        if grad_loss_module is not None:
-            grad_res = grad_loss_module(pred, gt)
-            grad_val = grad_res["loss"]
-            total_loss = total_loss + lambda_grad_l1 * grad_val
+            # ---- Gradient L1 ----
+            grad_val = pred.new_zeros(())
+            if grad_loss_module is not None:
+                grad_res = grad_loss_module(pred, gt)
+                grad_val = grad_res["loss"]
+                total_loss = total_loss + lambda_grad_l1 * grad_val
 
-        fourier_val = pred.new_zeros(())
-        if fourier_loss_module is not None:
-            fourier_res = fourier_loss_module(pred, gt)
-            fourier_val = fourier_res["loss"]
-            total_loss = total_loss + lambda_fourier_mag_l1 * fourier_val
+            # ---- Fourier Mag L1 ----
+            fourier_val = pred.new_zeros(())
+            if fourier_loss_module is not None:
+                fourier_res = fourier_loss_module(pred, gt)
+                fourier_val = fourier_res["loss"]
+                total_loss = total_loss + lambda_fourier_mag_l1 * fourier_val
 
-        combined = {
-            "loss": total_loss,
-            "l1": loss_dict["l1"],
-            "l2": loss_dict["l2"],
-            "grad_l1": grad_val.detach(),
-            "fourier_l1": fourier_val.detach(),
-        }
-        return combined
+            # ---- CrossEntropy Loss ----
+            ce_val = pred.new_zeros(())
+            if logits is not None and labels is not None:
+                ce_val = F.cross_entropy(logits, labels.long(), reduction="mean")
+                total_loss = total_loss + lambda_ce * ce_val
+
+            combined = {
+                "loss": total_loss,
+                "l1": loss_dict["l1"],
+                "l2": loss_dict["l2"],
+                "grad_l1": grad_val.detach(),
+                "fourier_l1": fourier_val.detach(),
+                "ce": ce_val.detach(),
+            }
+            return combined
+    else:
+        def criterion(pred: torch.Tensor, gt: torch.Tensor):
+            loss_dict = base_loss(pred, gt)
+            total_loss = loss_dict["loss"]
+
+            grad_val = pred.new_zeros(())
+            if grad_loss_module is not None:
+                grad_res = grad_loss_module(pred, gt)
+                grad_val = grad_res["loss"]
+                total_loss = total_loss + lambda_grad_l1 * grad_val
+
+            fourier_val = pred.new_zeros(())
+            if fourier_loss_module is not None:
+                fourier_res = fourier_loss_module(pred, gt)
+                fourier_val = fourier_res["loss"]
+                total_loss = total_loss + lambda_fourier_mag_l1 * fourier_val
+
+            combined = {
+                "loss": total_loss,
+                "l1": loss_dict["l1"],
+                "l2": loss_dict["l2"],
+                "grad_l1": grad_val.detach(),
+                "fourier_l1": fourier_val.detach(),
+            }
+            return combined
     
     # 损失函数
     # criterion = F.mse_loss  # 使用均方误差损失
-    
-    # 创建结果目录
-    results_dir = Path(config.output_dir) / f"seismic_moe_{config.family}"
+
+    def _slugify(text: str) -> str:
+        return "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in str(text))
+
+    run_group = _slugify(config.family or "all")
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_name_parts = [
+        _slugify(config.model_name or "model"),
+        f"router-{_slugify(config.router_type)}",
+        f"lr{config.learning_rate:g}",
+        f"bs{config.batch_size}",
+        _slugify(experts_name_str or "experts"),
+        timestamp,
+    ]
+    run_name = "_".join(part for part in run_name_parts if part)
+
+    output_root = Path(config.output_dir) / f"seismic_moe_{run_group}"
+    results_dir = output_root / run_name
+    log_file = results_dir / "training_log.txt"
+
+    tb_root = Path(getattr(config, "log_root", "./runs")).expanduser()
+    tb_dir = tb_root / run_group / run_name
+    tb_writer: Optional[SummaryWriter] = None
+
     if is_logger:
         results_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 训练日志
-    log_file = results_dir / "training_log.txt"
-    if is_logger:
-        with open(log_file, "w") as f:
-            f.write(f"    Epoch    |    Train Loss    |    Val Loss    |    MAE    |    MSE    |    PSNR    |\n")
-    
+        tb_dir.mkdir(parents=True, exist_ok=True)
+        tb_writer = SummaryWriter(log_dir=str(tb_dir))
+
+        config.experiment_dir = str(results_dir)
+        config.tensorboard_dir = str(tb_dir)
+
+        config_payload = config.to_dict() if hasattr(config, "to_dict") else vars(config)
+        with open(results_dir / "config.json", "w", encoding="utf-8") as f:
+            json.dump(config_payload, f, indent=2, default=str)
+        with open(results_dir / "args.json", "w", encoding="utf-8") as f:
+            json.dump(vars(args), f, indent=2, default=str)
+        
+        if config.train_encoder:
+            with open(log_file, "w", encoding="utf-8") as f:
+                f.write("    Epoch    |    Train Loss    |    Val Loss    |    MAE    |    MSE    |    PSNR    |    CE    |\n")
+        else:
+            with open(log_file, "w", encoding="utf-8") as f:
+                f.write("    Epoch    |    Train Loss    |    Val Loss    |    MAE    |    MSE    |    PSNR    |\n")
+    else:
+        config.experiment_dir = str(results_dir)
+        config.tensorboard_dir = str(tb_dir)
+
     # 最佳模型保存
     best_val_loss = float("inf")
     best_model_path = results_dir / f"best_model_{experts_name_str}.pt"
     best_expert_path = (results_dir / f"best_expert_{experts_name_str}.pt") if len(experts_name) == 1 else None
     last_model_path = results_dir / f"last_model_{experts_name_str}.pt"
     last_expert_path = (results_dir / f"last_expert_{experts_name_str}.pt") if len(experts_name) == 1 else None
-    
+    if config.train_encoder:
+        best_encoder_path = results_dir / f"best_encoder.pt"
+        last_encoder_path = results_dir / f"last_encoder.pt"
     # 指标计算器
     metrics = SeismicMetrics()
     
@@ -434,15 +548,17 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     # 记录参数数量
     if is_logger:
         moe_module = model.module if (config.distributed.use_distributed and hasattr(model, "module")) else model
-        encoder_module = encoder_model.module if (config.distributed.use_distributed and hasattr(encoder_model, "module")) else encoder_model
-        # classifier_module = classifier_model.module if (config.distributed.use_distributed and hasattr(classifier_model, "module")) else classifier_model
-
         moe_params = count_model_params(moe_module)
-        encoder_params = count_model_params(encoder_module)
-        # classifier_params = count_model_params(classifier_module)
+        encoder_params = 0
+        if encoder_model is not None:
+            encoder_module = encoder_model.module if (config.distributed.use_distributed and hasattr(encoder_model, "module")) else encoder_model
+            encoder_params = count_model_params(encoder_module)
         n_params = moe_params + encoder_params
         
-        print(f"模型参数数量: 总计 {n_params} (MoE {moe_params}, Encoder {encoder_params})")
+        if encoder_model is not None:
+            print(f"模型参数数量: 总计 {n_params} (MoE {moe_params}, Encoder {encoder_params})")
+        else:
+            print(f"模型参数数量: 总计 {n_params} (MoE {moe_params})")
         
         if args.use_wandb:
             wandb.log({"n_params": n_params})
@@ -459,14 +575,13 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             model.load_state_dict(checkpoint['model_state_dict'])
 
         encoder_state = checkpoint.get('encoder_state_dict')
-        if encoder_state is not None:
+        if encoder_model is not None and encoder_state is not None and not getattr(args, "encoder_path", None):
             encoder_target = encoder_model.module if (config.distributed.use_distributed and hasattr(encoder_model, "module")) else encoder_model
-            encoder_target.load_state_dict(encoder_state)
-
-        # classifier_state = checkpoint.get('classifier_state_dict')
-        # if classifier_state is not None:
-        #     classifier_target = classifier_model.module if (config.distributed.use_distributed and hasattr(classifier_model, "module")) else classifier_model
-        #     classifier_target.load_state_dict(classifier_state)
+            missing, unexpected = load_encoder_weights(encoder_target, encoder_state, strict=False)
+            if is_logger and (missing or unexpected):
+                print(f"[Encoder] Resume 加载缺失参数: {missing}, 多余参数: {unexpected}")
+        elif encoder_state is not None and getattr(args, "encoder_path", None) and is_logger:
+            print(f"[Encoder] 跳过从 resume checkpoint 加载 encoder，使用外部提供的 {args.encoder_path}。")
 
         # 加载优化器状态
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -494,736 +609,110 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     scaler = torch.amp.GradScaler(device=device, enabled=scaler_enabled)
     optimizer.zero_grad(set_to_none=True)
     REPORT_EVERY = max(1, getattr(args, "report_every", 5))
+    best_epoch_metrics = None
+    best_epoch_index = None
+
 #以上全是准备工作，下面是核心循环
-    # 训练循环
-    for epoch in range(start_epoch, config.epochs):
-        vis_now = (is_logger and ((epoch + 1) % args.vis_freq == 0))
-        stats, best_val_loss, stop_flag = train_one_epoch(
-            model=model,
-            encoder=encoder_model,
-            # classifier=classifier_model,
-            optimizer=optimizer,
-            criterion=criterion,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            device=device,
-            epoch=epoch,
-            config=config,
-            is_logger=is_logger,
-            log_file=log_file,
-            results_dir=results_dir,
-            lr_scheduler=lr_scheduler,
-            scheduler_step_mode=("per_step" if config.use_onecycle else "per_epoch"),
-            accum_steps=config.accum_steps,
-            vis_now=vis_now,
-            visualize_results=visualize_results,
-            input_inverse_transform=input_inverse_transform,
-            output_inverse_transform=output_inverse_transform,
-            use_wandb=args.use_wandb,
-            wandb_module=wandb if args.use_wandb else None,
-            early_stopper=early_stopper if config.early_stop else None,
-            best_val_loss=best_val_loss,
-            best_model_path=best_model_path,
-            best_expert_path=best_expert_path,
-            last_model_path=last_model_path,
-            last_expert_path=last_expert_path,
-            experts_name=experts_name,
-            experts_name_str=experts_name_str,
-            data_dict=data_dict,
-            metrics_module=metrics,
-            tqdm_module=tqdm,
-            profile_timing=args.profile_timing,
-            amp_enabled=amp_enabled,
-            amp_scaler=scaler,
-        )
+    try:
+        for epoch in range(start_epoch, config.epochs):
+            vis_now = (is_logger and ((epoch + 1) % args.vis_freq == 0))
+            stats, best_val_loss, stop_flag = train_one_epoch(
+                model=model,
+                encoder=encoder_model if encoder_model is not None else None,
+                # classifier=classifier_model,
+                optimizer=optimizer,
+                criterion=criterion,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                device=device,
+                epoch=epoch,
+                config=config,
+                is_logger=is_logger,
+                log_file=log_file,
+                results_dir=results_dir,
+                lr_scheduler=lr_scheduler,
+                scheduler_step_mode=("per_step" if config.use_onecycle else "per_epoch"),
+                accum_steps=config.accum_steps,
+                vis_now=vis_now,
+                input_inverse_transform=input_inverse_transform,
+                output_inverse_transform=output_inverse_transform,
+                use_wandb=args.use_wandb,
+                wandb_module=wandb if args.use_wandb else None,
+                early_stopper=early_stopper if config.early_stop else None,
+                best_val_loss=best_val_loss,
+                best_model_path=best_model_path,
+                best_expert_path=best_expert_path,
+                best_encoder_path=best_encoder_path,
+                last_model_path=last_model_path,
+                last_expert_path=last_expert_path,
+                last_encoder_path=last_encoder_path,
+                experts_name=experts_name,
+                experts_name_str=experts_name_str,
+                data_dict=data_dict,
+                metrics_module=metrics,
+                tqdm_module=tqdm,
+                profile_timing=args.profile_timing,
+                amp_enabled=amp_enabled,
+                amp_scaler=scaler,
+                encoder_frozen=not encoder_requires_grad,
+                train_encoder=config.train_encoder,
+                tb_writer=tb_writer,
+            )
 
-        # ====== 中间上报（仅 rank0 打印，供外层 Optuna 解析）======
-        # 注意：这里假设 stats["val_loss"] 已经做过 all_reduce 得到“全卡平均值”
+            if (
+                tb_writer is not None
+                and is_logger
+                and math.isfinite(stats.get("val_loss", float("inf")))
+                and math.isclose(stats.get("val_loss", float("inf")), best_val_loss, rel_tol=0.0, abs_tol=1e-8)
+            ):
+                best_epoch_metrics = dict(stats)
+                best_epoch_metrics["epoch"] = epoch + 1
+                best_epoch_index = epoch + 1
+
+            # ====== 中间上报（仅 rank0 打印，供外层 Optuna 解析）======
+            # 注意：这里假设 stats["val_loss"] 已经做过 all_reduce 得到“全卡平均值”
+            if is_logger:
+                cur_val = float(stats.get("val_loss", float("nan")))
+                # 满足：到达REPORT_EVERY、或最后一个epoch、或提前stop时，打印一次
+                if ((epoch + 1) % REPORT_EVERY == 0) or ((epoch + 1) == config.epochs) or (stop_flag == 1):
+                    print(f"REPORT:{cur_val}:{epoch+1}", flush=True)
+
+            # 可选：若内部早停信号触发，则跳出
+            if stop_flag == 1:
+                break
+
+        # ====== 训练结束：打印最终指标（仅 rank0）======
         if is_logger:
-            cur_val = float(stats.get("val_loss", float("nan")))
-            # 满足：到达REPORT_EVERY、或最后一个epoch、或提前stop时，打印一次
-            if ((epoch + 1) % REPORT_EVERY == 0) or ((epoch + 1) == config.epochs) or (stop_flag == 1):
-                print(f"REPORT:{cur_val}:{epoch+1}", flush=True)
+            # best_val_loss 为整个 trial 的最好验证损失（应已由 rank0 维护）
+            print(f"VAL_LOSS:{best_val_loss}", flush=True)
+            plot_loss_curve(log_file, save_path=results_dir / "loss_curve.png")
 
-        # 可选：若内部早停信号触发，则跳出
-        if stop_flag == 1:
-            break
-
-    # ====== 训练结束：打印最终指标（仅 rank0）======
-    if is_logger:
-        # best_val_loss 为整个 trial 的最好验证损失（应已由 rank0 维护）
-        print(f"VAL_LOSS:{best_val_loss}", flush=True)
-        plot_loss_curve(log_file, save_path=results_dir / "loss_curve.png")
+        if tb_writer is not None and is_logger:
+            hparam_summary = {
+                "family": str(config.family),
+                "router_type": str(config.router_type),
+                "learning_rate": float(config.learning_rate),
+                "batch_size": int(config.batch_size),
+                "top_k": int(getattr(config, "top_k", 1)),
+            }
+            metric_summary = {
+                "best/val_loss": float(best_val_loss),
+            }
+            if best_epoch_metrics is not None:
+                metric_summary.update({
+                    "best/train_loss": float(best_epoch_metrics.get("train_loss", float("nan"))),
+                    "best/psnr": float(best_epoch_metrics.get("psnr", float("nan"))),
+                    "best/mse": float(best_epoch_metrics.get("mse", float("nan"))),
+                    "best/mae": float(best_epoch_metrics.get("mae", float("nan"))),
+                    "best/epoch": float(best_epoch_index or 0),
+                })
+            tb_writer.add_hparams(hparam_summary, metric_summary)
+    finally:
+        if tb_writer is not None:
+            tb_writer.flush()
+            tb_writer.close()
 
     return model, best_val_loss
-
-def run_overfit_one_sample(args):
-    """
-    单样本过拟合：
-      - 仅取训练集中的一个样本（可用 --overfit_index 指定，默认0）
-      - 每个 epoch 重复该样本 steps_per_epoch 次
-      - 评价/可视化均在同一样本上进行（便于确认是否可完全拟合）
-    """
-    # ---------- 额外命令行参数的默认值 ----------
-    overfit_index     = getattr(args, "overfit_index", 0)
-    steps_per_epoch   = getattr(args, "steps_per_epoch", 64)  # 每个epoch重复次数
-    vis_freq          = getattr(args, "vis_freq", 5)
-    report_every      = max(1, getattr(args, "report_every", 5))
-
-    # ---------- 配置 & 设备 ----------
-    config = SeismicMOEConfig()
-    if getattr(args, "v_type_num", None) is not None:
-        config.v_type_num = args.v_type_num
-    elif not getattr(config, "v_type_num", None):
-        type_key = "specific" if config.is_specific else "normal"
-        mapped = config.type_id.get(type_key, {}) if hasattr(config, "type_id") else {}
-        if mapped:
-            config.v_type_num = len(mapped)
-    # 单样本过拟合默认禁用分布式，避免 sampler/drop_last 等边界问题
-    config.distributed.use_distributed = False
-    device, is_logger = setup(config)
-
-    if args.data_dir:
-        config.data_dir = args.data_dir
-    else:
-        config.data_dir = r"/root/autodl-tmp/FWINO/FWINO_data"
-
-    # 覆盖关键超参
-    if args.family:          config.family          = args.family
-    if args.batch_size:      config.batch_size      = args.batch_size
-    if args.epochs:          config.epochs          = args.epochs
-    if args.learning_rate:   config.learning_rate   = args.learning_rate
-    if args.hidden_channels: config.hidden_channels = args.hidden_channels
-    if args.weight_decay:    config.weight_decay    = args.weight_decay
-    if args.scheduler_gamma: config.scheduler_gamma = args.scheduler_gamma
-    if args.accum_steps is not None: config.accum_steps = args.accum_steps
-    if args.output_dir:      config.output_dir      = args.output_dir
-    if args.lambda_ssim:     config.lambda_ssim = args.lambda_ssim
-    if args.lambda_grad:     config.lambda_grad = args.lambda_grad
-    if getattr(args, "lambda_grad_l1", None) is not None:
-        config.lambda_grad_l1 = args.lambda_grad_l1
-    if getattr(args, "lambda_fourier_mag_l1", None) is not None:
-        config.lambda_fourier_mag_l1 = args.lambda_fourier_mag_l1
-    if getattr(args, "lambda_grad_l1", None) is not None:
-        config.lambda_grad_l1 = args.lambda_grad_l1
-    if getattr(args, "lambda_fourier_mag_l1", None) is not None:
-        config.lambda_fourier_mag_l1 = args.lambda_fourier_mag_l1
-    
-    # FNO / WNO / MNO / LNO 配置（与 run_training 一致）
-    config.expert_configs[0]['n_modes_height'] = args.FNO_n_modes_height
-    config.expert_configs[0]['n_modes_width']  = args.FNO_n_modes_width
-    config.expert_configs[0]['n_layers']       = args.FNO_n_layers
-
-    config.expert_configs[1]['n_levels_height'] = args.WNO_n_levels_height
-    config.expert_configs[1]['n_levels_width']  = args.WNO_n_levels_width
-    config.expert_configs[1]['n_layers']        = args.WNO_n_layers
-    config.expert_configs[1]['block_n_layers']  = args.WNO_block_n_layers
-    config.expert_configs[1]['dropout_rate']    = args.WNO_dropout_rate
-    config.expert_configs[1]['wavelet_type']    = args.wavelet_type
-    if(args.dtcwt_type):
-        config.expert_configs[1]['wavelet_type'] = args.dtcwt_type
-    if args.WNO_pad_mode:
-        config.expert_configs[1]['pad_mode'] = args.WNO_pad_mode
-    if args.WNO_ensure_even_shapes is not None:
-        config.expert_configs[1]['ensure_even_shapes'] = args.WNO_ensure_even_shapes
-    if args.WNO_adaptive_padding is not None:
-        config.expert_configs[1]['adaptive_padding'] = args.WNO_adaptive_padding
-    if args.WNO_use_channel_mlp is not None:
-        config.expert_configs[1]['use_channel_mlp'] = args.WNO_use_channel_mlp
-    if args.WNO_channel_mlp_dropout is not None:
-        config.expert_configs[1]['channel_mlp_dropout'] = args.WNO_channel_mlp_dropout
-    if args.WNO_channel_mlp_expansion is not None:
-        config.expert_configs[1]['channel_mlp_expansion'] = args.WNO_channel_mlp_expansion
-
-    config.expert_configs[2]['n_scales']       = args.MNO_n_scales
-    config.expert_configs[2]['scale_factors']  = args.MNO_scale_factors
-    config.expert_configs[2]['n_layers']       = args.MNO_n_layers
-
-    config.expert_configs[3]['n_modes']        = tuple(args.LNO_n_modes)
-    config.expert_configs[3]['n_layers']       = args.LNO_n_layers
-
-    # 选择专家
-    config.top_k = args.top_k
-    config.expert_configs = [config.expert_configs[i] for i in args.choose_experts]
-    experts_name = []
-    for idx, ec in enumerate(config.expert_configs):
-        experts_name.append(f"{ec.get('domain_type', ec.get('type','exp'))}_{args.choose_experts[idx]}")
-    experts_name_str = "_".join(experts_name)
-
-    # Loss 权重
-    config.lambda_g1v = args.lambda_g1v
-    config.lambda_g2v = args.lambda_g2v
-    if getattr(args, "lambda_grad_l1", None) is not None:
-        config.lambda_grad_l1 = args.lambda_grad_l1
-    if getattr(args, "lambda_fourier_mag_l1", None) is not None:
-        config.lambda_fourier_mag_l1 = args.lambda_fourier_mag_l1
-    if getattr(args, "lambda_grad_l1", None) is not None:
-        config.lambda_grad_l1 = args.lambda_grad_l1
-    if getattr(args, "lambda_fourier_mag_l1", None) is not None:
-        config.lambda_fourier_mag_l1 = args.lambda_fourier_mag_l1
-
-    # MoE 路由/融合
-    if args.router_type:     config.router_type = args.router_type
-    if args.fusion_type:     config.fusion_type = args.fusion_type
-    if args.s_processor_type: config.s_processor_type = args.s_processor_type
-    if args.w_processor_type: config.w_processor_type = args.w_processor_type
-    if args.beta:            config.beta = args.beta
-    if args.is_specific:     config.is_specific = True
-    if args.is_classier:     config.is_classier = True
-
-    if getattr(args, "v_type_num", None) is not None:
-        config.v_type_num = args.v_type_num
-    elif not getattr(config, "v_type_num", None):
-        type_key = "specific" if config.is_specific else "normal"
-        mapped = config.type_id.get(type_key, {}) if hasattr(config, "type_id") else {}
-        if mapped:
-            config.v_type_num = len(mapped)
-
-    # ---------- 数据 ----------
-    full_dataset = SeismicDataset(
-        data_dir=config.data_dir,
-        family=config.family,
-        is_specific=config.is_specific,
-        split='train',
-    )
-    if is_logger:
-        print(f"[Overfit] full train size = {len(full_dataset)}; use index = {overfit_index}")
-
-    # 取单一样本
-    if not (0 <= overfit_index < len(full_dataset)):
-        raise IndexError(f"--overfit_index 越界：{overfit_index} / {len(full_dataset)-1}")
-    single_raw = Subset(full_dataset, [overfit_index])
-
-    # 统计（用于归一化/反归一化）
-    data_dict = full_dataset.getStats()
-
-    # 变换（与 run_training 完全一致）
-    from neuralop.data.datasets.seismic_dataset import SeismicDataProcessor
-    input_transform = Compose([
-        T.LogTransform(k=args.k),
-        T.MinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k),
-                          T.log_transform(data_dict['input_max'], k=args.k))
-    ])
-    output_transform = Compose([
-        T.MinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
-    ])
-    input_inverse_transform = Compose([
-        T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k),
-                                 T.log_transform(data_dict['input_max'], k=args.k)),
-        T.InverseLogTransform(k=args.k)
-    ])
-    output_inverse_transform = Compose([
-        T.InverseMinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
-    ])
-    data_processor = SeismicDataProcessor(
-        input_transform=input_transform,
-        output_transform=output_transform,
-        channel_dim=config.channel_dim
-    )
-    single_ds = TransformedSubset(single_raw, data_processor)  # len==1
-
-    # —— 定义“重复同一条样本”的数据集 —— #
-    class RepeatSingleDataset(torch.utils.data.Dataset):
-        def __init__(self, base_subset: TransformedSubset, times_per_epoch):
-            assert len(base_subset) == 1
-            self.base = base_subset
-            self.times = int(times_per_epoch)
-
-        def __len__(self):
-            return self.times
-
-        def __getitem__(self, idx):
-            # 返回同一个样本的深拷贝，避免 in-place 污染
-            sample = self.base.__getitems__([0])[0]
-            return {
-                'input':  sample['input'].clone(),
-                'output': sample['output'].clone(),
-                'idx':    torch.tensor([int(sample.get('idx', 0))])
-            }
-
-    train_dataset = RepeatSingleDataset(single_ds, steps_per_epoch)
-    val_dataset   = single_ds  # 评估也用同一条
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-        persistent_workers=False
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-        persistent_workers=False
-    )
-
-    # 输入通道
-    sample_batch = next(iter(train_loader))
-    config.in_channels = sample_batch['input'].shape[1]
-    if is_logger:
-        print(f"[Overfit] in_channels={config.in_channels}, out_channels={config.out_channels}, hidden={config.hidden_channels}")
-
-    # ---------- 模型 ----------
-    if getattr(args, "use_moe", False) and getattr(args, "use_experts_path", None):
-        experts = load_moe_experts(
-            experts_config=config.expert_configs,
-            in_channels=config.in_channels,
-            out_channels=config.out_channels,
-            hidden_channels=config.hidden_channels,
-            model_path=args.use_experts_path,
-            is_specific=False,
-            map_location=device,
-            type_dict=config.type_id
-        )
-    else:
-        experts = ExpertFactory.create_expert_ensemble(
-            expert_configs=config.expert_configs,
-            in_channels=config.in_channels,
-            out_channels=config.out_channels,
-            hidden_channels=config.hidden_channels
-        )
-
-    model = MOEOperator(
-        experts=experts,
-        in_channels=config.in_channels,
-        out_channels=config.out_channels,
-        hidden_channels=config.hidden_channels,
-        top_k=config.top_k,
-        noisy_gating=config.noisy_gating,
-        fusion_type=config.fusion_type,
-        router_hidden_dim=config.router_hidden_dim,
-        is_logger=is_logger,
-        router_type=config.router_type,
-        s_processor_type=config.s_processor_type,
-        w_processor_type=config.w_processor_type,
-        beta=config.beta,
-        is_specific=config.is_specific,
-        is_classier=config.is_classier,
-        v_type_num=config.v_type_num,
-    ).to(device)
-
-    # ---------- 优化器 & 调度 & 损失 ----------
-    lr = config.learning_rate
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=config.weight_decay)
-
-    # 仍复用 WarmupMultiStepLR（以 step 计）
-    warmup_iters = int(max(1, config.lr_warmup_epochs) * len(train_loader))
-    lr_milestones = [len(train_loader) * m for m in getattr(config, "milestones", [30, 60, 90])]
-    lr_scheduler = WarmupMultiStepLR(
-        optimizer, milestones=lr_milestones, gamma=config.scheduler_gamma,
-        warmup_iters=warmup_iters, warmup_factor=1e-5
-    )
-
-    criterion: Callable = L1L2Loss()
-
-    # ---------- 目录 / 日志 ----------
-    results_dir = Path(config.output_dir) / f"overfit1_{config.family}"
-    if is_logger:
-        results_dir.mkdir(parents=True, exist_ok=True)
-    log_file = results_dir / "training_log.txt"
-    if is_logger:
-        with open(log_file, "w") as f:
-            f.write(f"    Epoch    |    Train Loss    |    Val Loss    |    MAE    |    MSE    |    PSNR    |\n")
-
-    best_val_loss = float("inf")
-    best_model_path = results_dir / f"best_model_{experts_name_str}.pt"
-    best_expert_path = (results_dir / f"best_expert_{experts_name_str}.pt") if len(experts_name)==1 else None
-    last_model_path = results_dir / f"last_model_{experts_name_str}.pt"
-    last_expert_path = (results_dir / f"last_expert_{experts_name_str}.pt") if len(experts_name)==1 else None
-
-    metrics = SeismicMetrics()
-
-    amp_enabled = bool(config.use_amp) and device.type == 'cuda'
-    scaler = torch.amp.GradScaler(device=device, enabled=amp_enabled)
-
-    # ---------- 训练循环（沿用你封装的 train_one_epoch） ----------
-    for epoch in range(config.epochs):
-        vis_now = (is_logger and ((epoch + 1) % vis_freq == 0))
-        stats, best_val_loss, stop_flag = train_one_epoch(
-            model=model,
-            optimizer=optimizer,
-            criterion=criterion,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            device=device,
-            epoch=epoch,
-            config=config,
-            is_logger=is_logger,
-            log_file=log_file,
-            results_dir=results_dir,
-            lr_scheduler=lr_scheduler,
-            scheduler_step_mode="per_step",   # 以 step 计
-            accum_steps=config.accum_steps,
-            vis_now=vis_now,
-            visualize_results=visualize_results,
-            input_inverse_transform=input_inverse_transform,
-            output_inverse_transform=output_inverse_transform,
-            use_wandb=False,
-            wandb_module=None,
-            early_stopper=None,               # overfit 不早停
-            best_val_loss=best_val_loss,
-            best_model_path=best_model_path,
-            best_expert_path=best_expert_path,
-            last_model_path=last_model_path,
-            last_expert_path=last_expert_path,
-            experts_name=experts_name,
-            experts_name_str=experts_name_str,
-            data_dict=data_dict,
-            metrics_module=metrics,
-            tqdm_module=tqdm,
-            profile_timing=False,
-            amp_enabled=amp_enabled,
-            amp_scaler=scaler,
-        )
-
-        if is_logger:
-            cur_val = float(stats.get("val_loss", float("nan")))
-            if ((epoch + 1) % report_every == 0) or ((epoch + 1) == config.epochs):
-                print(f"REPORT:{cur_val}:{epoch+1}", flush=True)
-
-    if is_logger:
-        print(f"VAL_LOSS:{best_val_loss}", flush=True)
-        plot_loss_curve(log_file, save_path=results_dir / "loss_curve.png")
-
-    print(f"[Overfit] 完成。最佳模型保存在：{best_model_path}")
-
-def run_overfit_one_sample_test(args):
-    """
-    单样本过拟合：用训练集中的 1 个样本训练到极低误差。
-    - 损失：L1 + Sobel梯度一致性(逐步加权) + 极小MSE(仅稳定/提升PSNR)
-    - 评估：PSNR(反归一化)、corr(pred,input)、grad_norm、LR 变化等
-    """
-    import copy
-    from itertools import cycle
-    import torch.nn.functional as F
-    from neuralop.training.torch_setup import setup as setup_env
-    from neuralop.data.datasets.seismic_dataset import SeismicDataProcessor
-
-    # ---------- 配置 & 设备 ----------
-    config = SeismicMOEConfig()
-    if getattr(args, "v_type_num", None) is not None:
-        config.v_type_num = args.v_type_num
-    elif not getattr(config, "v_type_num", None):
-        type_key = "specific" if config.is_specific else "normal"
-        mapped = config.type_id.get(type_key, {}) if hasattr(config, "type_id") else {}
-        if mapped:
-            config.v_type_num = len(mapped)
-    # 单样本过拟合默认禁用分布式，避免 sampler/drop_last 等边界问题
-    config.distributed.use_distributed = False
-    device, is_logger = setup(config)
-
-    if args.data_dir:
-        config.data_dir = args.data_dir
-    else:
-        config.data_dir = r"/root/autodl-tmp/FWINO/FWINO_data"
-
-    # 覆盖关键超参
-    if args.family:          config.family          = args.family
-    if args.batch_size:      config.batch_size      = args.batch_size
-    if args.epochs:          config.epochs          = args.epochs
-    if args.learning_rate:   config.learning_rate   = args.learning_rate
-    if args.hidden_channels: config.hidden_channels = args.hidden_channels
-    if args.weight_decay:    config.weight_decay    = args.weight_decay
-    if args.scheduler_gamma: config.scheduler_gamma = args.scheduler_gamma
-    if args.accum_steps is not None: config.accum_steps = args.accum_steps
-    if args.output_dir:      config.output_dir      = args.output_dir
-    if args.lambda_ssim:     config.lambda_ssim = args.lambda_ssim
-    if args.lambda_grad:     config.lambda_grad = args.lambda_grad
-    
-    # FNO / WNO / MNO / LNO 配置（与 run_training 一致）
-    config.expert_configs[0]['n_modes_height'] = args.FNO_n_modes_height
-    config.expert_configs[0]['n_modes_width']  = args.FNO_n_modes_width
-    config.expert_configs[0]['n_layers']       = args.FNO_n_layers
-
-    config.expert_configs[1]['n_levels_height'] = args.WNO_n_levels_height
-    config.expert_configs[1]['n_levels_width']  = args.WNO_n_levels_width
-    config.expert_configs[1]['n_layers']        = args.WNO_n_layers
-    config.expert_configs[1]['block_n_layers']  = args.WNO_block_n_layers
-    config.expert_configs[1]['dropout_rate']    = args.WNO_dropout_rate
-    config.expert_configs[1]['wavelet_type']    = args.wavelet_type
-    if(args.dtcwt_type):
-        config.expert_configs[1]['wavelet_type'] = args.dtcwt_type
-    if args.WNO_pad_mode:
-        config.expert_configs[1]['pad_mode'] = args.WNO_pad_mode
-    if args.WNO_ensure_even_shapes is not None:
-        config.expert_configs[1]['ensure_even_shapes'] = args.WNO_ensure_even_shapes
-    if args.WNO_adaptive_padding is not None:
-        config.expert_configs[1]['adaptive_padding'] = args.WNO_adaptive_padding
-    if args.WNO_use_channel_mlp is not None:
-        config.expert_configs[1]['use_channel_mlp'] = args.WNO_use_channel_mlp
-    if args.WNO_channel_mlp_dropout is not None:
-        config.expert_configs[1]['channel_mlp_dropout'] = args.WNO_channel_mlp_dropout
-    if args.WNO_channel_mlp_expansion is not None:
-        config.expert_configs[1]['channel_mlp_expansion'] = args.WNO_channel_mlp_expansion
-
-    config.expert_configs[2]['n_scales']       = args.MNO_n_scales
-    config.expert_configs[2]['scale_factors']  = args.MNO_scale_factors
-    config.expert_configs[2]['n_layers']       = args.MNO_n_layers
-
-    config.expert_configs[3]['n_modes']        = tuple(args.LNO_n_modes)
-    config.expert_configs[3]['n_layers']       = args.LNO_n_layers
-
-    # 选择专家
-    config.top_k = args.top_k
-    config.expert_configs = [config.expert_configs[i] for i in args.choose_experts]
-    experts_name = []
-    for idx, ec in enumerate(config.expert_configs):
-        experts_name.append(f"{ec.get('domain_type', ec.get('type','exp'))}_{args.choose_experts[idx]}")
-    experts_name_str = "_".join(experts_name)
-
-    # Loss 权重
-    config.lambda_g1v = args.lambda_g1v
-    config.lambda_g2v = args.lambda_g2v
-
-    # MoE 路由/融合
-    if args.router_type:     config.router_type = args.router_type
-    if args.fusion_type:     config.fusion_type = args.fusion_type
-    if args.s_processor_type: config.s_processor_type = args.s_processor_type
-    if args.w_processor_type: config.w_processor_type = args.w_processor_type
-    if args.beta:            config.beta = args.beta
-    if args.is_specific:     config.is_specific = True
-    if args.is_classier:     config.is_classier = True
-
-    if getattr(args, "v_type_num", None) is not None:
-        config.v_type_num = args.v_type_num
-    elif not getattr(config, "v_type_num", None):
-        type_key = "specific" if config.is_specific else "normal"
-        mapped = config.type_id.get(type_key, {}) if hasattr(config, "type_id") else {}
-        if mapped:
-            config.v_type_num = len(mapped)
-
-    # 设备/日志开关（与主训练一致）
-    torch.manual_seed(args.seed); np.random.seed(args.seed)
-    device, is_logger = setup_env(config)
-
-    # 结果与日志
-    results_dir = Path(args.output_dir) / f"overfit1_{experts_name}"
-    results_dir.mkdir(parents=True, exist_ok=True)
-    log_file = results_dir / "training_log.txt"
-    with open(log_file, "w") as f:
-        f.write("Epoch,Total,L1,Grad,MSE_mon,PSNR_inv,Corr,GradNorm,LR,w_grad\n")
-
-    # ===== 1) 数据与相同变换 =====
-    full_dataset = SeismicDataset(
-        data_dir=config.data_dir, 
-        family=config.family, 
-        split='train',
-        is_specific=config.is_specific,
-    )
-    data_dict = full_dataset.getStats()
-
-    input_transform = Compose([
-        T.LogTransform(k=args.k),
-        T.MinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k),
-                          T.log_transform(data_dict['input_max'], k=args.k))
-    ])
-    output_transform = Compose([
-        T.MinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
-    ])
-    input_inverse_transform = Compose([
-        T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k),
-                                 T.log_transform(data_dict['input_max'], k=args.k)),
-        T.InverseLogTransform(k=args.k)
-    ])
-    output_inverse_transform = Compose([
-        T.InverseMinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
-    ])
-    data_processor = SeismicDataProcessor(
-        input_transform=input_transform,
-        output_transform=output_transform,
-        channel_dim=config.channel_dim
-    )
-
-    # 取一个样本（你可改 one_idx）
-    one_idx = 0
-    sample = data_processor(full_dataset[one_idx])
-
-    class OneSampleDataset(torch.utils.data.Dataset):
-        def __init__(self, s): self.s = s
-        def __len__(self): return 1
-        def __getitem__(self, i): return self.s
-
-    train_loader = DataLoader(OneSampleDataset(sample), batch_size=1, shuffle=False, num_workers=0)
-    loader_iter = cycle(train_loader)
-
-    # ===== 2) 模型构建 =====
-    config.in_channels = sample['input'].shape[0]
-    if getattr(args, "use_moe", False) and args.use_experts_path:
-        experts = load_moe_experts(
-            expert_configs=config.expert_configs,
-            in_channels=config.in_channels,
-            out_channels=config.out_channels,
-            hidden_channels=config.hidden_channels,
-            model_path=args.use_experts_path
-        )
-        # 如需解冻专家训练，取消下面注释
-        # for e in experts:
-        #     for p in e.parameters(): p.requires_grad = True
-    else:
-        experts = ExpertFactory.create_expert_ensemble(
-            expert_configs=config.expert_configs,
-            in_channels=config.in_channels,
-            out_channels=config.out_channels,
-            hidden_channels=config.hidden_channels
-        )
-
-    model = MOEOperator(
-        experts=experts,
-        in_channels=config.in_channels,
-        out_channels=config.out_channels,
-        hidden_channels=config.hidden_channels,
-        top_k=config.top_k,
-        noisy_gating=config.noisy_gating,
-        fusion_type=config.fusion_type,
-        router_hidden_dim=config.router_hidden_dim,
-        v_type_num=config.v_type_num
-    ).to(device)
-
-    # ===== 3) 优化器/调度/损失 =====
-    # 单样本建议 LR=1e-3 起步；如想严格沿用传参，保留 config.learning_rate
-    lr = max(1e-3, float(config.learning_rate))
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=0.0)
-    sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=50)
-
-    def sobel_grad(x):
-        kx = torch.tensor([[1,0,-1],[2,0,-2],[1,0,-1]], dtype=x.dtype, device=x.device).view(1,1,3,3)
-        ky = torch.tensor([[1,2,1],[0,0,0],[-1,-2,-1]], dtype=x.dtype, device=x.device).view(1,1,3,3)
-        gx = F.conv2d(x, kx, padding=1); gy = F.conv2d(x, ky, padding=1)
-        return gx, gy
-
-    def grad_loss_sobel(pred, gt):
-        gx1, gy1 = sobel_grad(pred); gx2, gy2 = sobel_grad(gt)
-        return (gx1-gx2).abs().mean() + (gy1-gy2).abs().mean()
-
-    def criterion(pred, gt, epoch):
-        # 梯度项权重：每50个epoch增加0.05，上限0.25；MSE只给很小权重稳态
-        w_g = min(0.25, 0.05 * (epoch // 50))
-        loss_l1 = F.l1_loss(pred, gt)
-        loss_g  = grad_loss_sobel(pred, gt)
-        loss_m  = F.mse_loss(pred, gt) * 0.05
-        total   = loss_l1 + w_g*loss_g + loss_m
-        return {
-            "total": total, 
-            "loss_l1": loss_l1.detach(), 
-            "loss_g": loss_g.detach(), 
-            "w_g": w_g,
-        }
-
-    def psnr_after_inv(pred, tgt):
-        p = output_inverse_transform(pred.detach().cpu())
-        t = output_inverse_transform(tgt.detach().cpu())
-        mse_val = F.mse_loss(p, t).item()
-        if mse_val <= 1e-12: return 99.0
-        tmax, tmin = t.max().item(), t.min().item()
-        MAX = max(abs(tmax), abs(tmin), 1.0)
-        return 10.0 * np.log10((MAX*MAX) / mse_val)
-
-    def corr_pred_input(pred, inp):
-        # 输入降维至输出分辨率后计算相关
-        x = inp.mean(dim=1, keepdim=True) if inp.dim()==4 else inp
-        x = F.interpolate(x, size=pred.shape[-2:], mode='bilinear', align_corners=False)
-        p = pred.detach().flatten(); q = x.detach().flatten()
-        p = p - p.mean(); q = q - q.mean()
-        return (p*q).sum().item() / (p.norm().item()*q.norm().item() + 1e-8)
-
-    # ===== 4) 训练循环 =====
-    MAX_EPOCHS = max(2000, args.epochs or 500)
-    EARLY_PATIENCE = 100
-    best_total = float('inf')
-    best_state = None
-    bad = 0
-
-    for epoch in range(1, MAX_EPOCHS+1):
-        model.train()
-        batch = next(loader_iter)
-        inp = batch['input'].to(device)   # [1,C,T,R]
-        tgt = batch['output'].to(device)  # [1,1,H,W]
-        assert inp.dim()==4 and tgt.dim()==4, f"Bad shapes: inp={tuple(inp.shape)}, tgt={tuple(tgt.shape)}"
-        if epoch == 1:
-            print(f"[overfit1] inp: {tuple(inp.shape)} (expect [1,C,T,R]) | tgt: {tuple(tgt.shape)} (expect [1,1,H,W])")
-
-        opt.zero_grad(set_to_none=True)
-        pred, _ = model(inp)
-        loss_dict = criterion(pred, tgt, epoch)
-
-        total = loss_dict["total"]
-        
-        # 非有限守护
-        if not torch.isfinite(total):
-            print(f"[overfit1] non-finite loss at epoch {epoch}: {total.item()}")
-            break
-
-        total.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-
-        # 指标统计
-        with torch.no_grad():
-            mae_val  = float(loss_dict["loss_l1"].item())
-            grad_val = float(loss_dict["loss_g"].item())
-            mse_mon  = float(F.mse_loss(pred, tgt).item())  # 仅记录
-            psnr_val = float(psnr_after_inv(pred, tgt))
-            corr_val = float(corr_pred_input(pred, inp))
-
-        # 调度器（用 L1 更稳定）
-        old_lr = opt.param_groups[0]['lr']
-        sch.step(mae_val)
-        new_lr = opt.param_groups[0]['lr']
-        if new_lr != old_lr:
-            print(f"[LR] {old_lr:.2e} → {new_lr:.2e}")
-
-        # 保存最优（以 total 为准）
-        improved = total.item() < best_total - 1e-10
-        if improved:
-            best_total = total.item()
-            best_state = {
-                k: (v.detach().cpu().clone() if torch.is_tensor(v) else copy.deepcopy(v))
-                for k, v in model.state_dict().items()
-            }
-            bad = 0
-        else:
-            bad += 1
-
-        if epoch % 10 == 0 or epoch == 1:
-            print(f"[overfit1 {epoch:04d}] Total={total.item():.6f} | L1={mae_val:.6f} | Grad={grad_val:.6f} "
-                  f"| MSE(mon)={mse_mon:.6f} | PSNR(inv)={psnr_val:.3f} | corr={corr_val:.3f} "
-                  f"| grad_norm={grad_norm:.3e} | lr={new_lr:.2e} | w_g={loss_dict['w_g']:.3f}")
-
-        with open(log_file, "a") as f:
-            f.write(f"{epoch},{total.item():.6f},{mae_val:.6f},{grad_val:.6f},{mse_mon:.6f},"
-                    f"{psnr_val:.3f},{corr_val:.3f},{grad_norm:.3e},{new_lr:.2e},{loss_dict['w_g']:.3f}\n")
-
-        if bad >= EARLY_PATIENCE:
-            print(f"Early stop at epoch {epoch}, best Total={best_total:.6e}")
-            break
-
-    # ===== 5) 保存最佳与可视化 =====
-    if best_state is not None:
-        model.load_state_dict(best_state)
-        torch.save(best_state, results_dir / f"best_overfit1_{experts_name}.pt")
-
-    model.eval()
-    with torch.no_grad():
-        pred, _ = model(inp)
-        pred_inv = output_inverse_transform(pred.detach().cpu())
-        tgt_inv  = output_inverse_transform(tgt.detach().cpu())
-        inp_inv  = input_inverse_transform(inp.detach().cpu())
-
-        np.save(results_dir/'pred_overfit_inv.npy', pred_inv.numpy())
-        np.save(results_dir/'tgt_overfit_inv.npy',  tgt_inv.numpy())
-
-        visualize_results(
-            inputs=inp_inv,
-            targets=tgt_inv,
-            predictions=pred_inv,
-            save_dir=str(results_dir / "vis")
-        )
-
-    print(f"[overfit1] Done. Artifacts saved at: {results_dir.resolve()}")
 
 # 定义一个TransformedSubset类，用于对Subset应用变换
 class TransformedSubset(Subset):
@@ -1268,7 +757,7 @@ class TransformedSubset(Subset):
 
 def run_inference(args):
     """
-    使用训练好的模型进行推理
+    使用训练好的模型进行推理，推理前向流程与训练保持一致
     
     Parameters
     ----------
@@ -1278,118 +767,204 @@ def run_inference(args):
     # 验证模型路径
     if not os.path.exists(args.model_path):
         raise ValueError(f"模型文件不存在: {args.model_path}")
-    
-    # 加载模型
+
+    # 加载模型 checkpoint
     checkpoint = torch.load(args.model_path, map_location='cpu')
-    
-    # 获取归一化参数
     data_dict = checkpoint['data_dict']
-    
-    # 加载配置
-    config = SeismicMOEConfig()
-    if getattr(args, "v_type_num", None) is not None:
-        config.v_type_num = args.v_type_num
-    elif not getattr(config, "v_type_num", None):
-        type_key = "specific" if config.is_specific else "normal"
-        mapped = config.type_id.get(type_key, {}) if hasattr(config, "type_id") else {}
-        if mapped:
-            config.v_type_num = len(mapped)
+
+    # 构建与训练一致的配置
+    config, runtime_ctx = get_seismic_config(args)
+    device = runtime_ctx["device"]
+    is_logger = runtime_ctx["is_logger"]
+
     if args.data_dir:
         config.data_dir = args.data_dir
-    else:
-        # 设置默认数据目录为新路径
-        config.data_dir = "/data1/wuruoyu/waveform-inversion"
-    
-    # 检查测试目录是否存在
+
     test_dir = os.path.join(config.data_dir, 'test')
     if not os.path.exists(test_dir):
         raise ValueError(f"测试目录不存在: {test_dir}")
-    
-    # 设置设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"使用设备: {device}")
-    
+
+    # 数据预处理，与训练保持一致
+    from neuralop.data.datasets.seismic_dataset import SeismicDataProcessor
+
     input_transform = Compose([
         T.LogTransform(k=args.k),
-        T.MinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k))
-    ]) # data
-    
+        T.MinMaxNormalize(
+            T.log_transform(data_dict['input_min'], k=args.k),
+            T.log_transform(data_dict['input_max'], k=args.k),
+        )
+    ])
     output_inverse_transform = Compose([
         T.InverseMinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
     ])
-    
-    # 创建测试数据集
-    test_loader, test_dataset = create_seismic_dataloader(
+
+    data_processor = SeismicDataProcessor(
+        channel_dim=config.channel_dim,
+        input_transform=input_transform,
+        output_transform=None,
+        config=config,
+    )
+
+    # 创建测试数据集并应用与训练相同的变换
+    test_dataset = SeismicDataset(
         data_dir=config.data_dir,
-        family='all',  # 测试时使用所有数据
+        family=config.family or 'all',
+        is_specific=config.is_specific,
         split='test',
-        batch_size=args.batch_size or 4,
+        concat_channels=config.concat_channels,
+        config=config
+    )
+    test_dataset = TransformedSubset(test_dataset, data_processor)
+
+    test_batch_size = args.batch_size or getattr(config, "test_batch_size", None) or 4
+    num_workers = max(0, args.num_workers)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=test_batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        input_transform=input_transform
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=num_workers > 0,
     )
-    
-    # 获取实际的输入通道数
+
+    if len(test_loader) == 0:
+        raise RuntimeError("测试数据加载器为空，请检查数据集设置。")
+
     sample_batch = next(iter(test_loader))
-    in_channels = sample_batch['input'].shape[1]
-    config.in_channels = in_channels
-    
-    # 创建专家模型
-    experts = ExpertFactory.create_expert_ensemble(
-        expert_configs=config.expert_configs,
-        in_channels=config.in_channels,
-        out_channels=config.out_channels,
-        hidden_channels=config.hidden_channels
-    )
-    
-    # 创建MOE模型
+    input_shape = sample_batch['input'].shape
+    config.in_channels = input_shape[1]
+
+    encoder_model = None
+    if config.use_encoder:
+        encoder_model = get_encoder(
+            in_channels=config.in_channels,
+            out_channels=128,
+            num_types=config.v_type_num,
+        )
+        if not config.is_classifier and hasattr(encoder_model, "type_head"):
+            for p in encoder_model.type_head.parameters():
+                p.requires_grad_(False)
+        encoder_model.eval()
+        encoder_model = encoder_model.to(device)
+
+        encoder_ckpt_path = getattr(args, "encoder_path", None)
+        if encoder_ckpt_path:
+            missing, unexpected = load_encoder_weights(
+                encoder_model,
+                encoder_ckpt_path,
+                map_location="cpu",
+                strict=False,
+            )
+            if is_logger:
+                print(f"[Encoder] 推理阶段已从 {encoder_ckpt_path} 加载预训练权重。")
+                if missing:
+                    print(f"[Encoder] 缺失参数: {missing}")
+                if unexpected:
+                    print(f"[Encoder] 未使用参数: {unexpected}")
+        else:
+            encoder_state = checkpoint.get('encoder_state_dict')
+            if encoder_state is not None:
+                missing, unexpected = load_encoder_weights(encoder_model, encoder_state, strict=False)
+                if is_logger and (missing or unexpected):
+                    print(f"[Encoder] 从模型 checkpoint 加载编码器: 缺失 {missing}, 多余 {unexpected}")
+            elif is_logger:
+                print("警告：checkpoint 中缺少 encoder_state_dict，将使用随机初始化的编码器。")
+
+        for p in encoder_model.parameters():
+            p.requires_grad_(False)
+
+        with torch.no_grad():
+            probe_inputs = sample_batch['input'].to(device, non_blocking=True)
+            encoder_probe, _, _ = encoder_model(probe_inputs)
+        moe_in_channels = encoder_probe.shape[1]
+        config.moe_in_channels = moe_in_channels
+        del encoder_probe, probe_inputs
+    else:
+        moe_in_channels = config.in_channels
+        config.moe_in_channels = moe_in_channels
+        if is_logger:
+            print("[Encoder] use_encoder=False，推理阶段直接使用原始输入。")
+
+    # 创建专家模型，与训练保持一致
+    if config.use_moe and getattr(config, "use_experts_path", None):
+        experts = load_moe_experts(
+            experts_config=config.load_expert_configs,
+            in_channels=moe_in_channels,
+            out_channels=config.out_channels,
+            hidden_channels=config.hidden_channels,
+            model_path=config.use_experts_path,
+            is_specific=config.is_specific,
+            map_location=device,
+            type_dict=config.type_id
+        )
+    else:
+        experts = ExpertFactory.create_expert_ensemble(
+            expert_configs=config.expert_configs,
+            in_channels=moe_in_channels,
+            out_channels=config.out_channels,
+            hidden_channels=config.hidden_channels
+        )
+
+    # 构建 MOE 主干，与训练设置对齐
     model = MOEOperator(
         experts=experts,
-        in_channels=config.in_channels,
+        in_channels=moe_in_channels,
         out_channels=config.out_channels,
         hidden_channels=config.hidden_channels,
         top_k=config.top_k,
         noisy_gating=config.noisy_gating,
         fusion_type=config.fusion_type,
         router_hidden_dim=config.router_hidden_dim,
-        v_type_num=config.v_type_num
+        moe_mode=getattr(config, "moe_mode", "standard"),
+        is_logger=is_logger,
+        router_type=config.router_type,
+        s_processor_type=config.s_processor_type,
+        w_processor_type=config.w_processor_type,
+        beta=config.beta,
+        is_specific=config.is_specific,
+        is_classifier=config.is_classifier,
+        batch_size=config.batch_size,
+        v_type_num=config.v_type_num,
+        use_expert_memory_proxy=config.use_gpu_proxy,
     )
-    
-    # 加载模型参数
     model.load_state_dict(checkpoint['model_state_dict'])
-    
-    # 移动模型到设备
     model = model.to(device)
     model.eval()
-    
+
+    amp_enabled = bool(config.use_amp) and device.type == 'cuda'
+
     # 创建结果目录
-    results_dir = Path(args.output_dir) / "predictions"
+    output_root = Path(config.output_dir or args.output_dir or "./results")
+    results_dir = output_root / "predictions"
     results_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # 进行推理
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="推理中"):
-            # 获取数据
-            inputs = batch['input'].to(device) # 1*70*70 
-            # 假设batch_size是100 dataloader自动增加batch维度 变成B*1*70*70
-            # 对于dataset返回的是sample字典，dataloader按字段拼接成列表
-            file_names = batch['input_file'] # len=100的列表
-            
-            # 前向传播
-            predictions = model(inputs)
-            
-            # 反归一化
+            inputs = batch['input'].to(device, non_blocking=True)
+            file_names = batch['input_file']
+
+            if encoder_model is not None:
+                if amp_enabled:
+                    with torch.amp.autocast(device_type=device.type, enabled=True):
+                        encoded, weights, _ = encoder_model(inputs)
+                else:
+                    encoded, weights, _ = encoder_model(inputs)
+                encoded = encoded.to(dtype=torch.float32)
+                weights = weights.to(dtype=torch.float32) if weights is not None else None
+            else:
+                encoded = inputs.to(dtype=torch.float32)
+                weights = None
+
+            predictions, _ = model(encoded, weights)
+
             predictions = output_inverse_transform(predictions)
-            
-            # 保存预测结果
+
             for i, file_name in enumerate(file_names):
-                # 将预测结果转换为NumPy数组
-                prediction = predictions[i].cpu().numpy()
-                
-                # 保存为.npy文件
+                prediction = predictions[i].detach().cpu().numpy()
                 output_path = results_dir / f"{file_name}.npy"
                 np.save(output_path, prediction)
-    
+
     print(f"推理完成！结果保存在: {results_dir}")
 
 if __name__ == '__main__':
@@ -1400,9 +975,7 @@ if __name__ == '__main__':
         if not args.model_path:
             raise ValueError("推理模式需要指定模型路径 --model_path")
         run_inference(args)
-    elif args.mode == 'overfit1':
-        run_overfit_one_sample(args)
-    elif args.mode == 'overfit1_test':
-        run_overfit_one_sample_test(args)
+    elif args.mode == 'train_encoder':
+        run_training(args)
     else:
         raise ValueError(f"不支持的运行模式: {args.mode}") 

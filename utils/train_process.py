@@ -3,13 +3,13 @@ from typing import Optional, Callable
 import time
 from contextlib import nullcontext
 import torch.distributed as dist
-from .plot_fig import analyze_fourier_domain
+from torch.utils.tensorboard import SummaryWriter
+from .plot_fig import analyze_fourier_domain, visualize_results, save_type_predictions_txt
 import datetime
-from neuralop.models.moe import MOEOperator
 
 @torch.no_grad()
 def _evaluate_one_epoch(
-    model: MOEOperator,
+    model,
     encoder,
     # classifier,
     val_loader,
@@ -17,6 +17,7 @@ def _evaluate_one_epoch(
     criterion,
     metrics_module,  # 需有 calculate_psnr(pred, tgt)
     amp_enabled: bool = False,
+    train_encoder: bool = False,
 ):
     model.eval()
     if encoder is not None:
@@ -24,11 +25,13 @@ def _evaluate_one_epoch(
     # if classifier is not None:
     #     classifier.eval()
     val_loss = 0.0
-    mse_sum, mae_sum, psnr_sum = 0.0, 0.0, 0.0
+    mse_sum, mae_sum, psnr_sum, ce_sum = 0.0, 0.0, 0.0, 0.0
 
     for batch in val_loader:
         inputs  = batch['input'].to(device, non_blocking=True)
         targets = batch['output'].to(device, non_blocking=True)
+        if train_encoder:
+            labels = batch['v_type'].to(device, non_blocking=True)
         targets = targets.to(dtype=torch.float32)
 
         if encoder is not None:
@@ -47,14 +50,27 @@ def _evaluate_one_epoch(
             aux_loss = preds.new_zeros(())
 
         # 兼容 criterion 返回 (loss, loss_g1v, loss_g2v)
-        loss_dict = criterion(preds, targets)
+        if train_encoder:
+            loss_dict = criterion(preds, targets, weights, labels)
+        else:
+            loss_dict = criterion(preds, targets)
         
         val_loss += loss_dict["loss"].item()
         mse_sum  += loss_dict["l2"].item()
         mae_sum  += loss_dict["l1"].item()
         psnr_sum += metrics_module.calculate_psnr(preds, targets)
-
+        if train_encoder:
+            ce_sum += loss_dict["ce"].item()
+            
     n = max(1, len(val_loader))
+    if train_encoder:
+        return {
+            "val_loss": val_loss / n,
+            "mse": mse_sum / n,
+            "mae": mae_sum / n,
+            "psnr": psnr_sum / n,
+            "ce": ce_sum / n,
+        }
     return {
         "val_loss": val_loss / n,
         "mse": mse_sum / n,
@@ -65,7 +81,7 @@ def _evaluate_one_epoch(
 
 def train_one_epoch(
     *args,
-    model: MOEOperator,
+    model,
     encoder=None,
     # classifier=None,
     optimizer,
@@ -87,7 +103,6 @@ def train_one_epoch(
     accum_steps: int = 1,
     # 可视化 & 反归一化
     vis_now: bool = False,                   # 是否在本 epoch 可视化
-    visualize_results: Optional[Callable] = None,
     input_inverse_transform: Optional[Callable] = None,
     output_inverse_transform: Optional[Callable] = None,
     # WandB
@@ -99,10 +114,11 @@ def train_one_epoch(
     best_val_loss: float = float("inf"),
     best_model_path: Optional[str] = None,
     best_expert_path: Optional[str] = None,
+    best_encoder_path: Optional[str] = None,
     last_model_path: Optional[str] = None,
     last_expert_path: Optional[str] = None,
+    last_encoder_path: Optional[str] = None,
     experts_name: Optional[list] = None,
-    experts_name_str: Optional[str] = None,
     data_dict: Optional[dict] = None,
     # 其他工具
     metrics_module=None,
@@ -110,6 +126,10 @@ def train_one_epoch(
     profile_timing: bool = False,            # 是否记录耗时
     amp_enabled: bool = False,
     amp_scaler: Optional[torch.amp.GradScaler] = None,
+    encoder_frozen: bool = False,
+    # 是否训练encoder
+    train_encoder: bool = False,
+    tb_writer: Optional[SummaryWriter] = None,
     **kwargs,
 ):
     """
@@ -120,6 +140,10 @@ def train_one_epoch(
     """
     assert metrics_module is not None, "metrics_module 需提供 calculate_psnr(pred, tgt)"
     tqdm = tqdm_module.tqdm if tqdm_module is not None else None
+    tb_active = bool(tb_writer) and bool(is_logger)
+    router_hist_sample = None
+    max_router_hist_samples = 65536
+    image_log_limit = 3
 
     start_time = time.time()
     model.train()
@@ -161,24 +185,34 @@ def train_one_epoch(
     micro_in_group = 0  # 追踪当前累计组内的 micro 数
 
     for step, batch in enumerate(pbar_iter):
+        global_step = epoch * num_steps + step
         inputs  = batch['input'].to(device, non_blocking=True)
         targets = batch['output'].to(device, non_blocking=True)
+        if train_encoder:
+            labels = batch['v_type'].to(device, non_blocking=True)
         if encoder is not None:
-            if use_amp:
-                with torch.amp.autocast(device_type=device.type, enabled=True):
+            grad_ctx = torch.no_grad() if encoder_frozen else nullcontext()
+            with grad_ctx:
+                if use_amp:
+                    with torch.amp.autocast(device_type=device.type, enabled=True):
+                        encoded, weights, _ = encoder(inputs)
+                else:
                     encoded, weights, _ = encoder(inputs)
-            else:
-                encoded, weights, _ = encoder(inputs)
         else:
             encoded = inputs
             weights = None
         encoded = encoded.to(dtype=torch.float32)
+        if encoder_frozen:
+            encoded = encoded.detach()
         weights = weights.to(dtype=torch.float32) if weights is not None else None
+        if encoder_frozen and weights is not None:
+            weights = weights.detach()
+        if tb_active and router_hist_sample is None and weights is not None:
+            flat_weights = weights.detach().float().cpu().reshape(-1)
+            if flat_weights.numel() > max_router_hist_samples:
+                flat_weights = flat_weights[:max_router_hist_samples]
+            router_hist_sample = flat_weights
         targets = targets.to(dtype=torch.float32)
-        # if classifier is not None:
-        #     weights = classifier(encoded)
-        # else:
-        #     weights = None
         del inputs
 
         # —— 计算该 step 是否是这一累计组的“最后一个” —— #
@@ -193,7 +227,10 @@ def train_one_epoch(
             preds, aux_loss = model(encoded, weights)
             if aux_loss is None:
                 aux_loss = preds.new_zeros(())
-            loss_dict = criterion(preds, targets)
+            if train_encoder:
+                loss_dict = criterion(preds, targets, weights, labels)
+            else:
+                loss_dict = criterion(preds, targets)
             # —— 未缩放的“真实训练损失”（用于日志统计） —— #
             loss_raw = loss_dict["loss"] + coef * aux_loss
 
@@ -214,6 +251,9 @@ def train_one_epoch(
                 running_aux_loss   += aux_loss.item()
                 micro_in_group     += 1
                 micro_count        += 1
+                if tb_active:
+                    tb_writer.add_scalar("train/micro_loss", loss_raw.item(), global_step)
+                    tb_writer.add_scalar("train/aux_loss", aux_loss.item(), global_step)
 
         if step_has_nan:
             optimizer.zero_grad(set_to_none=True)
@@ -234,6 +274,10 @@ def train_one_epoch(
             # 学习率调度（按步）
             if lr_scheduler is not None and scheduler_step_mode == "per_step":
                 lr_scheduler.step()
+            if tb_active:
+                current_lr = optimizer.param_groups[0]["lr"]
+                tb_writer.add_scalar("train/learning_rate", current_lr, global_step)
+                tb_writer.add_scalar("train/optim_steps_in_epoch", optim_count, global_step)
 
         if is_logger and tqdm is not None:
             pbar_iter.set_postfix({"train_loss": f"{loss_raw.item():.6f}"})  # 展示未缩放损失
@@ -247,14 +291,30 @@ def train_one_epoch(
         avg_train_loss = running_train_loss / max(1, micro_count)
         avg_aux_loss = running_aux_loss / max(1, micro_count)
 
+    epoch_step = epoch + 1
+    if tb_active:
+        tb_writer.add_scalar("train/epoch_loss", avg_train_loss, epoch_step)
+        tb_writer.add_scalar("train/epoch_aux_loss", avg_aux_loss, epoch_step)
+        tb_writer.add_scalar("epoch/micro_steps", micro_count, epoch_step)
+        tb_writer.add_scalar("epoch/optim_steps", optim_count, epoch_step)
+
     # —— 验证 —— #
     if nan_detected:
-        val_stats = {
-            "val_loss": float("inf"),
-            "mse": float("nan"),
-            "mae": float("nan"),
-            "psnr": float("nan")
-        }
+        if train_encoder:
+            val_stats = {
+                "val_loss": float("inf"),
+                "mse": float("nan"),
+                "mae": float("nan"),
+                "psnr": float("nan"),
+                "ce": float("nan"),
+            }
+        else:
+            val_stats = {
+                "val_loss": float("inf"),
+                "mse": float("nan"),
+                "mae": float("nan"),
+                "psnr": float("nan"),
+            }
         val_loss = float("inf")
     else:
         val_stats = _evaluate_one_epoch(
@@ -267,6 +327,13 @@ def train_one_epoch(
             amp_enabled=use_amp,
         )
         val_loss = val_stats["val_loss"]
+    if tb_active:
+        tb_writer.add_scalar("val/loss", val_stats.get("val_loss", float("nan")), epoch_step)
+        tb_writer.add_scalar("val/psnr", val_stats.get("psnr", float("nan")), epoch_step)
+        tb_writer.add_scalar("val/mse", val_stats.get("mse", float("nan")), epoch_step)
+        tb_writer.add_scalar("val/mae", val_stats.get("mae", float("nan")), epoch_step)
+        if train_encoder:
+            tb_writer.add_scalar("val/ce", val_stats.get("ce", float("nan")), epoch_step)
     if router_type == 'adamv':
         signal = router.step_validation(val_loss)
         # 多进程之间同步信号
@@ -292,24 +359,46 @@ def train_one_epoch(
                     
     # —— 日志输出 & WandB —— #
     if is_logger and log_file is not None:
-        with open(log_file, "a") as f:
-            f.write(
-                f"    {epoch+1}    |    {avg_train_loss:.6f}    |    {val_loss:.6f}    |    "
-                f"{val_stats['mae']:.6f}    |    {val_stats['mse']:.6f}    |    {val_stats['psnr']:.6f}    |\n"
-            )
-
+        if train_encoder:
+            with open(log_file, "a") as f:
+                f.write(
+                    f"    {epoch+1}    |    {avg_train_loss:.6f}    |    {val_loss:.6f}    |    "
+                    f"{val_stats['mae']:.6f}    |    {val_stats['mse']:.6f}    |    {val_stats['psnr']:.6f}    |    {val_stats['ce']:.6f}    |\n"
+                )
+        else:
+            with open(log_file, "a") as f:
+                f.write(
+                    f"    {epoch+1}    |    {avg_train_loss:.6f}    |    {val_loss:.6f}    |    "
+                    f"{val_stats['mae']:.6f}    |    {val_stats['mse']:.6f}    |    {val_stats['psnr']:.6f}    |\n"
+                )
     if use_wandb and wandb_module is not None:
-        wandb_log = {
-            "epoch": epoch + 1,
-            "train_loss": avg_train_loss,
-            "val_loss": val_loss,
-            "learning_rate": optimizer.param_groups[0]["lr"],
-            "val/psnr": val_stats["psnr"],
-            "val/mse": val_stats["mse"],
-            "val/mae": val_stats["mae"],
-            "optim_steps_in_epoch": optim_count,
-        }
+        if train_encoder:
+            wandb_log = {
+                "epoch": epoch + 1,
+                "train_loss": avg_train_loss,
+                "val_loss": val_loss,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+                "val/psnr": val_stats["psnr"],
+                "val/mse": val_stats["mse"],
+                "val/mae": val_stats["mae"],
+                "val/ce": val_stats["ce"],
+                "optim_steps_in_epoch": optim_count,
+            }
+        else:
+            wandb_log = {
+                "epoch": epoch + 1,
+                "train_loss": avg_train_loss,
+                "val_loss": val_loss,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+                "val/psnr": val_stats["psnr"],
+                "val/mse": val_stats["mse"],
+                "val/mae": val_stats["mae"],
+                "optim_steps_in_epoch": optim_count,
+            }
         wandb_module.log(wandb_log)
+
+    if tb_active and router_hist_sample is not None:
+        tb_writer.add_histogram("router/gates", router_hist_sample, epoch_step)
 
     # —— 保存最佳模型（仅主进程）—— #
     if is_logger and (val_loss < best_val_loss):
@@ -330,15 +419,17 @@ def train_one_epoch(
             checkpoint['encoder_state_dict'] = encoder_to_save.state_dict()
         # if classifier_to_save is not None:
         #     checkpoint['classifier_state_dict'] = classifier_to_save.state_dict()
-
-        torch.save(checkpoint, best_model_path)
-
-        if experts_name is not None and len(experts_name) == 1 and best_expert_path is not None:
-            # 仅示例：若你的模型结构中存在 experts[0]
-            if hasattr(model_to_save, "experts") and len(model_to_save.experts) > 0:
-                torch.save({
-                    'expert_state_dict': model_to_save.experts[0].state_dict()
-                }, best_expert_path)
+        if train_encoder:
+            torch.save(encoder_to_save.state_dict(), best_encoder_path)
+        else:
+            torch.save(checkpoint, best_model_path)
+            
+            if experts_name is not None and len(experts_name) == 1 and best_expert_path is not None:
+                # 仅示例：若你的模型结构中存在 experts[0]
+                if hasattr(model_to_save, "experts") and len(model_to_save.experts) > 0:
+                    torch.save({
+                        'expert_state_dict': model_to_save.experts[0].state_dict()
+                    }, best_expert_path)
 
     if is_logger and last_model_path is not None:
         model_to_save = model.module if (getattr(config, "distributed", None) and getattr(config.distributed, "use_distributed", False) and hasattr(model, "module")) else model
@@ -357,24 +448,36 @@ def train_one_epoch(
             checkpoint['encoder_state_dict'] = encoder_to_save.state_dict()
         # if classifier_to_save is not None:
         #     checkpoint['classifier_state_dict'] = classifier_to_save.state_dict()
+        if train_encoder:
+            torch.save(encoder_to_save.state_dict(), last_encoder_path)
+        else:
+            torch.save(checkpoint, last_model_path)
 
-        torch.save(checkpoint, last_model_path)
-
-        if experts_name is not None and len(experts_name) == 1 and last_expert_path is not None:
-            if hasattr(model_to_save, "experts") and len(model_to_save.experts) > 0:
-                torch.save({
-                    'expert_state_dict': model_to_save.experts[0].state_dict()
-                }, last_expert_path)
+            if experts_name is not None and len(experts_name) == 1 and last_expert_path is not None:
+                if hasattr(model_to_save, "experts") and len(model_to_save.experts) > 0:
+                    torch.save({
+                        'expert_state_dict': model_to_save.experts[0].state_dict()
+                    }, last_expert_path)
 
     # —— 打印本 epoch 概要（仅主进程）—— #
     if is_logger:
-        print(f"Epoch {epoch+1}/{config.epochs}:")
-        print(f"  Train Loss: {avg_train_loss:.6f}")
-        print(f"  Val   Loss: {val_loss:.6f}")
-        print(f"  PSNR: {val_stats['psnr']:.2f} dB")
-        print(f"  MSE : {val_stats['mse']:.6f}")
-        print(f"  MAE : {val_stats['mae']:.6f}")
-        print(f"  AuxLoss : {avg_aux_loss:.2f}")
+        if train_encoder:
+            print(f"Epoch {epoch+1}/{config.epochs}:")
+            print(f"  Train Loss: {avg_train_loss:.6f}")
+            print(f"  Val   Loss: {val_loss:.6f}")
+            print(f"  PSNR: {val_stats['psnr']:.2f} dB")
+            print(f"  MSE : {val_stats['mse']:.6f}")
+            print(f"  MAE : {val_stats['mae']:.6f}")
+            print(f"  CE : {val_stats['ce']:.6f}")
+            print(f"  AuxLoss : {avg_aux_loss:.2f}")
+        else:
+            print(f"Epoch {epoch+1}/{config.epochs}:")
+            print(f"  Train Loss: {avg_train_loss:.6f}")
+            print(f"  Val   Loss: {val_loss:.6f}")
+            print(f"  PSNR: {val_stats['psnr']:.2f} dB")
+            print(f"  MSE : {val_stats['mse']:.6f}")
+            print(f"  MAE : {val_stats['mae']:.6f}")
+            print(f"  AuxLoss : {avg_aux_loss:.2f}")
 
     # —— 可视化（仅主进程 & 触发时）—— #
     if is_logger and vis_now and visualize_results is not None:
@@ -408,12 +511,23 @@ def train_one_epoch(
 
         visualize_results(inputs_v, targets_v, preds_v, save_dir=results_dir / f"vis_epoch_{epoch+1}")
         
+        save_type_predictions_txt(
+            logits=vis_weights,     # encoder输出的未softmax logits
+            batch=vis_batch,
+            save_dir=results_dir / f"vis_epoch_{epoch+1}",
+            epoch=epoch,
+            config=config,          # 直接传 config，内部自动反转 type_id_specific
+            filename="type_predictions.txt",
+            append=True,
+            is_logger=is_logger,
+        )
+        
         # 进行傅里叶域分析
         analyze_fourier_domain(inputs_v, targets_v, preds_v, save_dir=results_dir / f"fourier_analysis_epoch_{epoch+1}")
 
         if use_wandb and wandb_module is not None:
             # 只示例记录前三个
-            for i in range(min(3, inputs_v.shape[0])):
+            for i in range(min(4, inputs_v.shape[0])):
                 in_img  = inputs_v[i, 0].detach().float().cpu().numpy()
                 tgt_img = (targets_v[i, 0] if targets_v.dim() > 3 else targets_v[i]).detach().float().cpu().numpy()
                 prd_img = (preds_v[i, 0]   if preds_v.dim()   > 3 else preds_v[i]).detach().float().cpu().numpy()
@@ -422,6 +536,12 @@ def train_one_epoch(
                     f"sample_{i}/target_seismic": wandb_module.Image(tgt_img),
                     f"sample_{i}/prediction_seismic": wandb_module.Image(prd_img),
                 })
+        if tb_active:
+            num_samples = min(image_log_limit, inputs_v.shape[0])
+            for idx in range(num_samples):
+                tb_writer.add_image(f"samples/{idx}/input", inputs_v[idx], epoch_step)
+                tb_writer.add_image(f"samples/{idx}/target", targets_v[idx], epoch_step)
+                tb_writer.add_image(f"samples/{idx}/prediction", preds_v[idx], epoch_step)
 
     # —— 早停（仅主进程判定，后广播）—— #
     stop_flag = 0
@@ -460,6 +580,8 @@ def train_one_epoch(
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     if is_logger:
         print('Training time', total_time_str)
+    if tb_active:
+        tb_writer.add_scalar("epoch/duration_sec", total_time, epoch_step)
 
     # 返回统计与状态
     stats = {
