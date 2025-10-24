@@ -5,7 +5,7 @@
 5. 数值方法在单数据集上的表现
 6. 数值方法在全数据集上的表现
 
-7. 没有encoder的单专家在单数据集上的表现, 直接resize
+7. 没有encoder(直接resize)/不同encoder的单专家在单数据集上的表现
 8. encoder在全数据集上的训练, 使用encoder+fno直接训练，仅保存encoder
 9. moe在全数据集上的表现 
 

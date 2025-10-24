@@ -611,13 +611,12 @@ def get_encoder(
     out_channels: Optional[int] = None,
     num_types: int = 3,
     type_act: str = 'softmax',
-    backbone: str = 'vit',   # 'vit' | 'convnext_tiny' | 'convnext_small'
+    backbone: str = 'vit',   # 'vit' | 'convnext_tiny'
 ) -> nn.Module:
     """
     统一工厂：
       - backbone='vit'            -> Encoder_Dino（ViT-S/16 默认）
       - backbone='convnext_tiny'  -> Encoder_ConvNeXt(tiny)
-      - backbone='convnext_small' -> Encoder_ConvNeXt(small)
     """
     if out_channels is None:
         out_channels = 64
@@ -654,22 +653,5 @@ def get_encoder(
             type_act=type_act,
             use_timm_head=True,
         )
-
-    elif backbone == 'convnext_small':
-        model_name = 'convnext_small.dinov3_lvd1689m'
-        local_ckpt_path = "convnext_small.dinov3_lvd1689m.safetensors"
-        use_local = (local_ckpt_path is not None) and os.path.isfile(local_ckpt_path)
-        return Encoder_ConvNeXt(
-            model_name=model_name,
-            pretrained=not use_local,
-            checkpoint_path=local_ckpt_path if use_local else None,
-            in_chans=in_channels,
-            out_channels=out_channels,
-            num_types=num_types,
-            img_size=70,
-            type_act=type_act,
-            use_timm_head=True,
-        )
-
     else:
         raise ValueError(f"Unsupported backbone: {backbone}")

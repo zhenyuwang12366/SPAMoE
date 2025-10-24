@@ -196,7 +196,7 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
     parser.add_argument('--use_gpu_proxy', action='store_true',
                         help='启用专家显存代理以缓解显存压力')
     
-    parser.add_argument('--backbone', type=str, default='vit',
+    parser.add_argument('--backbone', type=str, default='vit', choices=['vit', 'convnext_tiny'],
                         help='encoder backbone')
     parser.add_argument('--use_encoder', dest='use_encoder', action='store_true',
                         help='启用 encoder，将输入先编码再送入 MoE')
