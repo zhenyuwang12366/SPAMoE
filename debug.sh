@@ -6,6 +6,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m pdb scripts/train_sei
   --mode train \
   --model_name FNO \
   --use_encoder \
+  --backbone convnext_tiny \
   --concat_channels \
   --is_specific \
   --num_workers 10 \

@@ -36,7 +36,7 @@ def _evaluate_one_epoch(
 
         if encoder is not None:
             if amp_enabled:
-                with torch.amp.autocast(device_type=device.type, enabled=True):
+                with torch.amp.autocast(device_type=device.type, enabled=True, dtype=torch.bfloat16):
                     encoded, weights, _ = encoder(inputs)
             else:
                 encoded, weights, _ = encoder(inputs)
@@ -45,7 +45,8 @@ def _evaluate_one_epoch(
         else:
             encoded = inputs.to(dtype=torch.float32)
             weights = None
-        preds, aux_loss = model(encoded, weights)
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            preds, aux_loss = model(encoded, weights)
         if aux_loss is None:
             aux_loss = preds.new_zeros(())
 
@@ -199,7 +200,7 @@ def train_one_epoch(
             grad_ctx = torch.no_grad() if encoder_frozen else nullcontext()
             with grad_ctx:
                 if use_amp:
-                    with torch.amp.autocast(device_type=device.type, enabled=True):
+                    with torch.amp.autocast(device_type=device.type, enabled=True, dtype=torch.bfloat16):
                         encoded, weights, _ = encoder(inputs)
                 else:
                     encoded, weights, _ = encoder(inputs)
@@ -212,6 +213,8 @@ def train_one_epoch(
         targets = targets.to(dtype=torch.float32)
         
         del inputs
+        
+        # mem()
         
         if encoder_frozen:
             encoded = encoded.detach()
@@ -237,7 +240,8 @@ def train_one_epoch(
 
         step_has_nan = False
         with sync_ctx:
-            preds, aux_loss = model(encoded, weights)
+            with torch.amp.autocast(device_type=device.type, enabled=False):
+                preds, aux_loss = model(encoded, weights)
             if aux_loss is None:
                 aux_loss = preds.new_zeros(())
             if train_encoder:
@@ -501,7 +505,7 @@ def train_one_epoch(
         with torch.no_grad():
             if encoder is not None:
                 if use_amp:
-                    with torch.amp.autocast(device_type=device.type, enabled=True):
+                    with torch.amp.autocast(device_type=device.type, enabled=True, dtype=torch.bfloat16):
                         vis_encoded, vis_weights, _ = encoder(inputs)
                 else:
                     vis_encoded, vis_weights, _ = encoder(inputs)
@@ -510,7 +514,9 @@ def train_one_epoch(
             else:
                 vis_encoded = inputs.to(dtype=torch.float32)
                 vis_weights = None
-            preds, _ = model(vis_encoded, vis_weights)
+                
+            with torch.amp.autocast(device_type=device.type, enabled=False):
+                preds, _ = model(vis_encoded, vis_weights)
 
         if input_inverse_transform is not None:
             inputs_v = input_inverse_transform(inputs)

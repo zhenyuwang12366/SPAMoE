@@ -146,9 +146,9 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='启用WNO通道MLP')
     parser.add_argument('--WNO_disable_channel_mlp', dest='WNO_use_channel_mlp', action='store_false',
                         help='禁用WNO通道MLP')
-    parser.add_argument('--WNO_channel_mlp_dropout', type=float, default=None,
+    parser.add_argument('--WNO_channel_mlp_dropout', type=float, default=0.0,
                         help='WNO通道MLP的dropout比例')
-    parser.add_argument('--WNO_channel_mlp_expansion', type=float, default=None,
+    parser.add_argument('--WNO_channel_mlp_expansion', type=float, default=0.0,
                         help='WNO通道MLP的扩展倍率')
     
     parser.add_argument('--MNO_n_scales', type=int, default=3,
@@ -195,11 +195,15 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='速度类型数量，用于控制分类器输出维度及专家分组')
     parser.add_argument('--use_gpu_proxy', action='store_true',
                         help='启用专家显存代理以缓解显存压力')
+    
+    parser.add_argument('--backbone', type=str, default='vit',
+                        help='encoder backbone')
     parser.add_argument('--use_encoder', dest='use_encoder', action='store_true',
                         help='启用 encoder，将输入先编码再送入 MoE')
     parser.add_argument('--disable_encoder', dest='use_encoder', action='store_false',
                         help='禁用 encoder，直接将原始输入送入 MoE')
     parser.set_defaults(use_encoder=None)
+
 
     parser.add_argument('--hidden_channels', type=int, default=128,
                         help='隐藏通道数（默认值由配置文件决定，可通过此参数覆盖）')

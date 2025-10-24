@@ -92,6 +92,7 @@ IS_CLASSIFIER=0                   # flag -> --is_classifier
 V_TYPE_NUM=""                  # 可选 -> --v_type_num
 USE_GPU_PROXY=0
 USE_ENCODER=""
+BACKBONE="vit"
 ENCODER_PATH=""
 
 # 推理/恢复
@@ -218,6 +219,7 @@ while [[ $# -gt 0 ]]; do
     --use_gpu_proxy) USE_GPU_PROXY=1; shift ;;
     --use_encoder) USE_ENCODER=1; shift ;;
     --disable_encoder) USE_ENCODER=0; shift ;;
+    --backbone) BACKBONE="$2"; shift 2 ;;
 
     --model_path) MODEL_PATH="$2"; shift 2 ;;
     --resume_path) RESUME_PATH="$2"; shift 2 ;;
@@ -397,6 +399,7 @@ echo "Beta(强弱激活): $BETA"
 echo "Noisy gating: $NOISY_GATING_DISPLAY"
 echo "GPU proxy: $GPU_PROXY_DISPLAY"
 echo "Encoder: $USE_ENCODER_DISPLAY"
+echo "Encoder Backbone: $BACKBONE"
 echo "Encoder Checkpoint: ${ENCODER_PATH:-<None>}"
 echo "is_specific: $IS_SPECIFIC, is_classifier: $IS_CLASSIFIER"
 echo "v_type_num: ${V_TYPE_NUM:-<auto>}"
@@ -445,6 +448,7 @@ ARGS=(
   --H_size "$H_SIZE"
   --W_size "$W_SIZE"
   --hidden_channels "$HIDDEN_CHANNELS"
+  --backbone "$BACKBONE"
   --learning_rate "$LEARNING_RATE"
   --resume_path "$RESUME_PATH"
   --weight_decay "$WEIGHT_DECAY"

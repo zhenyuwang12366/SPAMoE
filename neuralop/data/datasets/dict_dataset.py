@@ -6,8 +6,6 @@ from torch.utils.data import Dataset
 class DictDataset(Dataset):
     """DictDataset is a basic dataset form that stores each batch
     as a dictionary of tensors or other data structures
-
-
     """
 
     def __init__(

@@ -229,14 +229,16 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                 in_channels=config.in_channels,
                 out_channels=128,
                 num_types=10,
-                type_act='identity'
+                type_act='identity',
+                backbone=config.backbone,
             )
         else:
             encoder_model = get_encoder(
                 in_channels=config.in_channels,
                 out_channels=128,
                 num_types=10,
-                type_act='softmax'
+                type_act='softmax',
+                backbone=config.backbone,
             )
         if getattr(args, "encoder_path", None):
             missing, unexpected = load_encoder_weights(
@@ -255,10 +257,15 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                 p.requires_grad_(False)
             encoder_freeze = True
 
-        if not config.is_classifier and hasattr(encoder_model, "type_head"):
-            for p in encoder_model.type_head.parameters():
-                p.requires_grad_(False)
-        
+        if not config.is_classifier:
+            if config.backbone == 'vit':
+                for p in encoder_model.type_head.parameters():
+                    p.requires_grad_(False)
+            else:
+                for n, p in encoder_model.backbone.named_parameters():
+                    if n.startswith("head."):
+                        p.requires_grad_(False)
+                        
         encoder_model.eval()
 
         with torch.no_grad():
@@ -321,6 +328,24 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         use_expert_memory_proxy=config.use_gpu_proxy
     )
 
+    # def list_param_indices(mod, tag):
+    #     names = []
+    #     for i, (n, p) in enumerate(mod.named_parameters()):
+    #         names.append((i, n, p.requires_grad))
+    #     print(f"[{tag}] total={len(names)}")
+    #     for i, n, rg in names[-30:]:  # 打印尾部一段，或者全打
+    #         print(f"  idx={i:>4}  grad={rg}  name={n}")
+    #     return names
+
+    # # DDP 之前：
+    # _ = list_param_indices(moe_model, "moe_model(pre-DDP)")
+    # if encoder_model is not None:
+    #     base_enc = encoder_model
+    #     if hasattr(base_enc, "module"): base_enc = base_enc.module
+    #     _ = list_param_indices(base_enc, "encoder(pre-DDP)")
+        
+    # exit(0)
+    
     # 移动模型到设备
     if config.distributed.use_distributed:
         if encoder_model is not None:
@@ -956,7 +981,7 @@ def run_inference(args):
 
             if encoder_model is not None:
                 if amp_enabled:
-                    with torch.amp.autocast(device_type=device.type, enabled=True):
+                    with torch.amp.autocast(device_type=device.type, enabled=True, dtype=torch.bfloat16):
                         encoded, weights, _ = encoder_model(inputs)
                 else:
                     encoded, weights, _ = encoder_model(inputs)

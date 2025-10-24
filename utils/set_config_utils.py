@@ -120,6 +120,8 @@ def get_seismic_config(args: argparse.Namespace):
         config.early_stop = True
     if args.use_encoder is not None:
         config.use_encoder = args.use_encoder
+    if getattr(args, "backbone", None) is not None:
+        config.backbone = args.backbone
     if args.use_moe:
         config.use_moe = True
     if args.early_stop_patience is not None:
@@ -253,6 +255,8 @@ def get_seismic_config(args: argparse.Namespace):
         config.lambda_grad_l1 = args.lambda_grad_l1
     if hasattr(args, "lambda_fourier_mag_l1"):
         config.lambda_fourier_mag_l1 = args.lambda_fourier_mag_l1
+    if hasattr(args, "lambda_ce"):
+        config.lambda_ce = args.lambda_ce
     
     # 设置 MOE 模式
     if hasattr(args, "moe_mode") and args.moe_mode:
