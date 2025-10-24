@@ -138,6 +138,14 @@ def train_one_epoch(
     - 若使用 DDP，前 accum_steps-1 次 micro step 用 no_sync() 以减少通信
     - 调度器：per_step 在“优化步”后 step；per_epoch 在 epoch 末 step
     """
+    def mem():
+        """打印当前 GPU 显存状态"""
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated(device) / 1e9  # 已分配显存
+        reserved  = torch.cuda.memory_reserved(device)  / 1e9  # 已缓存（已申请但未使用）显存
+        max_alloc = torch.cuda.max_memory_allocated(device) / 1e9  # 运行以来的峰值显存
+        print(f"[{device}] allocated={allocated:.2f} GB | reserved={reserved:.2f} GB | max={max_alloc:.2f} GB")
+    
     assert metrics_module is not None, "metrics_module 需提供 calculate_psnr(pred, tgt)"
     tqdm = tqdm_module.tqdm if tqdm_module is not None else None
     tb_active = bool(tb_writer) and bool(is_logger)
@@ -149,8 +157,6 @@ def train_one_epoch(
     model.train()
     if encoder is not None:
         encoder.train()
-    # if classifier is not None:
-    #     classifier.train()
     running_train_loss = 0.0
     running_aux_loss = 0.0
     micro_count = 0
@@ -183,13 +189,12 @@ def train_one_epoch(
 
     num_steps = len(train_loader)
     micro_in_group = 0  # 追踪当前累计组内的 micro 数
-
+    
     for step, batch in enumerate(pbar_iter):
         global_step = epoch * num_steps + step
         inputs  = batch['input'].to(device, non_blocking=True)
         targets = batch['output'].to(device, non_blocking=True)
-        if train_encoder:
-            labels = batch['v_type'].to(device, non_blocking=True)
+        
         if encoder is not None:
             grad_ctx = torch.no_grad() if encoder_frozen else nullcontext()
             with grad_ctx:
@@ -201,20 +206,28 @@ def train_one_epoch(
         else:
             encoded = inputs
             weights = None
+        
         encoded = encoded.to(dtype=torch.float32)
+        weights = weights.to(dtype=torch.float32) if weights is not None else None
+        targets = targets.to(dtype=torch.float32)
+        
+        del inputs
+        
         if encoder_frozen:
             encoded = encoded.detach()
-        weights = weights.to(dtype=torch.float32) if weights is not None else None
+        
         if encoder_frozen and weights is not None:
             weights = weights.detach()
+        
         if tb_active and router_hist_sample is None and weights is not None:
             flat_weights = weights.detach().float().cpu().reshape(-1)
             if flat_weights.numel() > max_router_hist_samples:
                 flat_weights = flat_weights[:max_router_hist_samples]
             router_hist_sample = flat_weights
-        targets = targets.to(dtype=torch.float32)
-        del inputs
 
+        if train_encoder:
+            labels = batch['v_type'].to(device, non_blocking=True)
+        
         # —— 计算该 step 是否是这一累计组的“最后一个” —— #
         # 规则：自然分组 + 末尾不足一组也强制结算
         last_micro = ((step + 1) % accum_steps == 0) or ((step + 1) == num_steps)
@@ -283,6 +296,7 @@ def train_one_epoch(
             pbar_iter.set_postfix({"train_loss": f"{loss_raw.item():.6f}"})  # 展示未缩放损失
         encoded = None
         weights = None
+        
     # —— 训练集 loss（micro-step 平均）——
     if nan_detected and micro_count == 0:
         avg_train_loss = float("nan")

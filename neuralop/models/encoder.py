@@ -358,7 +358,7 @@ class Encoder_Dino(nn.Module):
         
         return latent_map, type_weight, global_repr
 
-def get_encoder(in_channels: int = 1, out_channels: int | None = None, num_types: int = 3) -> Encoder_Dino:
+def get_encoder(in_channels: int = 1, out_channels: int | None = None, num_types: int = 3, type_act: str = 'softmax') -> Encoder_Dino:
     """
     供训练脚本调用的工厂方法
     """
@@ -379,6 +379,6 @@ def get_encoder(in_channels: int = 1, out_channels: int | None = None, num_types
         img_size=70,
         patch_size=16,
         mode="pad_then_interp",
-        type_act="softmax",
+        type_act=type_act,
     )
     return model

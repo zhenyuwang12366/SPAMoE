@@ -25,6 +25,7 @@ bash scripts/run_distributed_seismic_moe.sh \
   --model_name FNO \
   --use_encoder \
   --concat_channels \
+  --is_specific \
   --num_gpus 2 \
   --num_workers 10 \
   --data_dir /data1/home/teacher/teacher_s/t108790/DATAA \

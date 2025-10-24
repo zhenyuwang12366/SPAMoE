@@ -143,29 +143,15 @@ class SeismicDataset(Dataset):
 
                 num_samples = input_array.shape[0]
                 for j in range(num_samples):
-                    sample_np = input_array[j]
-
-                    # (H,W) 或 (C,H,W) 或 对象数组(通道列表)
-                    if isinstance(sample_np, np.ndarray) and sample_np.dtype != object:
-                        input_np = sample_np.astype(np.float32, copy=False)
-                        if input_np.ndim == 2:
-                            input_np = np.expand_dims(input_np, axis=0)
-                    else:
-                        channels = [np.asarray(ch, dtype=np.float32) for ch in sample_np]
-                        input_np = np.stack(channels, axis=0)
-
-                    if self.concat_channels and input_np.ndim == 3 and input_np.shape[0] > 1:
-                        merged_np = np.concatenate([input_np[c] for c in range(input_np.shape[0])], axis=-1)
-                        input_np = merged_np[np.newaxis, ...]
-
-                    input_tensor = torch.from_numpy(np.ascontiguousarray(input_np))
+                    if self.concat_channels:
+                        input_data = np.concatenate([input_array[j][k] for k in range(5)], axis=1)
+                        input_tensor = torch.from_numpy(input_data.astype(np.float32)).unsqueeze(0)
+                    else:    
+                        input_tensor = torch.from_numpy(input_array[j])
                     self.input_tensors.append(input_tensor)
 
                     if output_array is not None:
-                        output_np = np.asarray(output_array[j], dtype=np.float32)
-                        if output_np.ndim == 2:
-                            output_np = np.expand_dims(output_np, axis=0)
-                        output_tensor = torch.from_numpy(np.ascontiguousarray(output_np))
+                        output_tensor = torch.from_numpy(output_array[j].astype(np.float32))
                         self.output_tensors.append(output_tensor)
 
                     # 与样本对齐的标签/类别名

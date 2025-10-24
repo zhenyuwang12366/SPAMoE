@@ -224,12 +224,20 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     encoder_model = None
     encoder_freeze = False
     if config.use_encoder:
-        encoder_model = get_encoder(
-            in_channels=config.in_channels,
-            out_channels=128,
-            num_types=10
-        )
-
+        if config.train_encoder:
+            encoder_model = get_encoder(
+                in_channels=config.in_channels,
+                out_channels=128,
+                num_types=10,
+                type_act='identity'
+            )
+        else:
+            encoder_model = get_encoder(
+                in_channels=config.in_channels,
+                out_channels=128,
+                num_types=10,
+                type_act='softmax'
+            )
         if getattr(args, "encoder_path", None):
             missing, unexpected = load_encoder_weights(
                 encoder_model,
@@ -247,6 +255,10 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                 p.requires_grad_(False)
             encoder_freeze = True
 
+        if not config.is_classifier and hasattr(encoder_model, "type_head"):
+            for p in encoder_model.type_head.parameters():
+                p.requires_grad_(False)
+        
         encoder_model.eval()
 
         with torch.no_grad():
@@ -286,8 +298,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             hidden_channels=config.hidden_channels
         )
 
-    # 创建分类器和 MOE 主干
-    # classifier_model = get_classifier(moe_in_channels)
+    # 创建 MOE 主干
     moe_model = MOEOperator(
         experts=experts,
         in_channels=moe_in_channels,
@@ -336,7 +347,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         trainable_model = moe_model
     
     model = trainable_model
-
+    
     if encoder_model is not None and encoder_freeze:
         encoder_model.eval()
         if is_logger:
@@ -399,7 +410,6 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         )
     else:
         raise ValueError(f"Unsupported lr_scheduler_type: {scheduler_type}")
-    
     
     lambda_grad_l1 = float(getattr(config, "lambda_grad_l1", 0.0))
     lambda_fourier_mag_l1 = float(getattr(config, "lambda_fourier_mag_l1", 0.0))
@@ -469,9 +479,6 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                 "fourier_l1": fourier_val.detach(),
             }
             return combined
-    
-    # 损失函数
-    # criterion = F.mse_loss  # 使用均方误差损失
 
     def _slugify(text: str) -> str:
         return "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in str(text))
@@ -529,6 +536,9 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     if config.train_encoder:
         best_encoder_path = results_dir / f"best_encoder.pt"
         last_encoder_path = results_dir / f"last_encoder.pt"
+    else:
+        best_encoder_path = None
+        last_encoder_path = None
     # 指标计算器
     metrics = SeismicMetrics()
     

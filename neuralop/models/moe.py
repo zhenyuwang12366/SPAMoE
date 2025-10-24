@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
-from typing import List, Dict, Union, Tuple, Callable, Optional
+from typing import List, Dict, Union, Tuple, Callable, Optional, Any
 from collections import Counter
 
 from .base_model import BaseModel
@@ -595,12 +595,11 @@ class MOEOperator(BaseModel, name='MOE'):
         return y_full
 
     # ---------------- 核心：批处理版激活组计算 ----------------
-    @torch.no_grad()
     def _process_activation_group(
         self,
         x: torch.Tensor,
         expert_indices: torch.Tensor,   # [B, top_k]
-        routing_weights: torch.Tensor,  # [B, top_k]
+        routing_weights: torch.Tensor,  # [B, top_k] 或 None
         k: int,
         batch_size: int,
         device,
@@ -608,42 +607,52 @@ class MOEOperator(BaseModel, name='MOE'):
         **kwargs,
     ) -> List[torch.Tensor]:
         """
-        返回长度为 k 的列表，每个元素是 [B, C, H, W]（已经乘以该列的 routing 权重）。
-        - 直接专家模式（无 type_weights）：每列 k_idx：
-            1) 按 expert_idx 聚合 -> {eid: [n_e,C,H,W]}
-            2) 一次 forward_many
-            3) 回填到 [B,C,H,W] 并乘以 routing 权重
-        - 分组模式（有 type_weights, 组内 T 专家 × 类型权重）：
-            1) 将 (group_id, t) 展开为 eid=group_id*T+t，按 eid 聚合
-            2) 一次 forward_many
-            3) 对每个样本按 t 用 type_weights[b,t] 累加，再乘以该列 routing 权重
+        要点：
+        1) 按专家聚合，一次前向（forward_many 或 per-expert 批处理）；
+        2) 像老版本一样：把“形状对齐 + 按样本路由加权”放在最后统一执行；
+        3) 提示信息与老版本一致，且 print(..., flush=True) 及时打印。
+        返回：长度为 top_k 的列表，每个 [B,C,H,W]。
         """
+        # ------------------ 打印封装（及时 flush） ------------------
+        def _log(msg: str):
+            if getattr(self, "is_logger", False):
+                print(msg, flush=True)
+
+        # ------------------ 基本校验与准备 ------------------
         top_k = int(k)
         if top_k <= 0:
             return []
 
         if expert_indices is None:
             raise ValueError("expert_indices 为空，无法获取路由结果。")
+        if expert_indices.size(1) < top_k:
+            raise ValueError(f"expert_indices 的列数不足以支持 top_k={top_k}")
 
         if routing_weights is None:
             routing_weights = torch.ones(batch_size, top_k, device=device, dtype=x.dtype)
+        elif routing_weights.size(1) < top_k:
+            raise ValueError(f"routing_weights 的列数不足以支持 top_k={top_k}")
         else:
             routing_weights = routing_weights.to(device=device, dtype=x.dtype)
 
-        C = self.out_channels if self.out_channels > 0 else x.size(1)
+        C = self.out_channels if getattr(self, "out_channels", 0) > 0 else x.size(1)
         total_experts = len(self.experts)
-        grouped_mode = (self.moe_mode == 'group') and (type_weights is not None)
+        grouped_mode = (getattr(self, "moe_mode", None) == "group") and (type_weights is not None)
 
-        # 检查分组模式一致性
+        # ---- 分组一致性与类型权重准备 ----
         if grouped_mode:
             if type_weights.dim() == 1:
                 type_weights = type_weights.view(1, -1).expand(batch_size, -1)
             if type_weights.size(0) != batch_size:
                 raise ValueError(f"type_weights batch 维度不一致: {type_weights.size(0)} vs {batch_size}")
-            T = self.types_per_group
-            if type_weights.size(1) != T:
-                if self.is_logger:
-                    print(f"[WARN] type_weights 列={type_weights.size(1)} 与组内专家数 T={T} 不一致，降级为直接模式。")
+
+            T = getattr(self, "types_per_group", None)
+            if T is None:
+                _log("[WARN] 未设置 types_per_group，降级为直接模式。")
+                grouped_mode = False
+                type_weights = None
+            elif type_weights.size(1) != T:
+                _log(f"[WARN] type_weights 列={type_weights.size(1)} 与组内专家数 T={T} 不一致，降级为直接模式。")
                 grouped_mode = False
                 type_weights = None
             else:
@@ -651,14 +660,63 @@ class MOEOperator(BaseModel, name='MOE'):
                 experts_per_group = total_experts // max(1, self.num_experts)
                 if (expected_total == 0 or total_experts < expected_total
                     or total_experts % T != 0 or experts_per_group != T):
-                    if self.is_logger:
-                        print(f"[WARN] 专家数量 {total_experts} 与分组结构不匹配（期望 {expected_total}），降级为直接模式。")
+                    _log(f"[WARN] 专家数量 {total_experts} 与分组结构不匹配（期望 {expected_total}），降级为直接模式。")
                     grouped_mode = False
                     type_weights = None
                 else:
                     type_weights = type_weights.to(device=device, dtype=x.dtype)
 
-        outputs_per_k: List[torch.Tensor] = []
+        # ------------------ 工具函数（与老版本语义一致） ------------------
+        def _zeros_like_x(bsz: int, channels: int, like: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(bsz, channels, *like.shape[2:], device=like.device, dtype=like.dtype)
+
+        def _most_common_target_shape(
+            all_shapes: List[Tuple[int, ...]],
+            default_shape: Optional[Tuple[int, ...]] = None
+        ) -> Tuple[int, ...]:
+            """
+            从收集到的空间形状中选出 target_shape。
+            若 all_shapes 为空则回退到 default_shape（若提供）或 x 的空间形状。
+            """
+            if not all_shapes:
+                return tuple(default_shape) if default_shape is not None else tuple(x.shape[2:])
+            ndims = [len(s) for s in all_shapes]
+            target_ndim = Counter(ndims).most_common(1)[0][0]
+            shapes_same_ndim = [s for s in all_shapes if len(s) == target_ndim]
+            target = []
+            for d in range(target_ndim):
+                dim_sizes = [s[d] for s in shapes_same_ndim]
+                target.append(Counter(dim_sizes).most_common(1)[0][0])
+            return tuple(target)
+
+        def _resize_to(out: torch.Tensor, target_shape: Tuple[int, ...]) -> torch.Tensor:
+            if out is None or out.dim() < 4 or out.shape[2:] == target_shape:
+                return out
+            try:
+                if len(target_shape) == 3:
+                    mode = 'trilinear'
+                elif len(target_shape) == 2:
+                    mode = 'bilinear'
+                else:
+                    mode = 'linear'
+                return F.interpolate(out, size=target_shape, mode=mode, align_corners=True)
+            except Exception as e:
+                _log(f"[ERROR] 插值失败: {e}；用零张量兜底。in={tuple(out.shape)} target={target_shape}")
+                return torch.zeros(out.shape[0], out.shape[1], *target_shape, device=out.device, dtype=out.dtype)
+
+        def _apply_sample_weights(batch_tensor: torch.Tensor, sample_wts: torch.Tensor) -> torch.Tensor:
+            if sample_wts.dim() == 1:
+                sample_wts = sample_wts.view(-1, 1, 1, 1)
+            elif sample_wts.dim() == 2 and sample_wts.shape[1] == 1:
+                sample_wts = sample_wts.view(-1, 1, 1, 1)
+            return batch_tensor * sample_wts
+
+        # 形状日志，与老版本保持一致风格（只存 shape，避免持有显存）
+        shape_log: Dict[Any, List[Tuple[int, ...]]] = {}
+
+        # ------------------ 主过程：逐 k 计算“未对齐、未乘路由权重”的逐样本输出 ------------------
+        # 每个 k_idx -> (List[torch.Tensor: [1,C,h,w] * B], sample_weights: [B])
+        collected: List[Tuple[List[torch.Tensor], torch.Tensor]] = []
 
         for k_idx in range(top_k):
             indices_k: torch.Tensor = expert_indices[:, k_idx]   # [B]
@@ -666,36 +724,55 @@ class MOEOperator(BaseModel, name='MOE'):
             weights_k = weights_k.to(device=device, dtype=x.dtype)
 
             if not grouped_mode:
-                # -------- 直接专家模式：一次 per-expert mini-batch 前向 --------
+                # -------- 直接专家模式：按专家聚合、一次前向、scatter 回填为 [B,C,h,w]，但先不乘路由权重 --------
                 routed, meta = self._pack_by_expert(indices_k, x)
 
                 if not routed:
-                    outputs_per_k.append(torch.zeros(batch_size, C, *x.shape[2:], device=device, dtype=x.dtype))
+                    # 这一列 k 没有任何路由命中
+                    batch_outputs = [_zeros_like_x(1, C, x[b:b+1]) for b in range(batch_size)]
+                    collected.append((batch_outputs, weights_k))
                     continue
 
-                # 一次前向（代理 or 直连）
-                if getattr(self, "expert_proxy", None) is not None:
-                    y_by_eid = self.expert_proxy.forward_many(routed)
-                else:
-                    y_by_eid = {eid: self.experts[eid](x_sub, **kwargs) for eid, x_sub in routed.items()}
+                # 前向（代理 or 直连），带兜底
+                try:
+                    if getattr(self, "expert_proxy", None) is not None:
+                        y_by_eid = self.expert_proxy.forward_many(routed)
+                    else:
+                        y_by_eid = {}
+                        for eid, x_sub in routed.items():
+                            try:
+                                y_by_eid[eid] = self.experts[eid](x_sub, **kwargs)
+                            except Exception as e:
+                                _log(f"[ERROR] 专家 {eid} 处理异常：{e}，使用零张量代替")
+                                y_by_eid[eid] = _zeros_like_x(x_sub.size(0), C, x_sub)
+                except Exception as e:
+                    _log(f"[ERROR] forward_many 异常：{e}；该列以零张量兜底")
+                    batch_outputs = [_zeros_like_x(1, C, x[b:b+1]) for b in range(batch_size)]
+                    collected.append((batch_outputs, weights_k))
+                    continue
 
-                # 统一空间形状
-                spatial_shapes = [tuple(y.shape[2:]) for y in y_by_eid.values() if y.dim() >= 4]
-                target_shape = self._most_common_shape(spatial_shapes, default_shape=tuple(x.shape[2:]))
+                # 形状日志（每个专家一条）
+                for eid, y in y_by_eid.items():
+                    if y is not None:
+                        shape_log.setdefault(("expert", int(eid)), []).append(tuple(y.shape))
+
+                # 暂不全局对齐：先局部统一到本列最常见形状，便于 scatter
+                spatial_shapes = [tuple(y.shape[2:]) for y in y_by_eid.values() if y is not None and y.dim() >= 4]
+                target_shape_local = _most_common_target_shape(spatial_shapes, default_shape=tuple(x.shape[2:]))
                 for eid in list(y_by_eid.keys()):
-                    y_by_eid[eid] = self._resize_to_shape(y_by_eid[eid], target_shape).contiguous()
+                    y_by_eid[eid] = _resize_to(y_by_eid[eid], target_shape_local).contiguous()
 
-                # 回填为 [B,C,H,W]
-                y_full = self._scatter_back(y_by_eid, meta, batch_size, C, target_shape, device, x.dtype)
-                # 逐样本乘以该列的 routing 权重
-                y_full = y_full * weights_k.view(-1, 1, 1, 1)
-                outputs_per_k.append(y_full)
+                y_full = self._scatter_back(y_by_eid, meta, batch_size, C, target_shape_local, device, x.dtype)
+
+                # 拆为逐样本 [1,C,h,w]（后续统一全局对齐）
+                batch_outputs = [y_full[b:b+1] for b in range(batch_size)]
+                collected.append((batch_outputs, weights_k))
 
             else:
-                # -------- 分组模式：把 (group, t) 展开为具体专家，合一批处理 --------
+                # -------- 分组模式：把 (group, t) 展开为具体专家，合一批处理；先按 type_weights 加权到样本，不乘路由权重 --------
                 T = self.types_per_group
-                routed: Dict[int, torch.Tensor] = {}
-                meta: Dict[int, Tuple[List[int], List[int]]] = {}
+                routed_dict: Dict[int, torch.Tensor] = {}
+                meta_dict: Dict[int, Tuple[List[int], List[int]]] = {}
 
                 group_ids = indices_k  # [B]
                 for b in range(batch_size):
@@ -707,79 +784,121 @@ class MOEOperator(BaseModel, name='MOE'):
                         if eid >= total_experts:
                             continue
                         x_slice = x[b:b+1]
-                        if eid not in routed:
-                            routed[eid] = [x_slice]
-                            meta[eid] = ([b], [1])
+                        if eid not in routed_dict:
+                            routed_dict[eid] = [x_slice]
+                            meta_dict[eid] = ([b], [1])
                         else:
-                            routed[eid].append(x_slice)
-                            meta[eid][0].append(b)
-                            meta[eid][1].append(1)
+                            routed_dict[eid].append(x_slice)
+                            meta_dict[eid][0].append(b)
+                            meta_dict[eid][1].append(1)
 
-                if not routed:
-                    outputs_per_k.append(torch.zeros(batch_size, C, *x.shape[2:], device=device, dtype=x.dtype))
+                if not routed_dict:
+                    batch_outputs = [_zeros_like_x(1, C, x[b:b+1]) for b in range(batch_size)]
+                    collected.append((batch_outputs, weights_k))
                     continue
 
                 # 拼接 mini-batch
-                for eid in routed:
-                    routed[eid] = torch.cat(routed[eid], dim=0).contiguous()
+                for eid in routed_dict:
+                    routed_dict[eid] = torch.cat(routed_dict[eid], dim=0).contiguous()
 
-                # 一次前向（代理 or 直连）
-                if getattr(self, "expert_proxy", None) is not None:
-                    y_by_eid = self.expert_proxy.forward_many(routed)
-                else:
-                    y_by_eid = {eid: self.experts[eid](x_sub, **kwargs) for eid, x_sub in routed.items()}
+                # 前向（代理 or 直连），带兜底
+                try:
+                    if getattr(self, "expert_proxy", None) is not None:
+                        y_by_eid = self.expert_proxy.forward_many(routed_dict)
+                    else:
+                        y_by_eid = {}
+                        for eid, x_sub in routed_dict.items():
+                            try:
+                                y_by_eid[eid] = self.experts[eid](x_sub, **kwargs)
+                            except Exception as e:
+                                _log(f"[ERROR] 专家 {eid} 处理异常：{e}，使用零张量代替")
+                                y_by_eid[eid] = _zeros_like_x(x_sub.size(0), C, x_sub)
+                except Exception as e:
+                    _log(f"[ERROR] forward_many 异常：{e}；该列以零张量兜底")
+                    batch_outputs = [_zeros_like_x(1, C, x[b:b+1]) for b in range(batch_size)]
+                    collected.append((batch_outputs, weights_k))
+                    continue
 
-                # 统一空间形状
-                spatial_shapes = [tuple(y.shape[2:]) for y in y_by_eid.values() if y.dim() >= 4]
-                target_shape = self._most_common_shape(spatial_shapes, default_shape=tuple(x.shape[2:]))
+                # 形状日志（按组内 t 记录）
+                for eid, y in y_by_eid.items():
+                    if y is not None:
+                        g = int(eid // T); t = int(eid % T)
+                        shape_log.setdefault(("group", g, t), []).append(tuple(y.shape))
+
+                # 局部统一到本列最常见形状，便于逐样本累加
+                spatial_shapes = [tuple(y.shape[2:]) for y in y_by_eid.values() if y is not None and y.dim() >= 4]
+                target_shape_local = _most_common_target_shape(spatial_shapes, default_shape=tuple(x.shape[2:]))
+
                 for eid in list(y_by_eid.keys()):
-                    y_by_eid[eid] = self._resize_to_shape(y_by_eid[eid], target_shape).contiguous()
+                    y_by_eid[eid] = _resize_to(y_by_eid[eid], target_shape_local).contiguous()
 
-                # 组内按 t 加权累加到样本位
-                H, W = target_shape
+                H, W = target_shape_local
                 y_group = torch.zeros(batch_size, C, H, W, device=device, dtype=x.dtype)
+
+                # 向量化回填：对同一 eid 的所有样本一次性 index_add_
                 for eid, y_sub in y_by_eid.items():
-                    positions, _ = meta[eid]
+                    positions, _ = meta_dict[eid]         # List[int]，长度 N
+                    if len(positions) == 0:
+                        continue
+                    idx = torch.tensor(positions, device=device, dtype=torch.long)  # [N]
                     local_t = eid % T
-                    for i, pos in enumerate(positions):
-                        tw = type_weights[pos, local_t]   # 标量
-                        y_group[pos:pos+1] += y_sub[i:i+1] * tw
+                    tw = type_weights[idx, local_t].view(-1, 1, 1, 1)               # [N,1,1,1]
+                    # y_sub: [N,C,H,W]（已被局部对齐）
+                    y_group.index_add_(0, idx, y_sub * tw)
 
-                # 乘以该列的路由权重
-                y_group = y_group * weights_k.view(-1, 1, 1, 1)
-                outputs_per_k.append(y_group)
+                # 拆成逐样本 [1,C,h,w]；后续再统一“全局对齐 + 按样本路由加权”
+                batch_outputs = [y_group[b:b+1] for b in range(batch_size)]
+                collected.append((batch_outputs, weights_k))
 
-        return outputs_per_k
+        # ------------------ 统一形状对齐 + 统一按样本路由加权（与老版本一致） ------------------
+        # 收集所有输出的空间形状
+        all_spatial_shapes: List[Tuple[int, ...]] = []
+        for batch_outputs, _ in collected:
+            for out in batch_outputs:
+                if out is not None and out.dim() >= 4:
+                    all_spatial_shapes.append(tuple(out.shape[2:]))
 
-    # ---------------- 其它工具 & 初始化 ----------------
-    @staticmethod
-    def _most_common_shape(shapes: List[Tuple[int, ...]], default_shape: Tuple[int, ...]) -> Tuple[int, ...]:
-        if not shapes:
-            return default_shape
-        ndims = [len(s) for s in shapes]
-        target_ndim = Counter(ndims).most_common(1)[0][0]
-        candidates = [s for s in shapes if len(s) == target_ndim]
-        result = []
-        for dim in range(target_ndim):
-            dim_sizes = [s[dim] for s in candidates]
-            result.append(Counter(dim_sizes).most_common(1)[0][0])
-        return tuple(result)
+        if not all_spatial_shapes:
+            _log("[WARN] 没有有效输出，返回零张量列表")
+            return [torch.zeros(batch_size, C, *x.shape[2:], device=device, dtype=x.dtype) for _ in range(top_k)]
 
-    def _resize_to_shape(self, tensor: torch.Tensor, target_shape: Tuple[int, ...]) -> torch.Tensor:
-        if tensor.dim() < 4 or tensor.shape[2:] == target_shape:
-            return tensor
-        try:
-            if len(target_shape) == 2:
-                mode = 'bilinear'
-            elif len(target_shape) == 3:
-                mode = 'trilinear'
-            else:
-                mode = 'linear'
-            return F.interpolate(tensor, size=target_shape, mode=mode, align_corners=False)
-        except Exception as exc:
-            if self.is_logger:
-                print(f"[WARN] 插值到 {target_shape} 失败：{exc}，使用零张量替代。")
-            return tensor.new_zeros(tensor.size(0), tensor.size(1), *target_shape)
+        target_shape = _most_common_target_shape(all_spatial_shapes)
+        _log(f"[INFO] 目标形状（对齐用）: {target_shape}")
+
+        outputs: List[torch.Tensor] = []
+        for batch_outputs, sample_wts in collected:
+            adjusted = []
+            for out in batch_outputs:
+                out_adj = _resize_to(out, target_shape)
+                adjusted.append(out_adj)
+
+            # 合并为 [B,C,H,W]
+            try:
+                stacked = torch.cat(adjusted, dim=0)  # [B,C,H,W]
+            except Exception as e:
+                bad_shapes = [tuple(a.shape) for a in adjusted]
+                _log(f"[ERROR] 合并组/专家输出失败：{e}；形状列表：{bad_shapes}；跳过该条目")
+                # 跳过这个 k_idx
+                continue
+
+            weighted = _apply_sample_weights(stacked, sample_wts)  # 逐样本广播乘权
+            outputs.append(weighted)
+
+        if not outputs:
+            _log("[WARN] 没有有效的组/专家输出，返回零张量列表")
+            return [torch.zeros(batch_size, C, *target_shape, device=device, dtype=x.dtype) for _ in range(top_k)]
+
+        if len(shape_log) > 0:
+            _log("[DEBUG] 专家/组内子模型输出形状样例（最多每类展示3条）：")
+            shown = 0
+            for key, shapes in shape_log.items():
+                _log(f"  {key}: {shapes[:3]}{' ...' if len(shapes) > 3 else ''}")
+                shown += 1
+                if shown >= 20:
+                    _log("  ... ")
+                    break
+
+        return outputs
 
     def reset_parameters_(self):
         neg_slope = 0.2
