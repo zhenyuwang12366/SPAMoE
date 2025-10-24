@@ -366,7 +366,7 @@ def get_encoder(in_channels: int = 1, out_channels: int | None = None, num_types
         out_channels = 64
 
     # ★ 如果你已经把权重下载到本地，请把路径改成你实际的文件：
-    local_ckpt = "/data1/home/teacher/teacher_s/t108790/weights/vit_small_patch16_dinov3.lvd1689m.safetensors"
+    local_ckpt = "pretrain_weight/vit_small_patch16_dinov3.lvd1689m.safetensors"
     use_local = os.path.isfile(local_ckpt)
 
     model = Encoder_Dino(
