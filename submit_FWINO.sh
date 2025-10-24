@@ -45,4 +45,5 @@ bash scripts/run_distributed_seismic_moe.sh \
   --lambda_g1v 0.43947650935102966 \
   --lambda_g2v 0.35339805101397564 \
   --lambda_grad_l1 0.15 \
-  --lambda_fourier_mag_l1 0.05
+  --lambda_fourier_mag_l1 0.05 \
+  --use_amp
