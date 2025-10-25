@@ -56,10 +56,20 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     is_logger = runtime_ctx["is_logger"]
     world_size = runtime_ctx["world_size"]
     local_rank = runtime_ctx["local_rank"]
-    val_ratio = runtime_ctx["val_ratio"]
     experts_name = runtime_ctx["experts_name"]
     experts_name_str = runtime_ctx["experts_name_str"]
     use_amp = config.use_amp
+    
+    if config.family in ['curve_vel_a', 'curve_vel_b']:
+        val_ratio = 6 / 30
+    elif config.family in ['curve_fault_a', 'curve_fault_b', 'flat_fault_a', 'flat_fault_b']:
+        val_ratio = 6 / 54
+    elif config.family in ['style_a', 'style_b']:
+        val_ratio = 7 / 67
+    elif config.family == 'all':
+        val_ratio = runtime_ctx["val_ratio"]
+    else:
+        raise ValueError("不支持的 family")
     
     if config.family == 'all':
         # 1) 构建 train/val 两个 Zarr 数据集（直接按 splits 读取，不再 random_split）
