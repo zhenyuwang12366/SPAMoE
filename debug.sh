@@ -4,9 +4,9 @@ srun --partition=gpu-4090-2 --gres=gpu:1 --cpus-per-task=10 --pty bash
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m pdb scripts/train_seismic_moe.py \
   --mode train \
-  --model_name FNO \
+  --model_name WNO \
   --use_encoder \
-  --backbone convnext_tiny \
+  --backbone vit \
   --concat_channels \
   --is_specific \
   --num_workers 10 \
@@ -17,7 +17,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m pdb scripts/train_sei
   --epochs 100 \
   --output_dir ../results \
   --top_k 1 \
-  --choose_experts 0 \
+  --choose_experts 1 \
   --hidden_channels 96 \
   --learning_rate 0.00026711555047527854 \
   --weight_decay 0.08952068376871994 \

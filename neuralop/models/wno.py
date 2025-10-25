@@ -1,10 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 WNO2d (DWT/DTCWT) + WNO3d (DWT) 一体化实现
-- 与 wavelet_conv.py 的 WaveConv2d / WaveConv2dCwt / WaveConv3d 完全对口
-- 小波路径禁用 AMP（fp16/bf16 下更稳），其余层可使用 AMP
-- 每层结构：x ← K(x) + W(x)；最后一层不激活；Channel-MLP 走残差
-- 2^L 对齐的样本级 padding（右/下/后补齐），退出时精确裁剪
 """
 
 import contextlib
@@ -14,11 +10,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    import torch.cuda.amp as amp
-except ImportError:
-    amp = None
-
 Number = Union[float, int]
 
 # === 你的工程内模块 ===
@@ -27,51 +18,6 @@ from ..layers.wavelet_conv import WaveConv2d, WaveConv2dCwt, WaveConv3d
 from ..layers.padding import DomainPadding
 from ..layers.channel_mlp import ChannelMLP
 from .base_model import BaseModel
-
-
-# -----------------------------
-# 工具: 固定到 2^L 倍数的 padding + 精确裁剪
-# -----------------------------
-def _ceil_to(x: int, m: int) -> int:
-    return ((x + m - 1) // m) * m
-
-def pad_to_pow2_hw(x: torch.Tensor, levels: Tuple[int, ...], mode: str) -> Tuple[torch.Tensor, dict]:
-    """
-    2D: 只对 H,W 进行右/下补齐，使其能被 2^L 整除；返回补齐后的张量与 meta。
-    x: [B,C,H,W]
-    """
-    assert x.dim() == 4, f"pad_to_pow2_hw 仅支持 4D 张量，收到 {x.shape}"
-    H, W = x.shape[-2:]
-    multiple = 2 ** max(levels)
-    Ht, Wt = _ceil_to(H, multiple), _ceil_to(W, multiple)
-    pad = (0, Wt - W, 0, Ht - H)   # (left,right,top,bottom) -> 只补右/下
-    x_pad = F.pad(x, pad, mode=mode) if (pad[1] or pad[3]) else x
-    meta = {"orig_hw": (H, W)}
-    return x_pad, meta
-
-def unpad_from_meta_hw(x: torch.Tensor, meta: dict) -> torch.Tensor:
-    H, W = meta["orig_hw"]
-    return x[..., :H, :W]
-
-def pad_to_pow2_dhw(x: torch.Tensor, levels: Tuple[int, ...], mode: str = "symmetric"):
-    """
-    3D: 只对 D,H,W 进行右/后/下补齐，使其能被 2^L 整除；返回补齐张量与 meta。
-    x: [B,C,D,H,W]
-    """
-    assert x.dim() == 5, f"pad_to_pow2_dhw 仅支持 5D 张量，收到 {x.shape}"
-    D, H, W = x.shape[-3:]
-    multiple = 2 ** max(levels)
-    Dt, Ht, Wt = _ceil_to(D, multiple), _ceil_to(H, multiple), _ceil_to(W, multiple)
-    # pad 顺序: (W_left, W_right, H_top, H_bottom, D_front, D_back)
-    pad = (0, Wt - W, 0, Ht - H, 0, Dt - D)   # 只补右/下/后
-    x_pad = F.pad(x, pad, mode=mode) if (pad[1] or pad[3] or pad[5]) else x
-    meta = {"orig_dhw": (D, H, W)}
-    return x_pad, meta
-
-def unpad_from_meta_dhw(x: torch.Tensor, meta: dict) -> torch.Tensor:
-    D, H, W = meta["orig_dhw"]
-    return x[..., :D, :H, :W]
-
 
 # -----------------------------
 # 归一化工厂: 小 batch 稳定优先 -> GroupNorm
@@ -188,25 +134,21 @@ class WNOBlock2d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 仅小波路径禁用 AMP，保证 DWT/IDWT / DTCWT 数值稳定
-        amp_ctx = torch.amp.autocast(enabled=False) if torch.cuda.is_available() else contextlib.nullcontext()
-        with amp_ctx:
-            pad_mode = 'symmetric' if self.conv_kind == 'dwt' else 'reflect'
-            x, meta = pad_to_pow2_hw(x, self.n_levels, mode=pad_mode)
+        pad_mode = 'symmetric' if self.conv_kind == 'dwt' else 'reflect'
 
-            for i in range(self.n_layers):
-                kx = self.convs[i](x)            # K(x)
-                wx = self.w_local[i](x)          # W(x)
-                x = kx + wx
+        for i in range(self.n_layers):
+            kx = self.convs[i](x)            # K(x)
+            wx = self.w_local[i](x)          # W(x)
+            x = kx + wx
 
-                if i != self.n_layers - 1:
-                    x = self.non_linearity(x)
+            if i != self.n_layers - 1:
+                x = self.non_linearity(x)
 
-                if self.use_channel_mlp:
-                    mlp_out = self.channel_mlps[i](x)
-                    skip = self.channel_mlp_skips[i](x)
-                    x = self.non_linearity(mlp_out + skip)
+            if self.use_channel_mlp:
+                mlp_out = self.channel_mlps[i](x)
+                skip = self.channel_mlp_skips[i](x)
+                x = self.non_linearity(mlp_out + skip)
 
-            x = unpad_from_meta_hw(x, meta)
         return x
 
 
@@ -245,7 +187,6 @@ class WNO2d(BaseModel):
         channel_mlp_dropout: float = 0.0,
         channel_mlp_expansion: float = 0.5,
         non_linearity = F.gelu,
-        use_amp: bool = True,
         use_group_norm: bool = True,
         dropout_rate: float = 0.10,
         lifting_channels: Optional[int] = None,
@@ -266,7 +207,6 @@ class WNO2d(BaseModel):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.n_layers = n_layers
-        self.use_amp = bool(use_amp and torch.cuda.is_available())
         self.dropout_rate = float(dropout_rate)
         self.base_size = base_size
 
@@ -331,13 +271,8 @@ class WNO2d(BaseModel):
         self.projection_norm = make_norm(self.out_channels, 2, use_group_norm)
         self.projection_drop = nn.Dropout(self.dropout_rate) if self.dropout_rate > 0 else nn.Identity()
 
-    # 外层可用 AMP；小波路径内部已禁用
     def forward(self, x: torch.Tensor, output_shape: Optional[Tuple[int, ...]] = None, **kwargs) -> torch.Tensor:
-        if self.use_amp and amp is not None:
-            with torch.amp.autocast(enabled=True):
-                return self._forward_impl(x, output_shape=output_shape, **kwargs)
-        else:
-            return self._forward_impl(x, output_shape=output_shape, **kwargs)
+        return self._forward_impl(x, output_shape=output_shape, **kwargs)
 
     def _forward_impl(self, x: torch.Tensor, output_shape: Optional[Tuple[int, ...]] = None, **kwargs) -> torch.Tensor:
         B, C, H, W = x.shape
@@ -450,24 +385,19 @@ class WNOBlock3d(nn.Module):
             self.channel_mlp_skips = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        amp_ctx = torch.cuda.amp.autocast(enabled=False) if torch.cuda.is_available() else contextlib.nullcontext()
-        with amp_ctx:
-            x, meta = pad_to_pow2_dhw(x, self.n_levels, mode=self.dwt_mode)
+        for i in range(self.n_layers):
+            kx = self.convs[i](x)            # K(x)
+            wx = self.w_local[i](x)          # W(x)
+            x = kx + wx
 
-            for i in range(self.n_layers):
-                kx = self.convs[i](x)            # K(x)
-                wx = self.w_local[i](x)          # W(x)
-                x = kx + wx
+            if i != self.n_layers - 1:
+                x = self.non_linearity(x)
 
-                if i != self.n_layers - 1:
-                    x = self.non_linearity(x)
+            if self.use_channel_mlp:
+                mlp_out = self.channel_mlps[i](x)
+                skip = self.channel_mlp_skips[i](x)
+                x = self.non_linearity(mlp_out + skip)
 
-                if self.use_channel_mlp:
-                    mlp_out = self.channel_mlps[i](x)
-                    skip = self.channel_mlp_skips[i](x)
-                    x = self.non_linearity(mlp_out + skip)
-
-            x = unpad_from_meta_dhw(x, meta)
         return x
 
 
@@ -499,7 +429,6 @@ class WNO3d(BaseModel):
         channel_mlp_dropout: float = 0.0,
         channel_mlp_expansion: float = 0.5,
         non_linearity = F.gelu,
-        use_amp: bool = True,
         use_group_norm: bool = True,
         dropout_rate: float = 0.10,
         lifting_channels: Optional[int] = None,
@@ -513,7 +442,6 @@ class WNO3d(BaseModel):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.n_layers = n_layers
-        self.use_amp = bool(use_amp and torch.cuda.is_available())
         self.dropout_rate = float(dropout_rate)
         self.base_size = base_size
         self.wavelet = wavelet
@@ -579,12 +507,8 @@ class WNO3d(BaseModel):
 
     # 外层仍可使用 AMP；小波路径内部已禁用
     def forward(self, x: torch.Tensor, output_shape: Optional[Tuple[int, ...]] = None, **kwargs) -> torch.Tensor:
-        if self.use_amp and amp is not None:
-            with torch.amp.autocast(enabled=True):
-                return self._forward_impl(x, output_shape=output_shape, **kwargs)
-        else:
-            return self._forward_impl(x, output_shape=output_shape, **kwargs)
-
+        return self._forward_impl(x, output_shape=output_shape, **kwargs)
+        
     def _forward_impl(self, x: torch.Tensor, output_shape: Optional[Tuple[int, ...]] = None, **kwargs) -> torch.Tensor:
         B, C, D, H, W = x.shape
         original_dhw = (D, H, W)
