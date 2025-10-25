@@ -59,15 +59,8 @@ WNO_H=2
 WNO_W=2
 # —— WNO 结构新增 ——
 WNO_N_LAYERS=4
-WNO_BLOCK_N_LAYERS=2
 WNO_DROPOUT_RATE=0.1
 WAVELET_TYPE="db6"   # haar | db4
-WNO_PAD_MODE=""
-WNO_ENSURE_SHAPES=""
-WNO_ADAPTIVE_PADDING=""
-WNO_USE_CHANNEL_MLP=""
-WNO_CHANNEL_MLP_DROPOUT=""
-WNO_CHANNEL_MLP_EXPANSION=""
 DTCWT_TYPE=()
 
 MNO_SCALES=3
@@ -181,18 +174,8 @@ while [[ $# -gt 0 ]]; do
     --WNO_n_levels_height) WNO_H="$2"; shift 2 ;;
     --WNO_n_levels_width) WNO_W="$2"; shift 2 ;;
     --WNO_n_layers) WNO_N_LAYERS="$2"; shift 2 ;;
-    --WNO_block_n_layers) WNO_BLOCK_N_LAYERS="$2"; shift 2 ;;
     --WNO_dropout_rate) WNO_DROPOUT_RATE="$2"; shift 2 ;;
     --wavelet_type) WAVELET_TYPE="$2"; shift 2 ;;
-    --WNO_pad_mode) WNO_PAD_MODE="$2"; shift 2 ;;
-    --WNO_ensure_even_shapes) WNO_ENSURE_SHAPES="1"; shift ;;
-    --WNO_disable_ensure_even_shapes) WNO_ENSURE_SHAPES="0"; shift ;;
-    --WNO_adaptive_padding) WNO_ADAPTIVE_PADDING="1"; shift ;;
-    --WNO_disable_adaptive_padding) WNO_ADAPTIVE_PADDING="0"; shift ;;
-    --WNO_use_channel_mlp) WNO_USE_CHANNEL_MLP="1"; shift ;;
-    --WNO_disable_channel_mlp) WNO_USE_CHANNEL_MLP="0"; shift ;;
-    --WNO_channel_mlp_dropout) WNO_CHANNEL_MLP_DROPOUT="$2"; shift 2 ;;
-    --WNO_channel_mlp_expansion) WNO_CHANNEL_MLP_EXPANSION="$2"; shift 2 ;;
     --dtcwt_type) shift; DTCWT_TYPE=(); while [[ $# -gt 0 && $1 != --* ]]; do DTCWT_TYPE+=("$1"); shift; done ;;
 
     --MNO_n_scales) MNO_SCALES="$2"; shift 2 ;;
@@ -436,7 +419,6 @@ ARGS=(
   --WNO_n_levels_height "$WNO_H"
   --WNO_n_levels_width "$WNO_W"
   --WNO_n_layers "$WNO_N_LAYERS"
-  --WNO_block_n_layers "$WNO_BLOCK_N_LAYERS"
   --WNO_dropout_rate "$WNO_DROPOUT_RATE"
   --wavelet_type "$WAVELET_TYPE"
   --MNO_n_scales "$MNO_SCALES"
@@ -520,30 +502,6 @@ fi
 [[ -n "$LAMBDA_SSIM" ]] && ARGS+=( --lambda_ssim "$LAMBDA_SSIM" )
 
 [[ ${#DTCWT_TYPE[@]} -eq 2 ]] && ARGS+=( --dtcwt_type "${DTCWT_TYPE[@]}" )
-[[ -n "$WNO_PAD_MODE" ]] && ARGS+=( --WNO_pad_mode "$WNO_PAD_MODE" )
-if [[ "$WNO_ENSURE_SHAPES" == "1" ]]; then
-  ARGS+=( --WNO_ensure_even_shapes )
-elif [[ "$WNO_ENSURE_SHAPES" == "0" ]]; then
-  ARGS+=( --WNO_disable_ensure_even_shapes )
-fi
-if [[ "$WNO_ADAPTIVE_PADDING" == "1" ]]; then
-  ARGS+=( --WNO_adaptive_padding )
-elif [[ "$WNO_ADAPTIVE_PADDING" == "0" ]]; then
-  ARGS+=( --WNO_disable_adaptive_padding )
-fi
-if [[ "$WNO_USE_CHANNEL_MLP" == "1" ]]; then
-  ARGS+=( --WNO_use_channel_mlp )
-elif [[ "$WNO_USE_CHANNEL_MLP" == "0" ]]; then
-  ARGS+=( --WNO_disable_channel_mlp )
-fi
-[[ -n "$WNO_CHANNEL_MLP_DROPOUT" ]] && ARGS+=( --WNO_channel_mlp_dropout "$WNO_CHANNEL_MLP_DROPOUT" )
-[[ -n "$WNO_CHANNEL_MLP_EXPANSION" ]] && ARGS+=( --WNO_channel_mlp_expansion "$WNO_CHANNEL_MLP_EXPANSION" )
-[[ -n "$GEOFNO_WIDTH" ]] && ARGS+=( --GeoFNO_width "$GEOFNO_WIDTH" )
-if [[ "$GEOFNO_IS_MESH" == "1" ]]; then
-  ARGS+=( --GeoFNO_is_mesh )
-elif [[ "$GEOFNO_IS_MESH" == "0" ]]; then
-  ARGS+=( --GeoFNO_disable_is_mesh )
-fi
 
 # 可选开关类参数
 [[ "$USE_AMP" -eq 1 ]]   && ARGS+=( --use_amp )

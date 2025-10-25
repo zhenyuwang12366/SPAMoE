@@ -98,10 +98,12 @@ class SeismicMOEConfig(Default):
             'n_dim': 2,
             'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
             'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
-            'wavelet_type': 'haar',
-            'ensure_even_shapes': True,  # 确保形状为偶数
-            'pad_mode': 'reflect',  # 添加填充模式
-            'adaptive_padding': True,  # 启用自适应填充
+            'conv_kind': 'dwt',
+            'wavelet': 'db6',
+            'biort': 'near_sym_b',
+            'qshift': 'qshift_b',
+            'n_layers': 4,
+            'dropout_rate': 0.10,
         },
         # 原生多尺度神经算子专家 - 专门处理多尺度地质结构 MNO
         {

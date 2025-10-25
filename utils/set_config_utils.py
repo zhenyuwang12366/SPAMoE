@@ -169,23 +169,12 @@ def get_seismic_config(args: argparse.Namespace):
     config.expert_configs[1]['n_levels_height'] = args.WNO_n_levels_height
     config.expert_configs[1]['n_levels_width'] = args.WNO_n_levels_width
     config.expert_configs[1]['n_layers'] = args.WNO_n_layers
-    config.expert_configs[1]['block_n_layers'] = args.WNO_block_n_layers
     config.expert_configs[1]['dropout_rate'] = args.WNO_dropout_rate
-    config.expert_configs[1]['wavelet_type'] = args.wavelet_type
+    config.expert_configs[1]['wavelet'] = args.wavelet_type
     if(args.dtcwt_type): 
-        config.expert_configs[1]['wavelet_type'] = args.dtcwt_type
-    if args.WNO_pad_mode:
-        config.expert_configs[1]['pad_mode'] = args.WNO_pad_mode
-    if args.WNO_ensure_even_shapes is not None:
-        config.expert_configs[1]['ensure_even_shapes'] = args.WNO_ensure_even_shapes
-    if args.WNO_adaptive_padding is not None:
-        config.expert_configs[1]['adaptive_padding'] = args.WNO_adaptive_padding
-    if args.WNO_use_channel_mlp is not None:
-        config.expert_configs[1]['use_channel_mlp'] = args.WNO_use_channel_mlp
-    if args.WNO_channel_mlp_dropout is not None:
-        config.expert_configs[1]['channel_mlp_dropout'] = args.WNO_channel_mlp_dropout
-    if args.WNO_channel_mlp_expansion is not None:
-        config.expert_configs[1]['channel_mlp_expansion'] = args.WNO_channel_mlp_expansion
+        config.expert_configs[1]['biort'], config.expert_configs[1]['qshift'] = args.dtcwt_type
+        config.expert_configs[1]['conv_kind'] = "dtcwt" 
+    
     # MNO config setting
     config.expert_configs[2]['n_scales'] = args.MNO_n_scales
     config.expert_configs[2]['scale_factors'] = args.MNO_scale_factors

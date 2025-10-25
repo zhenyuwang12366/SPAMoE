@@ -13,7 +13,7 @@ from .task_router import TaskAwareRouter
 from .expert_factory import ExpertFactory
 from .multiscale_expert import MultiscaleExpert
 from .multiscale_no import MultiscaleNO, MultiscaleNO1d, MultiscaleNO2d, MultiscaleNO3d
-from .wno import WNO, WNO1d, WNO2d, WNO3d
+from .wno import WNO2d, WNO3d
 from .base_model import get_model
 __all__ = [
     'BaseModel',
@@ -41,8 +41,6 @@ __all__ = [
     'MultiscaleNO1d',
     'MultiscaleNO2d',
     'MultiscaleNO3d',
-    'WNO',
-    'WNO1d',
     'WNO2d',
     'WNO3d'
 ]

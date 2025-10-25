@@ -3,7 +3,7 @@ import torch.nn as nn
 from typing import Dict, Any, List, Union, Optional
 
 from .fno import FNO, FNO1d, FNO2d, FNO3d
-from .wno import WNO, WNO1d, WNO2d, WNO3d
+from .wno import WNO2d, WNO3d
 from .gino import GINO
 from .multiscale_expert import MultiscaleExpert
 from .multiscale_no import MultiscaleNO, MultiscaleNO1d, MultiscaleNO2d, MultiscaleNO3d
@@ -104,20 +104,7 @@ class ExpertFactory:
             # 小波神经算子专家
             if v_type_id is not None:
                 hidden_channels = kwargs.get('hidden_channels', 64)
-            if n_dim == 1:
-                # 为了避免参数冲突，检查kwargs中是否已包含n_levels_height
-                levels_kwargs = {}
-                if 'n_levels_height' not in kwargs:
-                    levels_kwargs['n_levels_height'] = 4  # 默认参数
-                
-                return WNO1d(
-                    hidden_channels=hidden_channels,
-                    in_channels=in_channels,
-                    out_channels=out_channels,
-                    **levels_kwargs,
-                    **kwargs
-                )
-            elif n_dim == 2:
+            if n_dim == 2:
                 # 为了避免参数冲突，检查kwargs中是否已包含必要的级别参数
                 levels_kwargs = {}
                 if 'n_levels_height' not in kwargs:
@@ -126,6 +113,7 @@ class ExpertFactory:
                     levels_kwargs['n_levels_width'] = 4  # 默认参数
                 
                 return WNO2d(
+                    base_size=(70, 70),
                     hidden_channels=hidden_channels,
                     in_channels=in_channels,
                     out_channels=out_channels,
@@ -143,6 +131,7 @@ class ExpertFactory:
                     levels_kwargs['n_levels_depth'] = 3  # 默认参数
                 
                 return WNO3d(
+                    base_size=(1, 70, 70),
                     hidden_channels=hidden_channels,
                     in_channels=in_channels,
                     out_channels=out_channels,
