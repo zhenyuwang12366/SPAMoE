@@ -26,7 +26,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import scripts.transforms as T
 from neuralop.models import MOEOperator, ExpertFactory
 from neuralop.models.encoder import get_encoder
-from neuralop.data.datasets import SeismicDataset
+from neuralop.data.datasets import SeismicDataset, ZarrSeismicDataset
 from neuralop.utils import count_model_params
 from scripts.scheduler import (
     WarmupMultiStepLR,
@@ -61,51 +61,6 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     experts_name_str = runtime_ctx["experts_name_str"]
     use_amp = config.use_amp
     
-    # 创建完整数据集
-    full_dataset = SeismicDataset(
-        data_dir=config.data_dir,
-        family=config.family,
-        is_specific=config.is_specific,
-        split='train',
-        concat_channels=config.concat_channels,
-        config=config
-    )
-    
-    # 分割数据集为训练集和验证集
-    # 获取数据集大小
-    dataset_size = len(full_dataset)
-    train_size, val_size = safe_random_split(dataset_size, [1-val_ratio, val_ratio])
-    # val_size = int(dataset_size * val_ratio)
-    # train_size = dataset_size - val_size
-    
-    if is_logger:
-        print(f"数据集总大小: {dataset_size}")
-        print(f"训练集大小: {train_size}")
-        print(f"验证集大小: {val_size}")
-    
-    # 使用random_split分割数据集
-    train_dataset, val_dataset = random_split(
-        full_dataset, 
-        [train_size, val_size], 
-        generator=torch.Generator().manual_seed(args.seed)
-    )
-    
-    data_dict = full_dataset.getStats()
-    
-    # 验证训练集和验证集没有重叠
-    if is_logger:
-        train_indices_set = set(train_dataset.indices)
-        val_indices_set = set(val_dataset.indices)
-        overlap = train_indices_set.intersection(val_indices_set)
-        if overlap:
-            print(f"警告：训练集和验证集有{len(overlap)}个重叠样本！")
-        else:
-            print("验证成功：训练集和验证集没有重叠样本")
-        
-        # 确认数据集大小
-        assert len(train_dataset) == train_size, f"训练集大小不匹配：{len(train_dataset)} vs {train_size}"
-        assert len(val_dataset) == val_size, f"验证集大小不匹配：{len(val_dataset)} vs {val_size}"
-    
     # 创建数据处理器
     from neuralop.data.datasets.seismic_dataset import SeismicDataProcessor
     input_transform = Compose([
@@ -129,9 +84,77 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         config=config,
     )
     
-    # 应用变换到训练集和验证集
-    train_dataset_with_transform = TransformedSubset(train_dataset, data_processor)
-    val_dataset_with_transform = TransformedSubset(val_dataset, data_processor)
+    if config.family == 'all':
+        # 1) 构建 train/val 两个 Zarr 数据集（直接按 splits 读取，不再 random_split）
+        zarr_path = getattr(config, 'zarr_path', None)
+        assert zarr_path is not None, "family == 'all' 时请在 config.zarr_path 指定 seismic_moe.zarr 路径"
+
+        # 如果希望在 Zarr 层就做张量级变换，也可以把 input_transform/output_transform 直接传给 ZarrSeismicDataset
+        # 这里我们保持与原管线一致：在样本级用 data_processor（含 input_transform/output_transform）
+        train_dataset_with_transform = ZarrSeismicDataset(
+            zarr_path=zarr_path,
+            split='train',
+            input_transform=input_transform,      # 变换交给 data_processor（样本级）
+            output_transform=output_transform,
+            expect_input_shape=(5, 1000, 70),
+            to_float32=True,
+        )
+        val_dataset_with_transform = ZarrSeismicDataset(
+            zarr_path=zarr_path,
+            split='val',
+            input_transform=input_transform,
+            output_transform=output_transform,
+            expect_input_shape=(5, 1000, 70),
+            to_float32=True,
+        )
+    else:
+        # 创建完整数据集
+        full_dataset = SeismicDataset(
+            data_dir=config.data_dir,
+            family=config.family,
+            is_specific=config.is_specific,
+            split='train',
+            concat_channels=config.concat_channels,
+            config=config
+        )
+        
+        # 分割数据集为训练集和验证集
+        # 获取数据集大小
+        dataset_size = len(full_dataset)
+        train_size, val_size = safe_random_split(dataset_size, [1-val_ratio, val_ratio])
+        # val_size = int(dataset_size * val_ratio)
+        # train_size = dataset_size - val_size
+        
+        if is_logger:
+            print(f"数据集总大小: {dataset_size}")
+            print(f"训练集大小: {train_size}")
+            print(f"验证集大小: {val_size}")
+        
+        # 使用random_split分割数据集
+        train_dataset, val_dataset = random_split(
+            full_dataset, 
+            [train_size, val_size], 
+            generator=torch.Generator().manual_seed(args.seed)
+        )
+        
+        data_dict = full_dataset.getStats()
+        
+        # 验证训练集和验证集没有重叠
+        if is_logger:
+            train_indices_set = set(train_dataset.indices)
+            val_indices_set = set(val_dataset.indices)
+            overlap = train_indices_set.intersection(val_indices_set)
+            if overlap:
+                print(f"警告：训练集和验证集有{len(overlap)}个重叠样本！")
+            else:
+                print("验证成功：训练集和验证集没有重叠样本")
+            
+            # 确认数据集大小
+            assert len(train_dataset) == train_size, f"训练集大小不匹配：{len(train_dataset)} vs {train_size}"
+            assert len(val_dataset) == val_size, f"验证集大小不匹配：{len(val_dataset)} vs {val_size}"
+        # 应用变换到训练集和验证集
+        train_dataset_with_transform = TransformedSubset(train_dataset, data_processor)
+        val_dataset_with_transform = TransformedSubset(val_dataset, data_processor)
     
     # 创建数据加载器
     if args.distributed:

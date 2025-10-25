@@ -13,7 +13,7 @@
       1. 普通路由 + Sum/Attention
       2. 普通路由 + 强弱激活融合 + Sum/Attention
       3. 任务感知路由 + Sum  <--->   普通路由 + Sum
-8. Marmousi数据集进行推理，与数值方法对比
+8. Marmousi 数据集进行推理，与数值方法对比
 
 体现模型优势：
 

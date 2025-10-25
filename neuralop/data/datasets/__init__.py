@@ -1,17 +1,9 @@
-from .darcy import DarcyDataset, load_darcy_flow_small
-from .navier_stokes import NavierStokesDataset, load_navier_stokes_pt 
 from .pt_dataset import PTDataset
-from .burgers import Burgers1dTimeDataset, load_mini_burgers_1dtime
 from .dict_dataset import DictDataset
 from .mesh_datamodule import MeshDataModule
 from .car_cfd_dataset import CarCFDDataset
 from .seismic_dataset import SeismicDataset, SeismicDataProcessor, create_seismic_dataloader
-
-# only import SphericalSWEDataset if torch_harmonics is built locally
-try:
-    from .spherical_swe import load_spherical_swe
-except ModuleNotFoundError:
-    pass
+from .zarr_seismic_dataset import ZarrSeismicDataset
 
 # only import TheWell if the_well is built
 try:
