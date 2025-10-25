@@ -1,6 +1,7 @@
 import torch.nn.functional as F
 import torch
 import numpy as np
+from .pytorch_ssim import SSIM
 
 class SeismicMetrics:
     """
@@ -15,6 +16,11 @@ class SeismicMetrics:
     def calculate_mae(pred, target):
         """计算平均绝对误差"""
         return F.l1_loss(pred, target).item()
+    
+    @staticmethod
+    def calculate_rmse(pred, target):
+        mse = F.mse_loss(pred, target)
+        return torch.sqrt(mse).item()
     
     @staticmethod
     def calculate_psnr(pred, target, data_range=None):
@@ -40,3 +46,14 @@ class SeismicMetrics:
 
         psnr = 20 * np.log10(data_range) - 10 * np.log10(mse)
         return psnr
+    
+    @staticmethod
+    def calculate_ssim(pred, target):
+        if pred.is_cuda:
+            pred = pred.detach().cpu()
+        if target.is_cuda:
+            target = target.detach().cpu()
+            
+        ssim_loss = SSIM(window_size=11)
+        ssim = ssim_loss(target / 2 + 0.5, pred / 2 + 0.5)
+        return ssim

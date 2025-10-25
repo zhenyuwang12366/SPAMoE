@@ -79,3 +79,6 @@ target/
 
 #Ipython Notebook
 .ipynb_checkpoints
+
+# pretrian_weight
+pretrain_weight/

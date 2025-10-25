@@ -7,7 +7,9 @@ import os
 import time
 from pathlib import Path
 from typing import Optional, Dict, Union, Any
-
+import numpy as np
+from scipy.fft import fft2, fftshift
+    
 def save_type_predictions_txt(
     logits: Optional[torch.Tensor],
     batch: Dict[str, Any],
@@ -222,10 +224,6 @@ def analyze_fourier_domain(inputs, targets, predictions, save_dir='./results', m
     max_samples : int
         最大分析样本数
     """
-    import numpy as np
-    import matplotlib.pyplot as plt
-    from scipy.fft import fft2, fftshift
-    
     os.makedirs(save_dir, exist_ok=True)
     
     # 限制样本数
@@ -351,33 +349,42 @@ def analyze_fourier_domain(inputs, targets, predictions, save_dir='./results', m
             
             # 创建可视化
             fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-            
-            # 第一行：原始数据
+
+            # === 统一颜色范围 ===
+            # 原始/预测/目标的物理域
+            vmin_phys = min(target_data.min(), pred_data.min())
+            vmax_phys = max(target_data.max(), pred_data.max())
+
+            # 傅里叶域（取log10前的PSD）
+            vmin_freq = np.log10(min(target_psd.min(), pred_psd.min()) + 1e-10)
+            vmax_freq = np.log10(max(target_psd.max(), pred_psd.max()) + 1e-10)
+
+            # === 第一行：原始数据 ===
             im1 = axes[0, 0].imshow(input_data, cmap='viridis')
             axes[0, 0].set_title(f'Input Seismic Data\nMean: {input_mean:.3f}, Std: {input_std:.3f}')
             plt.colorbar(im1, ax=axes[0, 0])
-            
-            im2 = axes[0, 1].imshow(target_data, cmap='jet')
+
+            im2 = axes[0, 1].imshow(target_data, cmap='jet', vmin=vmin_phys, vmax=vmax_phys)
             axes[0, 1].set_title(f'Target Velocity Model\nMean: {target_mean:.3f}, Std: {target_std:.3f}')
             plt.colorbar(im2, ax=axes[0, 1])
-            
-            im3 = axes[0, 2].imshow(pred_data, cmap='jet')
+
+            im3 = axes[0, 2].imshow(pred_data, cmap='jet', vmin=vmin_phys, vmax=vmax_phys)
             axes[0, 2].set_title(f'Predicted Velocity Model\nMean: {pred_mean:.3f}, Std: {pred_std:.3f}')
             plt.colorbar(im3, ax=axes[0, 2])
-            
-            # 第二行：傅里叶域
+
+            # === 第二行：傅里叶域 ===
             im4 = axes[1, 0].imshow(np.log10(input_psd + 1e-10), cmap='viridis')
             axes[1, 0].set_title(f'Input Power Spectrum (log)\nMax Freq: {input_dominant_freq:.1f}, HF Ratio: {input_hf_ratio:.3f}')
             plt.colorbar(im4, ax=axes[1, 0])
-            
-            im5 = axes[1, 1].imshow(np.log10(target_psd + 1e-10), cmap='viridis')
+
+            im5 = axes[1, 1].imshow(np.log10(target_psd + 1e-10), cmap='viridis', vmin=vmin_freq, vmax=vmax_freq)
             axes[1, 1].set_title(f'Target Power Spectrum (log)\nMax Freq: {target_dominant_freq:.1f}, HF Ratio: {target_hf_ratio:.3f}')
             plt.colorbar(im5, ax=axes[1, 1])
-            
-            im6 = axes[1, 2].imshow(np.log10(pred_psd + 1e-10), cmap='viridis')
+
+            im6 = axes[1, 2].imshow(np.log10(pred_psd + 1e-10), cmap='viridis', vmin=vmin_freq, vmax=vmax_freq)
             axes[1, 2].set_title(f'Predicted Power Spectrum (log)\nMax Freq: {pred_dominant_freq:.1f}, HF Ratio: {pred_hf_ratio:.3f}')
             plt.colorbar(im6, ax=axes[1, 2])
-            
+
             plt.tight_layout()
             plt.savefig(os.path.join(save_dir, f'fourier_analysis_sample_{i}.png'), dpi=300, bbox_inches='tight')
             plt.close(fig)

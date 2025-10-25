@@ -61,29 +61,6 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     experts_name_str = runtime_ctx["experts_name_str"]
     use_amp = config.use_amp
     
-    # 创建数据处理器
-    from neuralop.data.datasets.seismic_dataset import SeismicDataProcessor
-    input_transform = Compose([
-        T.LogTransform(k=args.k),
-        T.MinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k))
-    ]) # data
-    output_transform = Compose([
-        T.MinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
-    ]) # model
-    input_inverse_transform = Compose([
-        T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k)),
-        T.InverseLogTransform(k=args.k)
-    ])
-    output_inverse_transform = Compose([
-        T.InverseMinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
-    ])
-    data_processor = SeismicDataProcessor(
-        input_transform=input_transform,
-        output_transform=output_transform,
-        channel_dim=config.channel_dim,
-        config=config,
-    )
-    
     if config.family == 'all':
         # 1) 构建 train/val 两个 Zarr 数据集（直接按 splits 读取，不再 random_split）
         zarr_path = getattr(config, 'zarr_path', None)
@@ -152,6 +129,30 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             # 确认数据集大小
             assert len(train_dataset) == train_size, f"训练集大小不匹配：{len(train_dataset)} vs {train_size}"
             assert len(val_dataset) == val_size, f"验证集大小不匹配：{len(val_dataset)} vs {val_size}"
+        
+        # 创建数据处理器
+        from neuralop.data.datasets.seismic_dataset import SeismicDataProcessor
+        input_transform = Compose([
+            T.LogTransform(k=args.k),
+            T.MinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k))
+        ]) # data
+        output_transform = Compose([
+            T.MinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
+        ]) # model
+        input_inverse_transform = Compose([
+            T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k)),
+            T.InverseLogTransform(k=args.k)
+        ])
+        output_inverse_transform = Compose([
+            T.InverseMinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
+        ])
+        data_processor = SeismicDataProcessor(
+            input_transform=input_transform,
+            output_transform=output_transform,
+            channel_dim=config.channel_dim,
+            config=config,
+        )
+        
         # 应用变换到训练集和验证集
         train_dataset_with_transform = TransformedSubset(train_dataset, data_processor)
         val_dataset_with_transform = TransformedSubset(val_dataset, data_processor)
@@ -350,24 +351,6 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         v_type_num=config.v_type_num,
         use_expert_memory_proxy=config.use_gpu_proxy
     )
-
-    # def list_param_indices(mod, tag):
-    #     names = []
-    #     for i, (n, p) in enumerate(mod.named_parameters()):
-    #         names.append((i, n, p.requires_grad))
-    #     print(f"[{tag}] total={len(names)}")
-    #     for i, n, rg in names[-30:]:  # 打印尾部一段，或者全打
-    #         print(f"  idx={i:>4}  grad={rg}  name={n}")
-    #     return names
-
-    # # DDP 之前：
-    # _ = list_param_indices(moe_model, "moe_model(pre-DDP)")
-    # if encoder_model is not None:
-    #     base_enc = encoder_model
-    #     if hasattr(base_enc, "module"): base_enc = base_enc.module
-    #     _ = list_param_indices(base_enc, "encoder(pre-DDP)")
-        
-    # exit(0)
     
     # 移动模型到设备
     if config.distributed.use_distributed:
@@ -567,10 +550,10 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         
         if config.train_encoder:
             with open(log_file, "w", encoding="utf-8") as f:
-                f.write("    Epoch    |    Train Loss    |    Val Loss    |    MAE    |    MSE    |    PSNR    |    CE    |\n")
+                f.write("    Epoch    |    Train Loss    |    Val Loss    |    MAE    |    MSE    |    PSNR    |    RMSE    |    SSIM    |    CE    |\n")
         else:
             with open(log_file, "w", encoding="utf-8") as f:
-                f.write("    Epoch    |    Train Loss    |    Val Loss    |    MAE    |    MSE    |    PSNR    |\n")
+                f.write("    Epoch    |    Train Loss    |    Val Loss    |    MAE    |    MSE    |    PSNR    |    RMSE    |    SSIM    |\n")
     else:
         config.experiment_dir = str(results_dir)
         config.tensorboard_dir = str(tb_dir)

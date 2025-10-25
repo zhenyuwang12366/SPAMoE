@@ -9,13 +9,21 @@ from tqdm import tqdm
 
 import zarr
 from numcodecs import Blosc
+from config.seismic_moe_config import SeismicMOEConfig
 
 # ---------------------------
 # 命名与类别推断
 # ---------------------------
 
 def to_snake_lower(s: str) -> str:
-    s = re.sub(r'[^A-Za-z0-9]+', '_', s.strip()).strip('_').lower()
+    s = s.strip()
+    if not s:
+        return s
+    # 先处理驼峰 -> 下划线的边界
+    s = re.sub(r'([A-Z]+)([A-Z][a-z0-9])', r'\1_\2', s)
+    s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s)
+    s = re.sub(r'[^A-Za-z0-9]+', '_', s)
+    s = re.sub(r'_+', '_', s).strip('_').lower()
     parts = [p for p in s.split('_') if p]  # 去重空片段
     if not parts:
         return s
@@ -163,7 +171,6 @@ def main():
     ap = argparse.ArgumentParser(description="Build seismic_moe.zarr from OpenFWI-style folders")
     ap.add_argument('--data_dir', required=True, help='根数据目录，含 train_samples/ 与(可选) test/')
     ap.add_argument('--zarr_out', required=True, help='输出 Zarr 目录（不存在会创建）')
-    ap.add_argument('--mapping_json', required=True, help='type_id_specific 映射 JSON 文件路径')
     ap.add_argument('--chunks', type=int, default=64, help='样本维 chunk 大小，如 64')
     ap.add_argument('--dtype', type=str, default='float32', choices=['float32','float16'], help='存盘 dtype')
     ap.add_argument('--split_ratio', nargs=3, type=float, default=[0.8,0.2,0.0], help='train/val/test 比例（针对有监督样本）')
@@ -176,10 +183,8 @@ def main():
     ratios     = tuple(args.split_ratio)
     assert abs(sum(ratios)-1.0) < 1e-6, "split_ratio 之和必须为 1.0"
 
-    with open(args.mapping_json, 'r', encoding='utf-8') as f:
-        type_id_map = json.load(f)
-    if not isinstance(type_id_map, dict) or not type_id_map:
-        raise ValueError("mapping_json 必须是非空字典")
+    config = SeismicMOEConfig()
+    type_id_map = config.type_id_specific
 
     train_dir = os.path.join(data_dir, 'train_samples')
     test_dir  = os.path.join(data_dir, 'test')

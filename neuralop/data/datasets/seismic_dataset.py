@@ -24,15 +24,27 @@ _ALLOWED_SPECIFIC_FAMILIES = _SPECIFIC_BASE_FAMILIES | _SPECIFIC_VARIANT_FAMILIE
 # ---------------------------
 # 目录名规范化 / 提取
 # ---------------------------
-def _to_snake_lower(name: str) -> str:
-    """
-    目录名规范化为小写蛇形：
-      CurveVel_B -> curve_vel_b
-      FlatFault_a -> flat_fault_a
-    """
-    name = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', name)
-    name = name.replace('-', '_').replace('__', '_')
-    return name.lower()
+def _to_snake_lower(s: str) -> str:
+    s = s.strip()
+    if not s:
+        return s
+    # 先处理驼峰 -> 下划线的边界
+    s = re.sub(r'([A-Z]+)([A-Z][a-z0-9])', r'\1_\2', s)
+    s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s)
+    s = re.sub(r'[^A-Za-z0-9]+', '_', s)
+    s = re.sub(r'_+', '_', s).strip('_').lower()
+    parts = [p for p in s.split('_') if p]  # 去重空片段
+    if not parts:
+        return s
+    if parts[0] == 'style':
+        # 情况1: style_a -> style_style_a
+        # 情况2: style_style_a -> 保持不变
+        # 其他(如 style_xxx_a) -> 取最后一段作为 a/b 后缀
+        suffix = parts[-1] if len(parts) >= 2 else 'a'
+        if len(parts) >= 3 and parts[1] == 'style':
+            return '_'.join(parts[:3])  # 已经是 style_style_a/b
+        return f"style_style_{suffix}"
+    return '_'.join(parts)
 
 def _infer_type_dir_name_from_input_file(p: str) -> str:
     """
@@ -478,53 +490,3 @@ class SeismicDataProcessor:
             sample['output'] = y
         
         return sample
-
-
-def create_seismic_dataloader(
-    data_dir: str,
-    family: str = 'all',
-    split: str = 'train',
-    batch_size: int = 16,
-    shuffle: bool = True,
-    num_workers: int = 4,
-    normalize_inputs: bool = True,   # 未用到，保留兼容
-    normalize_outputs: bool = True,  # 未用到，保留兼容
-    channel_dim: int = 1,
-    input_transform = None,
-    output_transform = None,
-    concat_channels: bool = False,
-    config: Optional[SeismicMOEConfig] = None,  # ★ 新增：必须传入
-):
-    """
-    创建地震数据加载器
-    - 会从 config.type_id_specific 读取小写映射字典（如 flat_fault_a -> 6）
-    """
-    assert config is not None, "create_seismic_dataloader 需要 config（含 type_id_specific 小写字典）"
-    # 处理器
-    processor = SeismicDataProcessor(
-        channel_dim=channel_dim,
-        input_transform=input_transform,
-        output_transform=output_transform,
-        config=config,
-    )
-
-    # 数据集（带标签输出）
-    dataset = SeismicDataset(
-        data_dir=data_dir,
-        family=family,
-        split=split,
-        concat_channels=concat_channels,
-        config=config,          # ★ 提供 config（用于标签映射）
-        processor=processor,    # ★ 使处理器在 __getitem__ 生效
-    )
-    
-    # DataLoader
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle if split == 'train' else False,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-    
-    return dataloader, dataset

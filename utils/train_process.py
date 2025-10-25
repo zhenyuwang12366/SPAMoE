@@ -25,7 +25,7 @@ def _evaluate_one_epoch(
     # if classifier is not None:
     #     classifier.eval()
     val_loss = 0.0
-    mse_sum, mae_sum, psnr_sum, ce_sum = 0.0, 0.0, 0.0, 0.0
+    mse_sum, mae_sum, psnr_sum, ce_sum, rmse_sum, ssim_sum = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     for batch in val_loader:
         inputs  = batch['input'].to(device, non_blocking=True)
@@ -60,6 +60,8 @@ def _evaluate_one_epoch(
         mse_sum  += loss_dict["l2"].item()
         mae_sum  += loss_dict["l1"].item()
         psnr_sum += metrics_module.calculate_psnr(preds, targets)
+        rmse_sum += metrics_module.calculate_rmse(preds, targets)
+        ssim_sum += metrics_module.calculate_ssim(preds, targets)
         if train_encoder:
             ce_sum += loss_dict["ce"].item()
             
@@ -70,13 +72,17 @@ def _evaluate_one_epoch(
             "mse": mse_sum / n,
             "mae": mae_sum / n,
             "psnr": psnr_sum / n,
+            "rmse": rmse_sum / n,
+            "ssim": ssim_sum / n,
             "ce": ce_sum / n,
         }
     return {
         "val_loss": val_loss / n,
         "mse": mse_sum / n,
         "mae": mae_sum / n,
-        "psnr": psnr_sum / n
+        "psnr": psnr_sum / n,
+        "rmse": rmse_sum / n,
+        "ssim": ssim_sum / n,
     }
 
 
@@ -248,6 +254,7 @@ def train_one_epoch(
                 loss_dict = criterion(preds, targets, weights, labels)
             else:
                 loss_dict = criterion(preds, targets)
+            
             # —— 未缩放的“真实训练损失”（用于日志统计） —— #
             loss_raw = loss_dict["loss"] + coef * aux_loss
 
@@ -324,6 +331,8 @@ def train_one_epoch(
                 "mse": float("nan"),
                 "mae": float("nan"),
                 "psnr": float("nan"),
+                "rmse": float("nan"),
+                "ssim": float("nan"),
                 "ce": float("nan"),
             }
         else:
@@ -332,6 +341,8 @@ def train_one_epoch(
                 "mse": float("nan"),
                 "mae": float("nan"),
                 "psnr": float("nan"),
+                "rmse": float("nan"),
+                "ssim": float("nan"),
             }
         val_loss = float("inf")
     else:
@@ -350,6 +361,8 @@ def train_one_epoch(
         tb_writer.add_scalar("val/psnr", val_stats.get("psnr", float("nan")), epoch_step)
         tb_writer.add_scalar("val/mse", val_stats.get("mse", float("nan")), epoch_step)
         tb_writer.add_scalar("val/mae", val_stats.get("mae", float("nan")), epoch_step)
+        tb_writer.add_scalar("val/rmse", val_stats.get("rmse", float("nan")), epoch_step)
+        tb_writer.add_scalar("val/ssim", val_stats.get("ssim", float("nan")), epoch_step)
         if train_encoder:
             tb_writer.add_scalar("val/ce", val_stats.get("ce", float("nan")), epoch_step)
     if router_type == 'adamv':
@@ -381,13 +394,13 @@ def train_one_epoch(
             with open(log_file, "a") as f:
                 f.write(
                     f"    {epoch+1}    |    {avg_train_loss:.6f}    |    {val_loss:.6f}    |    "
-                    f"{val_stats['mae']:.6f}    |    {val_stats['mse']:.6f}    |    {val_stats['psnr']:.6f}    |    {val_stats['ce']:.6f}    |\n"
+                    f"{val_stats['mae']:.6f}    |    {val_stats['mse']:.6f}    |    {val_stats['psnr']:.6f}    |    {val_stats['rmse']:.6f}    |    {val_stats['ssim']:.6f}    |    {val_stats['ce']:.6f}    |\n"
                 )
         else:
             with open(log_file, "a") as f:
                 f.write(
                     f"    {epoch+1}    |    {avg_train_loss:.6f}    |    {val_loss:.6f}    |    "
-                    f"{val_stats['mae']:.6f}    |    {val_stats['mse']:.6f}    |    {val_stats['psnr']:.6f}    |\n"
+                    f"{val_stats['mae']:.6f}    |    {val_stats['mse']:.6f}    |    {val_stats['psnr']:.6f}    |    {val_stats['rmse']:.6f}    |    {val_stats['ssim']:.6f}    |\n"
                 )
     if use_wandb and wandb_module is not None:
         if train_encoder:
@@ -399,6 +412,8 @@ def train_one_epoch(
                 "val/psnr": val_stats["psnr"],
                 "val/mse": val_stats["mse"],
                 "val/mae": val_stats["mae"],
+                "val/rmse": val_stats['rmse'],
+                "val/ssim": val_stats['ssim'],
                 "val/ce": val_stats["ce"],
                 "optim_steps_in_epoch": optim_count,
             }
@@ -411,6 +426,8 @@ def train_one_epoch(
                 "val/psnr": val_stats["psnr"],
                 "val/mse": val_stats["mse"],
                 "val/mae": val_stats["mae"],
+                "val/rmse": val_stats["rmse"],
+                "val/ssim": val_stats["ssim"],
                 "optim_steps_in_epoch": optim_count,
             }
         wandb_module.log(wandb_log)
@@ -430,7 +447,7 @@ def train_one_epoch(
             'model_state_dict': model_to_save.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'val_loss': val_loss,
-            'metrics': {"psnr": val_stats["psnr"], "mse": val_stats["mse"], "mae": val_stats["mae"]},
+            'metrics': {"psnr": val_stats["psnr"], "mse": val_stats["mse"], "mae": val_stats["mae"], "rmse": val_stats["rmse"], "ssim": val_stats["ssim"]},
             'data_dict': data_dict
         }
         if encoder_to_save is not None:
@@ -459,7 +476,7 @@ def train_one_epoch(
             'model_state_dict': model_to_save.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'val_loss': val_loss,
-            'metrics': {"psnr": val_stats["psnr"], "mse": val_stats["mse"], "mae": val_stats["mae"]},
+            'metrics': {"psnr": val_stats["psnr"], "mse": val_stats["mse"], "mae": val_stats["mae"], "rmse": val_stats["rmse"], "ssim": val_stats["ssim"]},
             'data_dict': data_dict
         }
         if encoder_to_save is not None:
@@ -479,23 +496,9 @@ def train_one_epoch(
 
     # —— 打印本 epoch 概要（仅主进程）—— #
     if is_logger:
-        if train_encoder:
-            print(f"Epoch {epoch+1}/{config.epochs}:")
-            print(f"  Train Loss: {avg_train_loss:.6f}")
-            print(f"  Val   Loss: {val_loss:.6f}")
-            print(f"  PSNR: {val_stats['psnr']:.2f} dB")
-            print(f"  MSE : {val_stats['mse']:.6f}")
-            print(f"  MAE : {val_stats['mae']:.6f}")
-            print(f"  CE : {val_stats['ce']:.6f}")
-            print(f"  AuxLoss : {avg_aux_loss:.2f}")
-        else:
-            print(f"Epoch {epoch+1}/{config.epochs}:")
-            print(f"  Train Loss: {avg_train_loss:.6f}")
-            print(f"  Val   Loss: {val_loss:.6f}")
-            print(f"  PSNR: {val_stats['psnr']:.2f} dB")
-            print(f"  MSE : {val_stats['mse']:.6f}")
-            print(f"  MAE : {val_stats['mae']:.6f}")
-            print(f"  AuxLoss : {avg_aux_loss:.2f}")
+        print(f"Epoch {epoch+1}/{config.epochs}:")
+        print(f"  Train Loss: {avg_train_loss:.6f}")
+        print(f"  Val   Loss: {val_loss:.6f}")
 
     # —— 可视化（仅主进程 & 触发时）—— #
     if is_logger and vis_now and visualize_results is not None:
