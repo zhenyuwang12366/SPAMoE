@@ -6,6 +6,8 @@
 MODE="train"                     # train / inference / overfit1
 NUM_GPUS=2
 DATA_DIR="/data1/wuruoyu/waveform-inversion"
+ZARR_PATH=""
+STATUS_JSON="./dataset_status/dataset_status.json"
 FAMILY="all"
 MODEL_NAME="MOE"
 BATCH_SIZE=8
@@ -114,6 +116,8 @@ while [[ $# -gt 0 ]]; do
     --mode) MODE="$2"; shift 2 ;;
     --num_gpus) NUM_GPUS="$2"; shift 2 ;;
     --data_dir) DATA_DIR="$2"; shift 2 ;;
+    --zarr_path) ZARR_PATH="$2"; shift 2 ;;
+    --status_json) STATUS_JSON="$2"; shift 2 ;;
     --family) FAMILY="$2"; shift 2 ;;
     --model_name) MODEL_NAME="$2"; shift 2 ;;
     --batch_size) BATCH_SIZE="$2"; shift 2 ;;
@@ -319,6 +323,8 @@ echo "启动分布式训练/推理，配置如下："
 echo "Mode: $MODE"
 echo "GPU数量: $NUM_GPUS"
 echo "数据目录: $DATA_DIR"
+echo "Zarr数据集路径: $ZARR_PATH"
+echo "数据集统计量json: $STATUS_JSON"
 echo "数据系列: $FAMILY"
 echo "模型名称: $MODEL_NAME"
 echo "批次大小: $BATCH_SIZE"
@@ -402,6 +408,8 @@ ARGS=(
   --mode "$MODE"
   --model_name "$MODEL_NAME"
   --data_dir "$DATA_DIR"
+  --zarr_path "$ZARR_PATH"
+  --status_json "$STATUS_JSON"
   --family "$FAMILY"
   --batch_size "$BATCH_SIZE"
   --epochs "$EPOCHS"

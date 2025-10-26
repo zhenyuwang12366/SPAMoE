@@ -14,8 +14,12 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
     parser.add_argument('--model_name', type=str, default='MOE')
     parser.add_argument('--data_dir', type=str, default=None,
                         help='数据目录路径')
+    parser.add_argument('--zarr_path', type=str, default=None,
+                        help='数据集zarr格式文件')
     parser.add_argument('--family', type=str, default=None, choices=_FAMILY_CHOICES,
                         help='数据集系列，可选通用 (vel/style/fault/all) 或细分类别 (如 curve_vel_a)')
+    parser.add_argument('--status_json', type=str, default='./dataset_status/dataset_status.json',
+                        help='数据集的统计信息')
     parser.add_argument('--batch_size', type=int, default=None,
                         help='训练批次大小')
     parser.add_argument('--test_batch_size', type=int, default=None,

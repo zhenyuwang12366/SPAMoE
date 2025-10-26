@@ -269,6 +269,8 @@ class LogTransform(object):
         self.c = c
 
     def __call__(self, data):
+        if isinstance(data, torch.Tensor):
+            return log_transform_tensor(data, k=self.k, c=self.c)
         return log_transform(data, k=self.k, c=self.c)
  
 class ToTensor(object):

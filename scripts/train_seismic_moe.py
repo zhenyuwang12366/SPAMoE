@@ -27,6 +27,8 @@ import scripts.transforms as T
 from neuralop.models import MOEOperator, ExpertFactory
 from neuralop.models.encoder import get_encoder
 from neuralop.data.datasets import SeismicDataset, ZarrSeismicDataset
+from neuralop.data.sampler.chunk_sampler import ChunkDistributedSampler
+from neuralop.data.dataloader.zarr_seismic_dataloader import build_loaders
 from neuralop.utils import count_model_params
 from scripts.scheduler import (
     WarmupMultiStepLR,
@@ -37,7 +39,6 @@ from neuralop.losses import L1L2Loss, SobelLoss, FourierMag_L1
 from utils import *
 
 print("-----------------------------------------------------------")
-
 
 def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     """
@@ -60,41 +61,85 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     experts_name_str = runtime_ctx["experts_name_str"]
     use_amp = config.use_amp
     
-    if config.family in ['curve_vel_a', 'curve_vel_b', 'flat_vel_a', 'flat_vel_b']:
-        val_ratio = 6 / 30
-    elif config.family in ['curve_fault_a', 'curve_fault_b', 'flat_fault_a', 'flat_fault_b']:
-        val_ratio = 6 / 54
-    elif config.family in ['style_a', 'style_b', 'style_style_a', 'style_style_b']:
-        val_ratio = 7 / 67
-    elif config.family == 'all':
-        val_ratio = runtime_ctx["val_ratio"]
-    else:
-        raise ValueError("不支持的 family")
-    
-    if config.family == 'all':
+    if args.zarr_path is not None or config.family == 'all':
+        json_path = getattr(args, 'status_json', None)
+        assert json_path is not None, "使用zarr数据集格式，需要指定归一化统计量json"
         # 1) 构建 train/val 两个 Zarr 数据集（直接按 splits 读取，不再 random_split）
-        zarr_path = getattr(config, 'zarr_path', None)
-        assert zarr_path is not None, "family == 'all' 时请在 config.zarr_path 指定 seismic_moe.zarr 路径"
+        zarr_path = getattr(args, 'zarr_path', None)
+        assert zarr_path is not None, "family == 'all' 时请在 args.zarr_path 指定 seismic_moe.zarr 路径"
 
-        # 如果希望在 Zarr 层就做张量级变换，也可以把 input_transform/output_transform 直接传给 ZarrSeismicDataset
-        # 这里我们保持与原管线一致：在样本级用 data_processor（含 input_transform/output_transform）
-        train_dataset_with_transform = ZarrSeismicDataset(
-            zarr_path=zarr_path,
-            split='train',
-            input_transform=input_transform,      # 变换交给 data_processor（样本级）
-            output_transform=output_transform,
-            expect_input_shape=(5, 1000, 70),
-            to_float32=True,
-        )
-        val_dataset_with_transform = ZarrSeismicDataset(
-            zarr_path=zarr_path,
-            split='val',
+        import json
+        with open(json_path, 'r') as f:
+            data_dict_raw = json.load(f)
+        
+        if config.family == 'all':
+            data_dict = data_dict_raw['overall']
+        else:
+            data_dict = data_dict_raw['per_type'][config.family]
+        
+        # 创建数据处理器
+        from neuralop.data.datasets.seismic_dataset import SeismicDataProcessor
+        input_transform = Compose([
+            T.LogTransform(k=args.k),
+            T.MinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k))
+        ])  # data
+        output_transform = Compose([
+            T.MinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
+        ])  # model
+        input_inverse_transform = Compose([
+            T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k)),
+            T.InverseLogTransform(k=args.k)
+        ])
+        output_inverse_transform = Compose([
+            T.InverseMinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
+        ])
+
+        data_processor = SeismicDataProcessor(
             input_transform=input_transform,
             output_transform=output_transform,
-            expect_input_shape=(5, 1000, 70),
+            channel_dim=config.channel_dim,
+            config=config,
+        )
+
+        # 如果希望在 Zarr 层就做张量级变换，也可以把 input_transform/output_transform 直接传给 ZarrSeismicDataset
+        # 这里我们保持与原管线一致：在样本级用 data_processor（含 input_transform/output_transform 等额外处理）
+        train_dataset = ZarrSeismicDataset(
+            zarr_path=zarr_path,
+            split='train',
+            input_transform=None,
+            output_transform=None,
+            expect_input_shape=(1, 1000, 350),
             to_float32=True,
         )
+        val_dataset = ZarrSeismicDataset(
+            zarr_path=zarr_path,
+            split='val',
+            input_transform=None,
+            output_transform=None,
+            expect_input_shape=(1, 1000, 350),
+            to_float32=True,
+        )
+        train_dataset_with_transform = TransformedSubset(train_dataset, data_processor)
+        val_dataset_with_transform = TransformedSubset(val_dataset, data_processor)
+    
+        train_loader, val_loader, train_sampler, val_sampler = build_loaders(
+            args=args,
+            config=config,
+            train_dataset_with_transform=train_dataset_with_transform,
+            val_dataset_with_transform=val_dataset_with_transform,
+            world_size=world_size,
+            local_rank=local_rank,
+        )
     else:
+        if config.family in ['curve_vel_a', 'curve_vel_b', 'flat_vel_a', 'flat_vel_b']:
+            val_ratio = 6 / 30
+        elif config.family in ['curve_fault_a', 'curve_fault_b', 'flat_fault_a', 'flat_fault_b']:
+            val_ratio = 6 / 54
+        elif config.family in ['style_a', 'style_b', 'style_style_a', 'style_style_b']:
+            val_ratio = 7 / 67
+        else:
+            raise ValueError("不支持的 family")
+        
         # 创建完整数据集
         full_dataset = SeismicDataset(
             data_dir=config.data_dir,
@@ -167,61 +212,61 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         train_dataset_with_transform = TransformedSubset(train_dataset, data_processor)
         val_dataset_with_transform = TransformedSubset(val_dataset, data_processor)
     
-    # 创建数据加载器
-    if args.distributed:
-        train_num_workers = max(0, args.num_workers // 2)
-        train_sampler = DistributedSampler(
-            train_dataset_with_transform, 
-            num_replicas=world_size, 
-            rank=local_rank,
-            drop_last=True,
-            shuffle=True
-        )
-        train_loader = DataLoader(
-            train_dataset_with_transform,
-            sampler=train_sampler,
-            batch_size=config.batch_size,
-            shuffle=False,
-            num_workers=train_num_workers,
-            pin_memory=True,
-            persistent_workers=train_num_workers > 0
-        )
+        # 创建数据加载器
+        if args.distributed:
+            train_num_workers = max(0, args.num_workers // 2)
+            train_sampler = DistributedSampler(
+                train_dataset_with_transform, 
+                num_replicas=world_size, 
+                rank=local_rank,
+                drop_last=True,
+                shuffle=True
+            )
+            train_loader = DataLoader(
+                train_dataset_with_transform,
+                sampler=train_sampler,
+                batch_size=config.batch_size,
+                shuffle=False,
+                num_workers=train_num_workers,
+                pin_memory=True,
+                persistent_workers=train_num_workers > 0
+            )
 
-        val_num_workers = train_num_workers
-        val_sampler = DistributedSampler(
-            val_dataset_with_transform, 
-            num_replicas=world_size, 
-            rank=local_rank,
-            drop_last=False
-        )
-        val_loader = DataLoader(
-            val_dataset_with_transform,
-            sampler=val_sampler,
-            batch_size=config.test_batch_size,
-            shuffle=False,
-            num_workers=val_num_workers,
-            pin_memory=True,
-            persistent_workers=val_num_workers > 0
-        )
-    else:
-        train_num_workers = max(0, args.num_workers)
-        train_loader = DataLoader(
-            train_dataset_with_transform,
-            batch_size=config.batch_size,
-            shuffle=True,
-            num_workers=train_num_workers,
-            pin_memory=True,
-            persistent_workers=train_num_workers > 0
-        )
+            val_num_workers = train_num_workers
+            val_sampler = DistributedSampler(
+                val_dataset_with_transform, 
+                num_replicas=world_size, 
+                rank=local_rank,
+                drop_last=False,
+            )
+            val_loader = DataLoader(
+                val_dataset_with_transform,
+                sampler=val_sampler,
+                batch_size=config.test_batch_size,
+                shuffle=False,
+                num_workers=val_num_workers,
+                pin_memory=True,
+                persistent_workers=val_num_workers > 0
+            )
+        else:
+            train_num_workers = max(0, args.num_workers)
+            train_loader = DataLoader(
+                train_dataset_with_transform,
+                batch_size=config.batch_size,
+                shuffle=True,
+                num_workers=train_num_workers,
+                pin_memory=True,
+                persistent_workers=train_num_workers > 0
+            )
 
-        val_loader = DataLoader(
-            val_dataset_with_transform,
-            batch_size=config.test_batch_size,
-            shuffle=False,
-            num_workers=train_num_workers,
-            pin_memory=True,
-            persistent_workers=train_num_workers > 0
-        )
+            val_loader = DataLoader(
+                val_dataset_with_transform,
+                batch_size=config.test_batch_size,
+                shuffle=False,
+                num_workers=train_num_workers,
+                pin_memory=True,
+                persistent_workers=train_num_workers > 0
+            )
 
     if is_logger:
         prefetch = getattr(train_loader, "prefetch_factor", None)

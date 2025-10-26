@@ -7,6 +7,7 @@ from config.seismic_moe_config import SeismicMOEConfig, SPECIFIC_TYPE_VARIANTS
 import neuralop.mpu.comm as comm
 from neuralop.training import setup
 from neuralop.utils import get_wandb_api_key
+from .utils import to_snake_lower
 
 _SPECIFIC_ALLOWED_FAMILIES = (
     set(SPECIFIC_TYPE_VARIANTS.keys()) |
@@ -75,7 +76,7 @@ def get_seismic_config(args: argparse.Namespace):
 
         #解释见onenote1
     if args.family:
-        config.family = args.family
+        config.family = to_snake_lower(args.family)
     if args.batch_size:
         config.batch_size = args.batch_size
     if args.test_batch_size is not None:

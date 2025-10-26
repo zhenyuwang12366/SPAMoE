@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Compute per-type and overall normalization statistics for the seismic dataset.
 
-The script expects the dataset layout illustrated in the project README.  It scans
+The script expects the dataset layout illustrated in the project README. It scans
 `train_samples/` under the provided dataset root, gathers all `.npy` files for inputs
 and outputs, and writes summary statistics (min, max, mean, std) to a JSON file.
+
+Enhancements:
+- Normalize type names to lower_snake_case via `to_snake_lower`.
+- Show progress bars using `tqdm` if available (fallback to simple prints otherwise).
 """
 
 from __future__ import annotations
@@ -11,14 +15,49 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Callable, Dict, Iterable, List, Tuple
 
 import numpy as np
+from utils.utils import to_snake_lower
+
+# --------------------------
+# Progress-bar utilities
+# --------------------------
+def _get_tqdm():
+    try:
+        from tqdm import tqdm  # type: ignore
+        return tqdm
+    except Exception:
+        return None
 
 
+def _simple_progress(total: int) -> Tuple[Callable[[int], None], Callable[[], None]]:
+    """Fallback progress printer when tqdm is not available."""
+    # Print every ~5% progress or at least every 50 files
+    step = max(1, total // 20, 50)
+
+    state = {"n": 0}
+
+    def update(n: int = 1):
+        state["n"] += n
+        if state["n"] % step == 0 or state["n"] >= total:
+            pct = (state["n"] / total * 100) if total > 0 else 100.0
+            print(f"[Progress] {state['n']}/{total} files ({pct:.1f}%)", file=sys.stderr)
+
+    def close():
+        pass
+
+    return update, close
+
+
+# --------------------------
+# Stats computation classes
+# --------------------------
 class StatsAccumulator:
     """Streaming statistics tracker to avoid storing all samples in memory."""
 
@@ -77,6 +116,9 @@ class TypeStatistics:
         return result
 
 
+# --------------------------
+# File discovery
+# --------------------------
 def gather_sample_files(sample_dir: Path) -> Tuple[List[Path], List[Path]]:
     """Return the input and output files for a given domain directory."""
     input_files: List[Path] = []
@@ -109,37 +151,71 @@ def load_array(file_path: Path) -> np.ndarray:
         raise RuntimeError(f"Failed to load {file_path}") from exc
 
 
+# --------------------------
+# Core computation with progress
+# --------------------------
 def compute_statistics(train_dir: Path) -> Tuple[Dict[str, TypeStatistics], TypeStatistics]:
     per_type_stats: Dict[str, TypeStatistics] = defaultdict(TypeStatistics)
     overall_stats = TypeStatistics()
 
-    subdirs = [d for d in sorted(train_dir.iterdir()) if d.is_dir()]
-    if not subdirs:
+    # Collect subdirs
+    raw_subdirs = [d for d in sorted(train_dir.iterdir()) if d.is_dir()]
+    if not raw_subdirs:
         raise FileNotFoundError(f"No data directories found in {train_dir}")
 
-    for domain_dir in subdirs:
-        type_name = domain_dir.name
-        type_stats = per_type_stats[type_name]
-
-        input_files, output_files = gather_sample_files(domain_dir)
-        if not input_files:
+    # Pre-scan to normalize names and count files for progress bars
+    normalized_domains: List[Tuple[str, Path, List[Path], List[Path]]] = []
+    total_files = 0
+    for domain_dir in raw_subdirs:
+        type_name_snake = to_snake_lower(domain_dir.name)
+        in_files, out_files = gather_sample_files(domain_dir)
+        if not in_files:
             raise FileNotFoundError(f"No input `.npy` files found under {domain_dir}")
-        if not output_files:
+        if not out_files:
             raise FileNotFoundError(f"No output `.npy` files found under {domain_dir}")
+        total_files += len(in_files) + len(out_files)
+        normalized_domains.append((type_name_snake, domain_dir, in_files, out_files))
+
+    # Setup progress bars
+    tqdm = _get_tqdm()
+    if tqdm:
+        pbar_files = tqdm(total=total_files, desc="Accumulating stats", unit="file")
+        pbar_types = tqdm(total=len(normalized_domains), desc="Types", unit="type")
+        def _update_files(n=1):
+            pbar_files.update(n)
+        def _close():
+            pbar_files.close()
+            pbar_types.close()
+    else:
+        _update_files, _close = _simple_progress(total_files)
+        pbar_types = None  # not used in fallback
+
+    # Accumulate
+    for type_name_snake, _domain_dir, input_files, output_files in normalized_domains:
+        type_stats = per_type_stats[type_name_snake]
 
         for npy_file in input_files:
             array = load_array(npy_file)
             type_stats.input_stats.update(array)
             overall_stats.input_stats.update(array)
+            _update_files(1)
 
         for npy_file in output_files:
             array = load_array(npy_file)
             type_stats.output_stats.update(array)
             overall_stats.output_stats.update(array)
+            _update_files(1)
 
+        if pbar_types is not None:
+            pbar_types.update(1)
+
+    _close()
     return per_type_stats, overall_stats
 
 
+# --------------------------
+# I/O
+# --------------------------
 def write_json(output_path: Path, per_type_stats: Dict[str, TypeStatistics], overall_stats: TypeStatistics) -> None:
     payload = {
         "per_type": {type_name: stats.as_dict() for type_name, stats in sorted(per_type_stats.items())},
@@ -149,6 +225,9 @@ def write_json(output_path: Path, per_type_stats: Dict[str, TypeStatistics], ove
         json.dump(payload, fh, indent=2, ensure_ascii=False)
 
 
+# --------------------------
+# CLI
+# --------------------------
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(

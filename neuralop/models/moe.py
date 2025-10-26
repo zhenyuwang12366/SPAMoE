@@ -239,7 +239,7 @@ class MOEOperator(BaseModel, name='MOE'):
         self.config = kwargs
         self.moe_mode = moe_mode
         self.config.setdefault('moe_mode', moe_mode)
-
+        
         valid_modes = {'standard', 'group', 'velocity_type'}
         if self.moe_mode not in valid_modes:
             raise ValueError(f"Unsupported moe_mode: {self.moe_mode}")

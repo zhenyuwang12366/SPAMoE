@@ -9,13 +9,17 @@ import datetime
 
 @torch.no_grad()
 def _evaluate_one_epoch(
+    epoch,
+    total_epoch,
     model,
     encoder,
+    is_logger,
     # classifier,
     val_loader,
     device,
     criterion,
     metrics_module,  # 需有 calculate_psnr(pred, tgt)
+    tqdm,
     amp_enabled: bool = False,
     train_encoder: bool = False,
 ):
@@ -26,8 +30,11 @@ def _evaluate_one_epoch(
     #     classifier.eval()
     val_loss = 0.0
     mse_sum, mae_sum, psnr_sum, ce_sum, rmse_sum, ssim_sum = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-
-    for batch in val_loader:
+    
+    if tqdm is not None:
+        pbar_iter = tqdm(val_loader, desc=f"Epoch(eval) {epoch+1}/{total_epoch}", leave=False, disable=not is_logger)
+    
+    for batch in pbar_iter:
         inputs  = batch['input'].to(device, non_blocking=True)
         targets = batch['output'].to(device, non_blocking=True)
         if train_encoder:
@@ -339,13 +346,18 @@ def train_one_epoch(
         val_loss = float("inf")
     else:
         val_stats = _evaluate_one_epoch(
+            epoch,
+            config.epochs,
             model,
             encoder,
+            is_logger,
             val_loader,
             device,
             criterion,
             metrics_module,
+            tqdm,
             amp_enabled=use_amp,
+            train_encoder=train_encoder,
         )
         val_loss = val_stats["val_loss"]
     if tb_active:
@@ -591,10 +603,6 @@ def train_one_epoch(
     # —— 调度器（按 epoch）—— #
     if lr_scheduler is not None and scheduler_step_mode == "per_epoch":
         lr_scheduler.step()
-
-    # —— 分布式 barrier（可选，与日志输出顺序相关）—— #
-    if getattr(config, "distributed", None) and getattr(config.distributed, "use_distributed", False):
-        torch.distributed.barrier()
 
     # —— 耗时 —— #
     total_time = time.time() - start_time
