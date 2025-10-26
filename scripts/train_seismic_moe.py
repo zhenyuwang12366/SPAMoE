@@ -61,7 +61,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     experts_name_str = runtime_ctx["experts_name_str"]
     use_amp = config.use_amp
     
-    if args.zarr_path is not None or config.family == 'all':
+    if args.zarr_path is not None:
         json_path = getattr(args, 'status_json', None)
         assert json_path is not None, "使用zarr数据集格式，需要指定归一化统计量json"
         # 1) 构建 train/val 两个 Zarr 数据集（直接按 splits 读取，不再 random_split）
