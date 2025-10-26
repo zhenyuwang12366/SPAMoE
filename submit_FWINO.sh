@@ -22,7 +22,7 @@ python -c "import torch; print('PyTorch 版本:', torch.__version__)"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 bash scripts/run_distributed_seismic_moe.sh \
   --mode train \
-  --model_name FNO \
+  --model_name WNO \
   --use_encoder \
   --concat_channels \
   --is_specific \
@@ -35,7 +35,7 @@ bash scripts/run_distributed_seismic_moe.sh \
   --epochs 100 \
   --output_dir ../results \
   --top_k 1 \
-  --choose_experts 0 \
+  --choose_experts 1 \
   --hidden_channels 96 \
   --learning_rate 0.00026711555047527854 \
   --weight_decay 0.08952068376871994 \
@@ -46,4 +46,9 @@ bash scripts/run_distributed_seismic_moe.sh \
   --lambda_g2v 0.35339805101397564 \
   --lambda_grad_l1 0.15 \
   --lambda_fourier_mag_l1 0.05 \
+  --wavelet_type db6 \
+  --WNO_n_levels_height 3 \
+  --WNO_n_levels_width 2 \
+  --WNO_n_layers 4 \
+  --WNO_dropout_rate 0.10 \
   --use_amp

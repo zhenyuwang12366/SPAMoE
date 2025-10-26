@@ -755,9 +755,12 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                     "best/psnr": float(best_epoch_metrics.get("psnr", float("nan"))),
                     "best/mse": float(best_epoch_metrics.get("mse", float("nan"))),
                     "best/mae": float(best_epoch_metrics.get("mae", float("nan"))),
+                    "best/rmse": float(best_epoch_metrics.get("rmse", float("nan"))),
+                    "best/ssim": float(best_epoch_metrics.get("ssim", float("nan"))),
                     "best/epoch": float(best_epoch_index or 0),
                 })
             tb_writer.add_hparams(hparam_summary, metric_summary)
+            print("已写入hparams")
     finally:
         if tb_writer is not None:
             tb_writer.flush()

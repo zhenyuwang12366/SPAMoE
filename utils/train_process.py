@@ -158,7 +158,7 @@ def train_one_epoch(
     tb_active = bool(tb_writer) and bool(is_logger)
     type_weight_hist_sample = None
     max_type_weight_hist_samples = 65536
-    image_log_limit = 3
+    image_log_limit = 4
 
     start_time = time.time()
     model.train()
@@ -530,7 +530,18 @@ def train_one_epoch(
         else:
             preds_v, targets_v = preds, targets
 
-        visualize_results(inputs_v, targets_v, preds_v, save_dir=results_dir / f"vis_epoch_{epoch+1}")
+        num_samples = min(image_log_limit, inputs_v.shape[0])
+        wandb_run = wandb_module if use_wandb and wandb_module is not None else None
+        tb = tb_writer if tb_active else None
+        
+        visualize_results(
+            inputs_v, targets_v, preds_v, 
+            save_dir=results_dir / f"vis_epoch_{epoch+1}",
+            max_samples=num_samples,
+            tb_writer=tb,
+            wandb_run=wandb_run,
+            global_step=epoch,
+        )
         
         save_type_predictions_txt(
             logits=vis_weights,     # encoder输出的未softmax logits
@@ -544,23 +555,14 @@ def train_one_epoch(
         )
         
         # 进行傅里叶域分析
-        analyze_fourier_domain(inputs_v, targets_v, preds_v, save_dir=results_dir / f"fourier_analysis_epoch_{epoch+1}")
-
-        num_samples = min(image_log_limit, inputs_v.shape[0])
-        for idx in range(num_samples):
-            in_img  = inputs_v[idx, 0].detach().float().cpu().numpy()
-            tgt_img = (targets_v[idx, 0] if targets_v.dim() > 3 else targets_v[idx]).detach().float().cpu().numpy()
-            prd_img = (preds_v[idx, 0]   if preds_v.dim()   > 3 else preds_v[idx]).detach().float().cpu().numpy()
-            if use_wandb and wandb_module is not None:
-                wandb_module.log({
-                    f"sample_{idx}/input_velocity": wandb_module.Image(in_img),
-                    f"sample_{idx}/target_seismic": wandb_module.Image(tgt_img),
-                    f"sample_{idx}/prediction_seismic": wandb_module.Image(prd_img),
-                })
-            if tb_active:
-                tb_writer.add_image(f"samples/{idx}/input", in_img, epoch_step)
-                tb_writer.add_image(f"samples/{idx}/target", tgt_img, epoch_step)
-                tb_writer.add_image(f"samples/{idx}/prediction", prd_img, epoch_step)
+        analyze_fourier_domain(
+            inputs_v, targets_v, preds_v, 
+            save_dir=results_dir / f"fourier_analysis_epoch_{epoch+1}",
+            max_samples=num_samples,
+            tb_writer=tb,
+            wandb_run=wandb_run,
+            global_step=epoch,
+        )
 
     # —— 早停（仅主进程判定，后广播）—— #
     stop_flag = 0

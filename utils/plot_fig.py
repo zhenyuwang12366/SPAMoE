@@ -3,13 +3,14 @@ from matplotlib.colors import Normalize
 import re
 import pandas as pd
 import torch
-import os
+import os, io
 import time
 from pathlib import Path
 from typing import Optional, Dict, Union, Any
 import numpy as np
 from scipy.fft import fft2, fftshift
-    
+from PIL import Image
+
 def save_type_predictions_txt(
     logits: Optional[torch.Tensor],
     batch: Dict[str, Any],
@@ -185,8 +186,56 @@ def plot_loss_curve(log_file, save_path=None):
         print(f" 保存曲线到 {save_path}")
     else:
         plt.show()
-        
-def visualize_results(inputs, targets, predictions, save_dir='./results', max_samples=4):
+
+def _fig_to_arrays(fig, dpi=200):
+    """
+    将 Figure 转为：
+      - arr_chw: (3,H,W) 供 TensorBoard add_image 使用
+      - arr_hwc: (H,W,3) 供 wandb.Image 使用
+    """
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    buf.seek(0)
+    im = Image.open(buf).convert("RGB")
+    arr_hwc = np.array(im)                         # (H,W,3), uint8
+    arr_chw  = np.transpose(arr_hwc, (2, 0, 1))    # (3,H,W)
+    return arr_chw, arr_hwc
+
+def _log_figure(fig, save_path, tb_writer=None, tb_tag=None, step=None,
+                wandb_run=None, wb_key=None, dpi=200):
+    """
+    保存 + 同步到 TensorBoard 和 W&B。三者都可选。
+    """
+    # 1) 保存到本地
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+
+    # 2) 转成数组
+    arr_chw, arr_hwc = _fig_to_arrays(fig, dpi=dpi)
+
+    # 3) TensorBoard
+    if tb_writer is not None and tb_tag is not None:
+        tb_writer.add_image(tb_tag, arr_chw, global_step=step)
+
+    # 4) Weights & Biases
+    if wandb_run is not None and wb_key is not None:
+        try:
+            import wandb
+            wandb_run.log({wb_key: wandb.Image(arr_hwc)}, step=step)
+        except Exception as e:
+            print(f"[warn] wandb log 失败：{e}")
+
+
+def visualize_results(inputs,
+                      targets,
+                      predictions,
+                      save_dir='./results',
+                      max_samples=4,
+                      # 新增：日志相关
+                      tb_writer=None,         # torch.utils.tensorboard.SummaryWriter 实例或 None
+                      wandb_run=None,         # wandb.run 实例或 None
+                      global_step=None,       # 当前步数/epoch
+                      log_prefix='vis'):
     """可视化地震数据和预测结果"""
     os.makedirs(save_dir, exist_ok=True)
     
@@ -213,7 +262,8 @@ def visualize_results(inputs, targets, predictions, save_dir='./results', max_sa
 
         im0 = axes[0].imshow(input_data, cmap='viridis', aspect='auto')
         axes[0].set_title('inputs data')
-        fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+        input_cbar = fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+        input_cbar.set_label('Amplitude')
         
         target_map = targets[i, 0].cpu().numpy()
         pred_map   = predictions[i, 0].cpu().numpy()
@@ -227,13 +277,27 @@ def visualize_results(inputs, targets, predictions, save_dir='./results', max_sa
         axes[2].set_title('predictions model')
 
         cbar = fig.colorbar(im1, ax=axes[1:3], fraction=0.046, pad=0.04)
-        cbar.set_label('Model amplitude')
+        cbar.set_label('Model inpedance')
 
-        save_path = os.path.join(save_dir, f'sample_{i}.png')
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        png_path = os.path.join(save_dir, f'sample_{i}.png')
+        tb_tag   = f"{log_prefix}/sample_{i}/composed"
+        wb_key   = f"{log_prefix}/sample_{i}/figure"
+        _log_figure(fig, png_path,
+                    tb_writer=tb_writer, tb_tag=tb_tag, step=global_step,
+                    wandb_run=wandb_run, wb_key=wb_key, dpi=300)
+        
         plt.close(fig)
 
-def analyze_fourier_domain(inputs, targets, predictions, save_dir='./results', max_samples=4):
+def analyze_fourier_domain(inputs,
+                           targets,
+                           predictions,
+                           save_dir='./results',
+                           max_samples=4,
+                           # 新增：日志相关
+                           tb_writer=None,
+                           wandb_run=None,
+                           global_step=None,
+                           log_prefix='vis'):
     """
     分析输入和输出速度波形图在傅里叶域的特点 - 完全安全版本
     
@@ -412,7 +476,16 @@ def analyze_fourier_domain(inputs, targets, predictions, save_dir='./results', m
             plt.colorbar(im6, ax=axes[1, 2])
 
             plt.tight_layout()
-            plt.savefig(os.path.join(save_dir, f'fourier_analysis_sample_{i}.png'), dpi=300, bbox_inches='tight')
+            
+            # === 保存 & 日志 ===
+            png_path = os.path.join(save_dir, f'fourier_analysis_sample_{i}.png')
+            tb_tag   = f"{log_prefix}/sample_{i}/fourier_composed"
+            wb_key   = f"{log_prefix}/sample_{i}/fourier_figure"
+
+            _log_figure(fig, png_path,
+                        tb_writer=tb_writer, tb_tag=tb_tag, step=global_step,
+                        wandb_run=wandb_run, wb_key=wb_key, dpi=300)
+            
             plt.close(fig)
             
             # 计算相似性指标
