@@ -84,3 +84,5 @@ target/
 pretrain_weight/
 
 marmousi/
+
+runs/
