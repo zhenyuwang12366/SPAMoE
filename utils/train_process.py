@@ -156,8 +156,8 @@ def train_one_epoch(
     assert metrics_module is not None, "metrics_module 需提供 calculate_psnr(pred, tgt)"
     tqdm = tqdm_module.tqdm if tqdm_module is not None else None
     tb_active = bool(tb_writer) and bool(is_logger)
-    router_hist_sample = None
-    max_router_hist_samples = 65536
+    type_weight_hist_sample = None
+    max_type_weight_hist_samples = 65536
     image_log_limit = 3
 
     start_time = time.time()
@@ -167,7 +167,6 @@ def train_one_epoch(
     running_train_loss = 0.0
     running_aux_loss = 0.0
     micro_count = 0
-    optim_count = 0
     num_steps = len(train_loader)
     nan_detected = False
     use_amp = bool(amp_enabled) and (amp_scaler is not None)
@@ -228,11 +227,11 @@ def train_one_epoch(
         if encoder_frozen and weights is not None:
             weights = weights.detach()
         
-        if tb_active and router_hist_sample is None and weights is not None:
+        if tb_active and type_weight_hist_sample is None and weights is not None:
             flat_weights = weights.detach().float().cpu().reshape(-1)
-            if flat_weights.numel() > max_router_hist_samples:
-                flat_weights = flat_weights[:max_router_hist_samples]
-            router_hist_sample = flat_weights
+            if flat_weights.numel() > max_type_weight_hist_samples:
+                flat_weights = flat_weights[:max_type_weight_hist_samples]
+            type_weight_hist_sample = flat_weights
 
         if train_encoder:
             labels = batch['v_type'].to(device, non_blocking=True)
@@ -275,9 +274,6 @@ def train_one_epoch(
                 running_aux_loss   += aux_loss.item()
                 micro_in_group     += 1
                 micro_count        += 1
-                if tb_active:
-                    tb_writer.add_scalar("train/micro_loss", loss_raw.item(), global_step)
-                    tb_writer.add_scalar("train/aux_loss", aux_loss.item(), global_step)
 
         if step_has_nan:
             optimizer.zero_grad(set_to_none=True)
@@ -292,7 +288,6 @@ def train_one_epoch(
             else:
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-            optim_count += 1
             micro_in_group = 0  # 结算完当前组，清零
 
             # 学习率调度（按步）
@@ -301,7 +296,6 @@ def train_one_epoch(
             if tb_active:
                 current_lr = optimizer.param_groups[0]["lr"]
                 tb_writer.add_scalar("train/learning_rate", current_lr, global_step)
-                tb_writer.add_scalar("train/optim_steps_in_epoch", optim_count, global_step)
 
         if is_logger and tqdm is not None:
             pbar_iter.set_postfix({"train_loss": f"{loss_raw.item():.6f}"})  # 展示未缩放损失
@@ -320,8 +314,6 @@ def train_one_epoch(
     if tb_active:
         tb_writer.add_scalar("train/epoch_loss", avg_train_loss, epoch_step)
         tb_writer.add_scalar("train/epoch_aux_loss", avg_aux_loss, epoch_step)
-        tb_writer.add_scalar("epoch/micro_steps", micro_count, epoch_step)
-        tb_writer.add_scalar("epoch/optim_steps", optim_count, epoch_step)
 
     # —— 验证 —— #
     if nan_detected:
@@ -363,6 +355,14 @@ def train_one_epoch(
         tb_writer.add_scalar("val/mae", val_stats.get("mae", float("nan")), epoch_step)
         tb_writer.add_scalar("val/rmse", val_stats.get("rmse", float("nan")), epoch_step)
         tb_writer.add_scalar("val/ssim", val_stats.get("ssim", float("nan")), epoch_step)
+        tb_writer.add_scalars(
+            "loss/epoch",
+            {
+                "train": avg_train_loss,
+                "val": val_stats.get("val_loss", float("nan")),
+            },
+            epoch_step,
+        )
         if train_encoder:
             tb_writer.add_scalar("val/ce", val_stats.get("ce", float("nan")), epoch_step)
     if router_type == 'adamv':
@@ -415,7 +415,6 @@ def train_one_epoch(
                 "val/rmse": val_stats['rmse'],
                 "val/ssim": val_stats['ssim'],
                 "val/ce": val_stats["ce"],
-                "optim_steps_in_epoch": optim_count,
             }
         else:
             wandb_log = {
@@ -428,12 +427,11 @@ def train_one_epoch(
                 "val/mae": val_stats["mae"],
                 "val/rmse": val_stats["rmse"],
                 "val/ssim": val_stats["ssim"],
-                "optim_steps_in_epoch": optim_count,
             }
         wandb_module.log(wandb_log)
 
-    if tb_active and router_hist_sample is not None:
-        tb_writer.add_histogram("router/gates", router_hist_sample, epoch_step)
+    if tb_active and type_weight_hist_sample is not None:
+        tb_writer.add_histogram("encoder/type_weights", type_weight_hist_sample, epoch_step)
 
     # —— 保存最佳模型（仅主进程）—— #
     if is_logger and (val_loss < best_val_loss):
@@ -548,23 +546,21 @@ def train_one_epoch(
         # 进行傅里叶域分析
         analyze_fourier_domain(inputs_v, targets_v, preds_v, save_dir=results_dir / f"fourier_analysis_epoch_{epoch+1}")
 
-        if use_wandb and wandb_module is not None:
-            # 只示例记录前三个
-            for i in range(min(4, inputs_v.shape[0])):
-                in_img  = inputs_v[i, 0].detach().float().cpu().numpy()
-                tgt_img = (targets_v[i, 0] if targets_v.dim() > 3 else targets_v[i]).detach().float().cpu().numpy()
-                prd_img = (preds_v[i, 0]   if preds_v.dim()   > 3 else preds_v[i]).detach().float().cpu().numpy()
+        num_samples = min(image_log_limit, inputs_v.shape[0])
+        for idx in range(num_samples):
+            in_img  = inputs_v[idx, 0].detach().float().cpu().numpy()
+            tgt_img = (targets_v[idx, 0] if targets_v.dim() > 3 else targets_v[idx]).detach().float().cpu().numpy()
+            prd_img = (preds_v[idx, 0]   if preds_v.dim()   > 3 else preds_v[idx]).detach().float().cpu().numpy()
+            if use_wandb and wandb_module is not None:
                 wandb_module.log({
-                    f"sample_{i}/input_velocity": wandb_module.Image(in_img),
-                    f"sample_{i}/target_seismic": wandb_module.Image(tgt_img),
-                    f"sample_{i}/prediction_seismic": wandb_module.Image(prd_img),
+                    f"sample_{idx}/input_velocity": wandb_module.Image(in_img),
+                    f"sample_{idx}/target_seismic": wandb_module.Image(tgt_img),
+                    f"sample_{idx}/prediction_seismic": wandb_module.Image(prd_img),
                 })
-        if tb_active:
-            num_samples = min(image_log_limit, inputs_v.shape[0])
-            for idx in range(num_samples):
-                tb_writer.add_image(f"samples/{idx}/input", inputs_v[idx], epoch_step)
-                tb_writer.add_image(f"samples/{idx}/target", targets_v[idx], epoch_step)
-                tb_writer.add_image(f"samples/{idx}/prediction", preds_v[idx], epoch_step)
+            if tb_active:
+                tb_writer.add_image(f"samples/{idx}/input", in_img, epoch_step)
+                tb_writer.add_image(f"samples/{idx}/target", tgt_img, epoch_step)
+                tb_writer.add_image(f"samples/{idx}/prediction", prd_img, epoch_step)
 
     # —— 早停（仅主进程判定，后广播）—— #
     stop_flag = 0
@@ -603,8 +599,6 @@ def train_one_epoch(
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     if is_logger:
         print('Training time', total_time_str)
-    if tb_active:
-        tb_writer.add_scalar("epoch/duration_sec", total_time, epoch_step)
 
     # 返回统计与状态
     stats = {
@@ -614,8 +608,7 @@ def train_one_epoch(
         "psnr": val_stats["psnr"],
         "mse": val_stats["mse"],
         "mae": val_stats["mae"],
-        "optim_steps": optim_count,
-        "micro_steps": micro_count,
-        "time_sec": total_time
+        "rmse": val_stats["rmse"],
+        "ssim": val_stats["ssim"],
     }
     return stats, best_val_loss, stop_flag
