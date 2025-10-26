@@ -60,11 +60,11 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     experts_name_str = runtime_ctx["experts_name_str"]
     use_amp = config.use_amp
     
-    if config.family in ['curve_vel_a', 'curve_vel_b']:
+    if config.family in ['curve_vel_a', 'curve_vel_b', 'flat_vel_a', 'flat_vel_b']:
         val_ratio = 6 / 30
     elif config.family in ['curve_fault_a', 'curve_fault_b', 'flat_fault_a', 'flat_fault_b']:
         val_ratio = 6 / 54
-    elif config.family in ['style_a', 'style_b']:
+    elif config.family in ['style_a', 'style_b', 'style_style_a', 'style_style_b']:
         val_ratio = 7 / 67
     elif config.family == 'all':
         val_ratio = runtime_ctx["val_ratio"]

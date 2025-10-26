@@ -116,34 +116,60 @@ def save_type_predictions_txt(
 
     return txt_path
 
+import re
+import pandas as pd
+import matplotlib.pyplot as plt
+
 def plot_loss_curve(log_file, save_path=None):
     """
     从日志文件中解析并绘制 Train Loss 和 Val Loss 曲线
+    自动适配是否存在 CE 列
     """
-    with open(log_file, "r") as f:
+    with open(log_file, "r", encoding="utf-8") as f:
         text = f.read()
     
-    pattern = re.compile(
-        r"""^                                   # 行首
-            \s*(\d+)\s*\|\s*                    # Epoch（整数）
-            (\d+(?:\.\d+)?)\s*\|\s*             # Train Loss（浮点）
-            (\d+(?:\.\d+)?)\s*\|\s*             # Val Loss（浮点）
-            (\d+(?:\.\d+)?)\s*\|\s*             # MAE（浮点）
-            (\d+(?:\.\d+)?)\s*\|\s*             # MSE（浮点）
-            ([+-]?\d+(?:\.\d+)?)\s*\|           # PSNR（可为负）
-            \s*$                                # 行尾
-        """,
-        re.MULTILINE | re.VERBOSE
+    # 尝试两种日志模式：带 CE 和不带 CE
+    pattern_with_ce = re.compile(
+        r"""^\s*(\d+)\s*\|\s*                     # Epoch
+            (\d+(?:\.\d+)?)\s*\|\s*              # Train Loss
+            (\d+(?:\.\d+)?)\s*\|\s*              # Val Loss
+            (\d+(?:\.\d+)?)\s*\|\s*              # MAE
+            (\d+(?:\.\d+)?)\s*\|\s*              # MSE
+            ([+-]?\d+(?:\.\d+)?)\s*\|\s*         # PSNR
+            (\d+(?:\.\d+)?)\s*\|\s*              # RMSE
+            (\d+(?:\.\d+)?)\s*\|\s*              # SSIM
+            (\d+(?:\.\d+)?)\s*\|?\s*$            # CE（可选）
+        """, re.MULTILINE | re.VERBOSE
     )
 
-    rows = [m.groups() for m in pattern.finditer(text)]
-    
+    pattern_without_ce = re.compile(
+        r"""^\s*(\d+)\s*\|\s*                     # Epoch
+            (\d+(?:\.\d+)?)\s*\|\s*              # Train Loss
+            (\d+(?:\.\d+)?)\s*\|\s*              # Val Loss
+            (\d+(?:\.\d+)?)\s*\|\s*              # MAE
+            (\d+(?:\.\d+)?)\s*\|\s*              # MSE
+            ([+-]?\d+(?:\.\d+)?)\s*\|\s*         # PSNR
+            (\d+(?:\.\d+)?)\s*\|\s*              # RMSE
+            (\d+(?:\.\d+)?)\s*\|?\s*$            # SSIM
+        """, re.MULTILINE | re.VERBOSE
+    )
+
+    # 优先匹配带 CE 的格式
+    rows = [m.groups() for m in pattern_with_ce.finditer(text)]
+    if rows:
+        columns = ["Epoch", "Train Loss", "Val Loss", "MAE", "MSE", "PSNR", "RMSE", "SSIM", "CE"]
+    else:
+        rows = [m.groups() for m in pattern_without_ce.finditer(text)]
+        columns = ["Epoch", "Train Loss", "Val Loss", "MAE", "MSE", "PSNR", "RMSE", "SSIM"]
+
     if not rows:
-        raise ValueError("日志格式不匹配，请检查 log_file 格式")
-    
-    df = pd.DataFrame(rows, columns=["Epoch", "Train Loss", "Val Loss", "MAE", "MSE", "PSNR"]).astype(float)
+        raise ValueError("日志格式不匹配，请检查 log_file 是否包含正确的数值行")
+
+    # 构建 DataFrame
+    df = pd.DataFrame(rows, columns=columns).astype(float)
     df_grouped = df.groupby("Epoch").mean().reset_index()
-    
+
+    # 绘制损失曲线
     plt.figure(figsize=(10, 6))
     plt.plot(df_grouped["Epoch"], df_grouped["Train Loss"], label="Train Loss", lw=2)
     plt.plot(df_grouped["Epoch"], df_grouped["Val Loss"], label="Val Loss", lw=2)
@@ -153,10 +179,10 @@ def plot_loss_curve(log_file, save_path=None):
     plt.title("Train vs Validation Loss")
     plt.legend()
     plt.grid(True)
-    
+
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
-        print(f"保存曲线到 {save_path}")
+        print(f" 保存曲线到 {save_path}")
     else:
         plt.show()
         
