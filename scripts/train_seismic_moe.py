@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from typing import Optional, Callable
+from argparse import Namespace
 import tqdm
 from pathlib import Path
 from datetime import datetime
@@ -66,7 +67,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         assert json_path is not None, "使用zarr数据集格式，需要指定归一化统计量json"
         # 1) 构建 train/val 两个 Zarr 数据集（直接按 splits 读取，不再 random_split）
         zarr_path = getattr(args, 'zarr_path', None)
-        assert zarr_path is not None, "family == 'all' 时请在 args.zarr_path 指定 seismic_moe.zarr 路径"
+        assert zarr_path is not None, "使用zarr数据格式时请在 args.zarr_path 指定 seismic_moe.zarr 路径"
 
         import json
         with open(json_path, 'r') as f:
@@ -854,7 +855,7 @@ class TransformedSubset(Subset):
         return [self._get_single(index) for index in idx]
 
 
-def run_inference(args):
+def run_inference(n_args):
     """
     使用训练好的模型进行推理，推理前向流程与训练保持一致
     
@@ -863,151 +864,234 @@ def run_inference(args):
     args : argparse.Namespace
         命令行参数
     """
-    # 验证模型路径
-    if not os.path.exists(args.model_path):
-        raise ValueError(f"模型文件不存在: {args.model_path}")
+    setting_dir = Path(getattr(n_args, "setting_path", ""))
+    if not setting_dir:
+        raise ValueError("推理模式需要指定包含 args.json/config.json 的 --setting_path 目录")
+    if not setting_dir.exists():
+        raise ValueError(f"配置目录不存在: {setting_dir}")
 
-    # 加载模型 checkpoint
-    checkpoint = torch.load(args.model_path, map_location='cpu')
-    data_dict = checkpoint['data_dict']
+    args_path = setting_dir / "args.json"
+    config_path = setting_dir / "config.json"
+    if not args_path.exists():
+        raise ValueError(f"缺少训练时保存的参数文件: {args_path}")
+    if not config_path.exists():
+        raise ValueError(f"缺少训练时保存的配置文件: {config_path}")
 
-    # 构建与训练一致的配置
-    config, runtime_ctx = get_seismic_config(args)
+    with open(args_path, "r", encoding="utf-8") as f:
+        stored_args_dict = json.load(f)
+    with open(config_path, "r", encoding="utf-8") as f:
+        stored_config_dict = json.load(f)
+
+    runtime_args_dict = dict(stored_args_dict)
+    for key, value in vars(n_args).items():
+        if value is not None:
+            runtime_args_dict[key] = value
+    runtime_args_dict["mode"] = "inference"
+    runtime_args = Namespace(**runtime_args_dict)
+
+    config, runtime_ctx = get_seismic_config(runtime_args)
+
+    def _recursive_update(obj, payload):
+        for k, v in payload.items():
+            if isinstance(v, dict) and hasattr(obj, k):
+                child = getattr(obj, k)
+                if hasattr(child, "__dict__"):
+                    _recursive_update(child, v)
+                else:
+                    setattr(obj, k, v)
+            else:
+                setattr(obj, k, v)
+
+    _recursive_update(config, stored_config_dict)
+
     device = runtime_ctx["device"]
     is_logger = runtime_ctx["is_logger"]
+    world_size = runtime_ctx["world_size"]
+    local_rank = runtime_ctx["local_rank"]
 
-    if args.data_dir:
-        config.data_dir = args.data_dir
+    model_path = Path(getattr(n_args, "model_path", ""))
+    if not model_path.exists():
+        raise ValueError(f"模型文件不存在: {model_path}")
 
-    test_dir = os.path.join(config.data_dir, 'test')
-    if not os.path.exists(test_dir):
-        raise ValueError(f"测试目录不存在: {test_dir}")
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
 
-    # 数据预处理，与训练保持一致
-    from neuralop.data.datasets.seismic_dataset import SeismicDataProcessor
+    stats_from_ckpt = checkpoint.get("data_dict", None)
+    status_json = getattr(runtime_args, "status_json", None)
+    stats_dict = None
+    if status_json and Path(status_json).exists():
+        with open(status_json, "r", encoding="utf-8") as f:
+            status_payload = json.load(f)
+        if config.family == "all":
+            stats_dict = status_payload.get("overall")
+        else:
+            per_type = status_payload.get("per_type", {})
+            stats_dict = per_type.get(config.family)
+    if stats_dict is None:
+        stats_dict = stats_from_ckpt
+    if stats_dict is None:
+        raise ValueError("无法获取归一化统计量，请确保提供 status_json 或 checkpoint 中包含 data_dict。")
+
+    k_value = getattr(runtime_args, "k", 1.0)
 
     input_transform = Compose([
-        T.LogTransform(k=args.k),
+        T.LogTransform(k=k_value),
         T.MinMaxNormalize(
-            T.log_transform(data_dict['input_min'], k=args.k),
-            T.log_transform(data_dict['input_max'], k=args.k),
-        )
+            T.log_transform(stats_dict["input_min"], k=k_value),
+            T.log_transform(stats_dict["input_max"], k=k_value),
+        ),
+    ])
+    output_transform = Compose([
+        T.MinMaxNormalize(stats_dict["output_min"], stats_dict["output_max"])
+    ])
+    input_inverse_transform = Compose([
+        T.InverseMinMaxNormalize(
+            T.log_transform(stats_dict["input_min"], k=k_value),
+            T.log_transform(stats_dict["input_max"], k=k_value),
+        ),
+        T.InverseLogTransform(k=k_value),
     ])
     output_inverse_transform = Compose([
-        T.InverseMinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
+        T.InverseMinMaxNormalize(stats_dict["output_min"], stats_dict["output_max"])
     ])
+
+    from neuralop.data.datasets.seismic_dataset import SeismicDataProcessor
 
     data_processor = SeismicDataProcessor(
         channel_dim=config.channel_dim,
         input_transform=input_transform,
-        output_transform=None,
+        output_transform=output_transform,
         config=config,
     )
 
-    # 创建测试数据集并应用与训练相同的变换
-    test_dataset = SeismicDataset(
-        data_dir=config.data_dir,
-        family=config.family or 'all',
-        is_specific=config.is_specific,
-        split='test',
-        concat_channels=config.concat_channels,
-        config=config
-    )
-    test_dataset = TransformedSubset(test_dataset, data_processor)
+    zarr_path = getattr(runtime_args, "zarr_path", None)
+    if not zarr_path:
+        raise ValueError("推理需要指定 zarr 数据集路径 (--zarr_path)")
+    zarr_path = Path(zarr_path)
+    if not zarr_path.exists():
+        raise ValueError(f"zarr 数据文件不存在: {zarr_path}")
 
-    test_batch_size = args.batch_size or getattr(config, "test_batch_size", None) or 4
-    num_workers = max(0, args.num_workers)
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=test_batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=num_workers > 0,
+    test_dataset = ZarrSeismicDataset(
+        zarr_path=str(zarr_path),
+        split=getattr(runtime_args, "eval_split", "val"),
+        input_transform=None,
+        output_transform=None,
+        expect_input_shape=(1, 1000, 350),
+        to_float32=True,
     )
+    test_dataset_with_transform = TransformedSubset(test_dataset, data_processor)
+
+    if getattr(runtime_args, "distributed", False) and world_size > 1:
+        test_sampler = DistributedSampler(
+            test_dataset_with_transform,
+            num_replicas=world_size,
+            rank=local_rank,
+            shuffle=False,
+            drop_last=False,
+        )
+        num_workers = max(0, runtime_args.num_workers // 2)
+        test_loader = DataLoader(
+            test_dataset_with_transform,
+            sampler=test_sampler,
+            batch_size=int(config.test_batch_size),
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+        )
+    else:
+        test_sampler = None
+        num_workers = max(0, getattr(runtime_args, "num_workers", 0))
+        test_loader = DataLoader(
+            test_dataset_with_transform,
+            batch_size=int(config.test_batch_size),
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+        )
 
     if len(test_loader) == 0:
-        raise RuntimeError("测试数据加载器为空，请检查数据集设置。")
+        raise RuntimeError("测试数据加载器为空，请检查数据集配置。")
 
     sample_batch = next(iter(test_loader))
-    input_shape = sample_batch['input'].shape
-    config.in_channels = input_shape[1]
+    config.in_channels = sample_batch["input"].shape[1]
 
     encoder_model = None
-    if config.use_encoder:
+    if getattr(config, "use_encoder", False):
+        num_types = getattr(config, "v_type_num", 0) or 10
+        type_act = "identity" if getattr(config, "train_encoder", False) else "softmax"
         encoder_model = get_encoder(
             in_channels=config.in_channels,
             out_channels=128,
-            num_types=config.v_type_num,
+            num_types=num_types,
+            type_act=type_act,
+            backbone=config.backbone,
         )
-        if not config.is_classifier and hasattr(encoder_model, "type_head"):
-            for p in encoder_model.type_head.parameters():
-                p.requires_grad_(False)
-        encoder_model.eval()
         encoder_model = encoder_model.to(device)
+        encoder_model.eval()
+        for p in encoder_model.parameters():
+            p.requires_grad_(False)
 
-        encoder_ckpt_path = getattr(args, "encoder_path", None)
-        if encoder_ckpt_path:
+        encoder_ckpt = getattr(runtime_args, "encoder_path", None)
+        if encoder_ckpt:
             missing, unexpected = load_encoder_weights(
                 encoder_model,
-                encoder_ckpt_path,
-                map_location="cpu",
+                encoder_ckpt,
+                map_location=device,
                 strict=False,
             )
             if is_logger:
-                print(f"[Encoder] 推理阶段已从 {encoder_ckpt_path} 加载预训练权重。")
+                print(f"[Encoder] 已从 {encoder_ckpt} 加载推理权重。")
                 if missing:
                     print(f"[Encoder] 缺失参数: {missing}")
                 if unexpected:
                     print(f"[Encoder] 未使用参数: {unexpected}")
         else:
-            encoder_state = checkpoint.get('encoder_state_dict')
+            encoder_state = checkpoint.get("encoder_state_dict")
             if encoder_state is not None:
-                missing, unexpected = load_encoder_weights(encoder_model, encoder_state, strict=False)
+                missing, unexpected = load_encoder_weights(
+                    encoder_model,
+                    encoder_state,
+                    map_location=device,
+                    strict=False,
+                )
                 if is_logger and (missing or unexpected):
-                    print(f"[Encoder] 从模型 checkpoint 加载编码器: 缺失 {missing}, 多余 {unexpected}")
+                    print(f"[Encoder] 从 checkpoint 加载编码器: 缺失 {missing}, 多余 {unexpected}")
             elif is_logger:
-                print("警告：checkpoint 中缺少 encoder_state_dict，将使用随机初始化的编码器。")
-
-        for p in encoder_model.parameters():
-            p.requires_grad_(False)
+                print("[Encoder] checkpoint 中缺少 encoder_state_dict，将使用随机初始化的编码器。")
 
         with torch.no_grad():
-            probe_inputs = sample_batch['input'].to(device, non_blocking=True)
+            probe_inputs = sample_batch["input"].to(device, non_blocking=True)
             encoder_probe, _, _ = encoder_model(probe_inputs)
-        moe_in_channels = encoder_probe.shape[1]
-        config.moe_in_channels = moe_in_channels
+        config.moe_in_channels = encoder_probe.shape[1]
         del encoder_probe, probe_inputs
     else:
-        moe_in_channels = config.in_channels
-        config.moe_in_channels = moe_in_channels
+        config.moe_in_channels = config.in_channels
         if is_logger:
             print("[Encoder] use_encoder=False，推理阶段直接使用原始输入。")
 
-    # 创建专家模型，与训练保持一致
-    if config.use_moe and getattr(config, "use_experts_path", None):
+    if getattr(config, "use_moe", False) and getattr(config, "use_experts_path", None):
         experts = load_moe_experts(
-            experts_config=config.load_expert_configs,
-            in_channels=moe_in_channels,
+            experts_config=getattr(config, "load_expert_configs", config.expert_configs),
+            in_channels=config.moe_in_channels,
             out_channels=config.out_channels,
             hidden_channels=config.hidden_channels,
             model_path=config.use_experts_path,
             is_specific=config.is_specific,
             map_location=device,
-            type_dict=config.type_id
+            type_dict=config.type_id,
         )
     else:
         experts = ExpertFactory.create_expert_ensemble(
             expert_configs=config.expert_configs,
-            in_channels=moe_in_channels,
+            in_channels=config.moe_in_channels,
             out_channels=config.out_channels,
-            hidden_channels=config.hidden_channels
+            hidden_channels=config.hidden_channels,
         )
 
-    # 构建 MOE 主干，与训练设置对齐
     model = MOEOperator(
         experts=experts,
-        in_channels=moe_in_channels,
+        in_channels=config.moe_in_channels,
         out_channels=config.out_channels,
         hidden_channels=config.hidden_channels,
         top_k=config.top_k,
@@ -1026,22 +1110,37 @@ def run_inference(args):
         v_type_num=config.v_type_num,
         use_expert_memory_proxy=config.use_gpu_proxy,
     )
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(checkpoint["model_state_dict"])
     model = model.to(device)
     model.eval()
 
-    amp_enabled = bool(config.use_amp) and device.type == 'cuda'
+    amp_enabled = bool(getattr(config, "use_amp", False)) and device.type == "cuda"
 
-    # 创建结果目录
-    output_root = Path(config.output_dir or args.output_dir or "./results")
-    results_dir = output_root / "predictions"
+    default_root = getattr(config, "experiment_dir", None) or getattr(config, "output_dir", None) or setting_dir
+    output_root = Path(getattr(n_args, "output_dir", None) or default_root)
+    results_dir = output_root / "inference"
+    log_path = results_dir / "metrics.txt"
+    img_path = results_dir / "vis"
     results_dir.mkdir(parents=True, exist_ok=True)
+    img_path.mkdir(parents=True, exist_ok=True)
 
-    # 进行推理
+    metrics_module = SeismicMetrics()
+
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write("    Epoch    |    Train Loss    |    Val Loss    |    MAE    |    MSE    |    PSNR    |    RMSE    |    SSIM    |\n")
+
+    mse_sum = mae_sum = psnr_sum = rmse_sum = ssim_sum = 0.0
+    batch_count = 0
+    visual_payload = None
+
+    model_kwargs = {}
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="推理中"):
-            inputs = batch['input'].to(device, non_blocking=True)
-            file_names = batch['input_file']
+        for batch in tqdm.tqdm(test_loader, desc="推理中", disable=not is_logger):
+            inputs = batch["input"].to(device, non_blocking=True)
+            targets = batch.get("output")
+            if targets is None:
+                continue
+            targets = targets.to(device, non_blocking=True).to(dtype=torch.float32)
 
             if encoder_model is not None:
                 if amp_enabled:
@@ -1055,14 +1154,86 @@ def run_inference(args):
                 encoded = inputs.to(dtype=torch.float32)
                 weights = None
 
-            predictions, _ = model(encoded, weights)
+            preds, _ = model(encoded, weights, **model_kwargs)
+            preds = preds.to(dtype=torch.float32)
 
-            predictions = output_inverse_transform(predictions)
+            mse_sum += metrics_module.calculate_mse(preds, targets)
+            mae_sum += metrics_module.calculate_mae(preds, targets)
+            psnr_sum += metrics_module.calculate_psnr(preds, targets)
+            rmse_sum += metrics_module.calculate_rmse(preds, targets)
+            ssim_sum += metrics_module.calculate_ssim(preds, targets)
+            batch_count += 1
 
-            for i, file_name in enumerate(file_names):
-                prediction = predictions[i].detach().cpu().numpy()
-                output_path = results_dir / f"{file_name}.npy"
-                np.save(output_path, prediction)
+            if visual_payload is None and is_logger:
+                inputs_cpu = inputs.detach().cpu()
+                targets_cpu = targets.detach().cpu()
+                preds_cpu = preds.detach().cpu()
+                if input_inverse_transform is not None:
+                    inputs_cpu = input_inverse_transform(inputs_cpu)
+                if output_inverse_transform is not None:
+                    preds_cpu = output_inverse_transform(preds_cpu)
+                    targets_cpu = output_inverse_transform(targets_cpu)
+                logits_cpu = weights.detach().cpu() if weights is not None else None
+                visual_payload = {
+                    "inputs": inputs_cpu,
+                    "targets": targets_cpu,
+                    "preds": preds_cpu,
+                    "logits": logits_cpu,
+                    "batch": batch,
+                }
+
+    if batch_count == 0:
+        raise RuntimeError("测试数据集中没有可评估的样本。")
+
+    mse = mse_sum / batch_count
+    mae = mae_sum / batch_count
+    psnr = psnr_sum / batch_count
+    rmse = rmse_sum / batch_count
+    ssim = ssim_sum / batch_count
+
+    if is_logger:
+        print(f"推理指标: MSE={mse:.6f} | MAE={mae:.6f} | PSNR={psnr:.4f} | RMSE={rmse:.6f} | SSIM={ssim:.6f}")
+
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"  Inference |        -        |        -        | {mae:.6f} | {mse:.6f} | {psnr:.4f} | {rmse:.6f} | {ssim:.6f} |\n")
+
+    if visual_payload is not None:
+        inputs_vis = visual_payload["inputs"]
+        targets_vis = visual_payload["targets"]
+        preds_vis = visual_payload["preds"]
+        logits_vis = visual_payload["logits"]
+        vis_batch = visual_payload["batch"]
+        num_samples = min(4, inputs_vis.shape[0])
+
+        visualize_results(
+            inputs_vis,
+            targets_vis,
+            preds_vis,
+            save_dir=img_path,
+            max_samples=num_samples,
+        )
+
+        save_type_predictions_txt(
+            logits=logits_vis,
+            batch=vis_batch,
+            save_dir=img_path,
+            epoch=0,
+            config=config,
+            filename="type_predictions.txt",
+            append=False,
+            is_logger=is_logger,
+        )
+
+        analyze_fourier_domain(
+            inputs_vis,
+            targets_vis,
+            preds_vis,
+            save_dir=img_path,
+            max_samples=num_samples,
+        )
+
+    if test_sampler is not None and hasattr(test_sampler, "set_epoch"):
+        test_sampler.set_epoch(0)
 
     print(f"推理完成！结果保存在: {results_dir}")
 

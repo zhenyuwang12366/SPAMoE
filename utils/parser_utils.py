@@ -16,6 +16,8 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='数据目录路径')
     parser.add_argument('--zarr_path', type=str, default=None,
                         help='数据集zarr格式文件')
+    parser.add_argument('--setting_path', type=str, default=None,
+                        help='推理使用的存放训练配置文件目录')
     parser.add_argument('--family', type=str, default=None, choices=_FAMILY_CHOICES,
                         help='数据集系列，可选通用 (vel/style/fault/all) 或细分类别 (如 curve_vel_a)')
     parser.add_argument('--status_json', type=str, default='./dataset_status/dataset_status.json',
