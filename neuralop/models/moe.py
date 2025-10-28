@@ -745,6 +745,9 @@ class MOEOperator(BaseModel, name='MOE'):
                             except Exception as e:
                                 _log(f"[ERROR] 专家 {eid} 处理异常：{e}，使用零张量代替")
                                 y_by_eid[eid] = _zeros_like_x(x_sub.size(0), C, x_sub)
+                                import traceback
+                                traceback.print_exc()
+                                exit(0)
                 except Exception as e:
                     _log(f"[ERROR] forward_many 异常：{e}；该列以零张量兜底")
                     batch_outputs = [_zeros_like_x(1, C, x[b:b+1]) for b in range(batch_size)]

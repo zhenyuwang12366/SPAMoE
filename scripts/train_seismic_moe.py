@@ -69,7 +69,6 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         zarr_path = getattr(args, 'zarr_path', None)
         assert zarr_path is not None, "使用zarr数据格式时请在 args.zarr_path 指定 seismic_moe.zarr 路径"
 
-        import json
         with open(json_path, 'r') as f:
             data_dict_raw = json.load(f)
         

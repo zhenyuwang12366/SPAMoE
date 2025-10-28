@@ -57,3 +57,24 @@ class SeismicMetrics:
         ssim_loss = SSIM(window_size=11)
         ssim = ssim_loss(target / 2 + 0.5, pred / 2 + 0.5)
         return ssim
+
+    # ==== 新增统一指标计算接口 ====
+    def __call__(self, pred, target):
+        """
+        验证阶段统一接口：返回 {'loss','mae','mse','psnr','rmse','ssim'} 字典
+        自动在GPU上运行，自动转换复数/float类型
+        """
+        mse = self.calculate_mse(pred, target)
+        mae = self.calculate_mae(pred, target)
+        rmse = self.calculate_rmse(pred, target)
+        psnr = self.calculate_psnr(pred, target)
+        ssim_val = self.calculate_ssim(target, pred)
+
+        return {
+            "loss": float(mse),
+            "mae": float(mae),
+            "mse": float(mse),
+            "psnr": float(psnr),
+            "rmse": float(rmse),
+            "ssim": float(ssim_val),
+        }
