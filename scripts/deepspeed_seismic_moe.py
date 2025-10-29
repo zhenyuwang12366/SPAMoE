@@ -27,12 +27,8 @@ from torchvision.transforms import Compose
 import deepspeed
 from deepspeed import zero
 
-# >>> NEW: 进度条与绘图工具导入
+# 进度条与绘图工具导入
 from tqdm.auto import tqdm
-from utils.plot_fig import (
-    analyze_fourier_domain, visualize_results, save_type_predictions_txt
-)
-
 # ===== 你的工程内模块（保持原结构）=====
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from neuralop.data.datasets.seismic_dataset import SeismicDataProcessor
@@ -209,7 +205,7 @@ def run_training_deepspeed(args):
         output_transform = Compose([
             T.MinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
         ])
-        # >>> NEW: 反归一化（根据你参考代码保留，未改其他逻辑）
+        # 反归一化（如需可视化）
         input_inverse_transform = Compose([
             T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k)),
             T.InverseLogTransform(k=args.k)
@@ -279,7 +275,7 @@ def run_training_deepspeed(args):
         output_transform = Compose([
             T.MinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
         ])
-        # >>> NEW: 反归一化（根据你参考代码保留，未改其他逻辑）
+        # 反归一化（如需可视化）
         input_inverse_transform = Compose([
             T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k)),
             T.InverseLogTransform(k=args.k)
@@ -656,7 +652,6 @@ def run_training_deepspeed(args):
 
             # Train
             run_train = {"loss": 0.0}
-            # >>> NEW: 训练进度条（仅 logger 进程展示）
             train_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs}", leave=False, disable=not is_logger)
             for step, batch in enumerate(train_iter):
                 batch = _to_device(batch, engine.device)
@@ -680,34 +675,51 @@ def run_training_deepspeed(args):
             num_steps = max(1, step + 1)
             train_loss = run_train["loss"] / num_steps
 
-            # Val
+            # ---------- Val ----------
             engine.eval()
             with torch.no_grad():
-                v_meter = {"loss": 0.0, "mae": 0.0, "mse": 0.0, "psnr": 0.0, "rmse": 0.0, "ssim": 0.0}
-                # >>> NEW: 验证进度条（仅 logger 进程展示）
+                # 累加“和”方便跨卡规约
+                sum_meter = {"loss": 0.0, "mae": 0.0, "mse": 0.0, "psnr": 0.0, "rmse": 0.0, "ssim": 0.0}
+                cnt_batches = 0
+
                 val_iter = tqdm(val_loader, desc=f"Eval {epoch+1}/{config.epochs}", leave=False, disable=not is_logger)
                 for vstep, vbatch in enumerate(val_iter):
                     vbatch = _to_device(vbatch, engine.device)
                     out = engine(vbatch)
                     pred, y = out[0], out[1]
                     res = metrics(pred, y)
-                    for k in v_meter:
-                        v_meter[k] += float(res.get(k, 0.0))
+                    for k in sum_meter:
+                        sum_meter[k] += float(res.get(k, 0.0))
+                    cnt_batches += 1
                     if is_logger:
                         val_iter.set_postfix(
                             val_loss=f"{float(res.get('loss', 0.0)):.6f}",
                             mae=f"{float(res.get('mae', 0.0)):.4f}",
                             psnr=f"{float(res.get('psnr', 0.0)):.2f}"
                         )
-                vsteps = max(1, vstep + 1)
-                val_loss = v_meter["loss"] / vsteps
-                val_mae  = v_meter["mae"]  / vsteps
-                val_mse  = v_meter["mse"]  / vsteps
-                val_psnr = v_meter["psnr"] / vsteps
-                val_rmse = v_meter["rmse"] / vsteps
-                val_ssim = v_meter["ssim"] / vsteps
 
-            # 记录/保存
+                # 本 rank 的求和与计数
+                local_sums = torch.tensor(
+                    [sum_meter["loss"], sum_meter["mae"], sum_meter["mse"], sum_meter["psnr"], sum_meter["rmse"], sum_meter["ssim"]],
+                    dtype=torch.float64, device=engine.device
+                )
+                local_cnt = torch.tensor([cnt_batches], dtype=torch.float64, device=engine.device)
+
+                # 跨 rank 规约：SUM
+                if deepspeed.comm.get_world_size() > 1:
+                    deepspeed.comm.all_reduce(local_sums, op=deepspeed.comm.ReduceOp.SUM)
+                    deepspeed.comm.all_reduce(local_cnt,  op=deepspeed.comm.ReduceOp.SUM)
+
+                # 全局一致的均值
+                denom = max(1.0, float(local_cnt.item()))
+                val_loss = float(local_sums[0].item() / denom)
+                val_mae  = float(local_sums[1].item() / denom)
+                val_mse  = float(local_sums[2].item() / denom)
+                val_psnr = float(local_sums[3].item() / denom)
+                val_rmse = float(local_sums[4].item() / denom)
+                val_ssim = float(local_sums[5].item() / denom)
+
+            # ---------- 记录到日志（仅 logger 打印/落盘）----------
             if is_logger:
                 if train_encoder_flag:
                     row = f"{epoch+1:>8d} | {train_loss:>14.6f} | {val_loss:>12.6f} | {val_mae:>8.6f} | {val_mse:>8.6f} | {val_psnr:>8.4f} | {val_rmse:>8.6f} | {val_ssim:>8.6f} | {'-':>6} |\n"
@@ -716,17 +728,27 @@ def run_training_deepspeed(args):
                 with open(log_file, "a", encoding="utf-8") as f:
                     f.write(row)
 
-            # ====== 改动点：保存 checkpoint 必须所有 rank 都执行 ======
-            improved = val_loss < best_val_loss - 1e-12
+            # ---------- 全局同步 best，并在同一把尺子上判定 improved ----------
+            if deepspeed.comm.get_world_size() > 1:
+                best_t = torch.tensor([best_val_loss], dtype=torch.float64, device=engine.device)
+                deepspeed.comm.all_reduce(best_t, op=deepspeed.comm.ReduceOp.MIN)
+                best_val_loss_global = float(best_t.item())
+            else:
+                best_val_loss_global = best_val_loss
+
+            improved = (val_loss < (best_val_loss_global - 1e-12))
+
+            # ====== 保存 checkpoint：所有 rank 必须一致进入 ======
             if improved:
+                # 先把 best 更新为全局一致的新值
                 best_val_loss = val_loss
                 save_tag = f"best_e{epoch+1}"
 
-                # 所有 rank 都保存（避免死锁）；建议仅保存 ZeRO 分片，空间更省
-                engine.save_checkpoint(
-                    results_dir.as_posix(),
-                    tag=save_tag,
-                )
+                # 兼容不同 DS 版本：老版本没有 save_zero_checkpoint_only
+                try:
+                    engine.save_checkpoint(results_dir.as_posix(), tag=save_tag, save_zero_checkpoint_only=True)
+                except TypeError:
+                    engine.save_checkpoint(results_dir.as_posix(), tag=save_tag)
 
                 # 保存后 barrier，避免竞态
                 if deepspeed.comm.get_world_size() > 1:
@@ -743,7 +765,7 @@ def run_training_deepspeed(args):
                 best_epoch_index = epoch + 1
             # ====== 改动点结束 ======
 
-            # >>> NEW: 每个 epoch 的可视化（仅 logger；指标提升或到达周期）
+            # 可视化（仅 logger；指标提升或到达周期）
             if is_logger and (improved or ((epoch + 1) % int(getattr(config, "vis_every", 5)) == 0)):
                 try:
                     vis_batch = next(iter(val_loader))
@@ -756,9 +778,8 @@ def run_training_deepspeed(args):
                         else:
                             vis_pred, vis_y, vis_logits = vis_out[0], vis_out[1], None
 
-                    # 反归一化（若需要），否则直接用当前张量
+                    # 反归一化
                     vis_in = vis_batch['input']
-                    vis_pred_v, vis_y_v, vis_in_v = vis_pred, vis_y, vis_in
                     vis_in_v = input_inverse_transform(vis_in)
                     vis_pred_v = output_inverse_transform(vis_pred)
                     vis_y_v = output_inverse_transform(vis_y)

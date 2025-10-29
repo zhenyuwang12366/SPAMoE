@@ -408,7 +408,6 @@ ARGS=(
   --mode "$MODE"
   --model_name "$MODEL_NAME"
   --data_dir "$DATA_DIR"
-  --zarr_path "$ZARR_PATH"
   --status_json "$STATUS_JSON"
   --family "$FAMILY"
   --batch_size "$BATCH_SIZE"
@@ -465,6 +464,7 @@ ARGS=(
   --lambda_ce "$LAMBDA_CE"
 )
 
+[[ -n "$ZARR_PATH" ]] && ARGS+=( --zarr_path "$ZARR_PATH" )
 [[ -n "$TEST_BATCH_SIZE" ]] && ARGS+=( --test_batch_size "$TEST_BATCH_SIZE" )
 [[ -n "$N_TRAIN_SAMPLES" ]] && ARGS+=( --n_train_samples "$N_TRAIN_SAMPLES" )
 [[ -n "$N_TEST_SAMPLES" ]] && ARGS+=( --n_test_samples "$N_TEST_SAMPLES" )
