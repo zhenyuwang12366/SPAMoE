@@ -3,7 +3,7 @@
   "gradient_accumulation_steps": 1,
   "gradient_clipping": 1.0,
 
-  "bf16": { "enabled": true },
+  "bf16": { "enabled": false },
   "fp16": { "enabled": false },
 
   "zero_optimization": {

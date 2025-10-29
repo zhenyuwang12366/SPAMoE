@@ -27,6 +27,12 @@ from torchvision.transforms import Compose
 import deepspeed
 from deepspeed import zero
 
+# >>> NEW: 进度条与绘图工具导入
+from tqdm.auto import tqdm
+from utils.plot_fig import (
+    analyze_fourier_domain, visualize_results, save_type_predictions_txt
+)
+
 # ===== 你的工程内模块（保持原结构）=====
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from neuralop.data.datasets.seismic_dataset import SeismicDataProcessor
@@ -203,7 +209,14 @@ def run_training_deepspeed(args):
         output_transform = Compose([
             T.MinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
         ])
-
+        # >>> NEW: 反归一化（根据你参考代码保留，未改其他逻辑）
+        input_inverse_transform = Compose([
+            T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k)),
+            T.InverseLogTransform(k=args.k)
+        ])
+        output_inverse_transform = Compose([
+            T.InverseMinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
+        ])
         data_processor = SeismicDataProcessor(
             input_transform=input_transform, output_transform=output_transform,
             channel_dim=config.channel_dim, config=config
@@ -265,6 +278,14 @@ def run_training_deepspeed(args):
         ])
         output_transform = Compose([
             T.MinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
+        ])
+        # >>> NEW: 反归一化（根据你参考代码保留，未改其他逻辑）
+        input_inverse_transform = Compose([
+            T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k)),
+            T.InverseLogTransform(k=args.k)
+        ])
+        output_inverse_transform = Compose([
+            T.InverseMinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
         ])
         data_processor = SeismicDataProcessor(
             input_transform=input_transform, output_transform=output_transform,
@@ -555,7 +576,7 @@ def run_training_deepspeed(args):
 
     metrics = SeismicMetrics()
 
-    # -------- 输出目录 / 日志 --------
+    # -------- 输出目录 / 日志（修复：rank0 创建，所有 rank barrier）--------
     def _slugify(text: str) -> str:
         return "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in str(text))
 
@@ -577,25 +598,24 @@ def run_training_deepspeed(args):
     tb_dir = tb_root / run_group / run_name
     tb_writer: Optional[SummaryWriter] = None
 
-    if is_logger:
+    # 仅 rank0 创建目录
+    if deepspeed.comm.get_rank() == 0:
         results_dir.mkdir(parents=True, exist_ok=True)
         tb_dir.mkdir(parents=True, exist_ok=True)
+
+    # 全员等待目录就绪
+    if deepspeed.comm.get_world_size() > 1:
+        deepspeed.comm.barrier()
+
+    # rank0 写入日志/配置；非 logger 也持有路径字符串
+    if is_logger:
         tb_writer = SummaryWriter(log_dir=str(tb_dir))
         config.experiment_dir = str(results_dir)
         config.tensorboard_dir = str(tb_dir)
         with open(results_dir / "config.json", "w", encoding="utf-8") as f:
             json.dump((config.to_dict() if hasattr(config, "to_dict") else vars(config)), f, indent=2, default=str)
         with open(results_dir / "args.json", "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "config_path": str(getattr(args, "config_path", "")),
-                    "deepspeed_config": str(ds_cfg_path),
-                    "resume_path": str(args.resume_path) if args.resume_path else None,
-                    "encoder_path": str(args.encoder_path) if args.encoder_path else None,
-                    "zarr_path": str(getattr(args, "zarr_path", "")),
-                    "status_json": str(getattr(args, "status_json", "")),
-                }, f, indent=2, default=str
-            )
+            json.dump(vars(args), f, indent=2, default=str)
         header = ("    Epoch    |    Train Loss    |    Val Loss    |    MAE    |    MSE    |    PSNR    |    RMSE    |    SSIM    |    CE    |\n"
                   if train_encoder_flag else
                   "    Epoch    |    Train Loss    |    Val Loss    |    MAE    |    MSE    |    PSNR    |    RMSE    |    SSIM    |\n")
@@ -636,7 +656,9 @@ def run_training_deepspeed(args):
 
             # Train
             run_train = {"loss": 0.0}
-            for step, batch in enumerate(train_loader):
+            # >>> NEW: 训练进度条（仅 logger 进程展示）
+            train_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs}", leave=False, disable=not is_logger)
+            for step, batch in enumerate(train_iter):
                 batch = _to_device(batch, engine.device)
                 out = engine(batch)
                 if train_encoder_flag:
@@ -650,7 +672,10 @@ def run_training_deepspeed(args):
                 loss = loss_dict["loss"] + 0.01 * aux_loss
                 engine.backward(loss)
                 engine.step()      # 调度器由 DeepSpeed 内部推进
-                run_train["loss"] += float(loss.detach().item())
+                step_loss = float(loss.detach().item())
+                run_train["loss"] += step_loss
+                if is_logger:
+                    train_iter.set_postfix(train_loss=f"{step_loss:.6f}")
 
             num_steps = max(1, step + 1)
             train_loss = run_train["loss"] / num_steps
@@ -659,13 +684,21 @@ def run_training_deepspeed(args):
             engine.eval()
             with torch.no_grad():
                 v_meter = {"loss": 0.0, "mae": 0.0, "mse": 0.0, "psnr": 0.0, "rmse": 0.0, "ssim": 0.0}
-                for vstep, vbatch in enumerate(val_loader):
+                # >>> NEW: 验证进度条（仅 logger 进程展示）
+                val_iter = tqdm(val_loader, desc=f"Eval {epoch+1}/{config.epochs}", leave=False, disable=not is_logger)
+                for vstep, vbatch in enumerate(val_iter):
                     vbatch = _to_device(vbatch, engine.device)
                     out = engine(vbatch)
                     pred, y = out[0], out[1]
                     res = metrics(pred, y)
                     for k in v_meter:
                         v_meter[k] += float(res.get(k, 0.0))
+                    if is_logger:
+                        val_iter.set_postfix(
+                            val_loss=f"{float(res.get('loss', 0.0)):.6f}",
+                            mae=f"{float(res.get('mae', 0.0)):.4f}",
+                            psnr=f"{float(res.get('psnr', 0.0)):.2f}"
+                        )
                 vsteps = max(1, vstep + 1)
                 val_loss = v_meter["loss"] / vsteps
                 val_mae  = v_meter["mae"]  / vsteps
@@ -683,16 +716,83 @@ def run_training_deepspeed(args):
                 with open(log_file, "a", encoding="utf-8") as f:
                     f.write(row)
 
+            # ====== 改动点：保存 checkpoint 必须所有 rank 都执行 ======
             improved = val_loss < best_val_loss - 1e-12
             if improved:
                 best_val_loss = val_loss
-                engine.save_checkpoint(results_dir.as_posix(), tag=f"best_e{epoch+1}")
+                save_tag = f"best_e{epoch+1}"
+
+                # 所有 rank 都保存（避免死锁）；建议仅保存 ZeRO 分片，空间更省
+                engine.save_checkpoint(
+                    results_dir.as_posix(),
+                    tag=save_tag,
+                )
+
+                # 保存后 barrier，避免竞态
+                if deepspeed.comm.get_world_size() > 1:
+                    deepspeed.comm.barrier()
+
+                if is_logger:
+                    print(f"[DeepSpeed] saved checkpoint: {save_tag}")
+
                 best_epoch_metrics = {
                     "train_loss": float(train_loss), "val_loss": float(val_loss),
                     "mae": float(val_mae), "mse": float(val_mse),
                     "psnr": float(val_psnr), "rmse": float(val_rmse), "ssim": float(val_ssim),
                 }
                 best_epoch_index = epoch + 1
+            # ====== 改动点结束 ======
+
+            # >>> NEW: 每个 epoch 的可视化（仅 logger；指标提升或到达周期）
+            if is_logger and (improved or ((epoch + 1) % int(getattr(config, "vis_every", 5)) == 0)):
+                try:
+                    vis_batch = next(iter(val_loader))
+                    vis_batch = _to_device(vis_batch, engine.device)
+                    engine.eval()
+                    with torch.no_grad():
+                        vis_out = engine(vis_batch)
+                        if train_encoder_flag:
+                            vis_pred, vis_y, vis_logits = vis_out[0], vis_out[1], vis_out[2]
+                        else:
+                            vis_pred, vis_y, vis_logits = vis_out[0], vis_out[1], None
+
+                    # 反归一化（若需要），否则直接用当前张量
+                    vis_in = vis_batch['input']
+                    vis_pred_v, vis_y_v, vis_in_v = vis_pred, vis_y, vis_in
+                    vis_in_v = input_inverse_transform(vis_in)
+                    vis_pred_v = output_inverse_transform(vis_pred)
+                    vis_y_v = output_inverse_transform(vis_y)
+
+                    num_samples = min(4, vis_pred.shape[0])
+                    vis_dir = results_dir / f"vis_epoch_{epoch+1}"
+                    visualize_results(
+                        vis_in_v, vis_y_v, vis_pred_v,
+                        save_dir=vis_dir, max_samples=num_samples,
+                        tb_writer=tb_writer,
+                        wandb_run=(wandb if wandb is not None else None),
+                        global_step=epoch
+                    )
+                    if vis_logits is not None:
+                        save_type_predictions_txt(
+                            logits=vis_logits,
+                            batch=vis_batch,
+                            save_dir=vis_dir,
+                            epoch=epoch,
+                            config=config,
+                            filename="type_predictions.txt",
+                            append=True,
+                            is_logger=is_logger,
+                        )
+                    analyze_fourier_domain(
+                        vis_in_v, vis_y_v, vis_pred_v,
+                        save_dir=results_dir / f"fourier_analysis_epoch_{epoch+1}",
+                        max_samples=num_samples,
+                        tb_writer=tb_writer,
+                        wandb_run=(wandb if wandb is not None else None),
+                        global_step=epoch,
+                    )
+                except Exception as _viz_err:
+                    print(f"[Viz] Skipped visualization due to error: {_viz_err}")
 
             if early_stopper is not None and early_stopper.step(val_loss, epoch):
                 if is_logger:

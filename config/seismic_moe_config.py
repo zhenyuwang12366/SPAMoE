@@ -154,7 +154,7 @@ class SeismicMOEConfig(Default):
     lr_warmup_factor = 1.0 / 3
     lr_warmup_method = 'linear'
 
-    lr_scheduler_type = 'cos'  # cos_restart, cos, multistep
+    lr_scheduler_type = 'cos_restart'  # cos_restart, cos, multistep
     lr_cosine_eta_min = 1e-6
     lr_cosine_tmax_epochs = 50
     lr_cosine_restart_t0_epochs = 10
