@@ -47,11 +47,7 @@ nohup bash scripts/run_distributed_seismic_moe.sh \
   --WNO_n_levels_height 1 \
   --WNO_n_levels_width 1 \
   --WNO_n_layers 3 \
-  --WNO_block_n_layers 2 \
   --WNO_dropout_rate 0.10 \
   --wavelet_type db4 \
-  --WNO_pad_mode reflect \
-  --WNO_ensure_even_shapes  \
-  --WNO_adaptive_padding  \
   > "$LOGFILE" 2>&1 &
 echo "ddp训练已启动，日志记录在：$LOGFILE"
