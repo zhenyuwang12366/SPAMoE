@@ -65,7 +65,6 @@ class SeismicMOEConfig(Default):
     
     # MOE配置
     use_moe = False
-    moe_mode = 'standard'  # 'standard' | 'velocity_type'
     use_experts_path = None
     top_k = 1  # 选择前k个专家
     noisy_gating = True  # 是否使用噪声门控
