@@ -31,7 +31,6 @@ nohup bash scripts/run_distributed_seismic_moe.sh \
   --output_dir ../results \
   --use_moe \
   --use_experts_path /root/auto-tmp/model_path_type_sum \
-  --choose_experts 0 1 2 3\
   --top_k 10 \
   --moe_mode velocity_type \
   --router_type basic \

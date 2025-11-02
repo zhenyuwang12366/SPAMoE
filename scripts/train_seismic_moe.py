@@ -375,7 +375,8 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             model_path=config.use_experts_path,
             is_specific=config.is_specific,
             map_location=device,
-            type_dict=config.type_id
+            type_dict=config.type_id,
+            moe_mode=config.moe_mode,
         )
     else:
         # 创建专家模型

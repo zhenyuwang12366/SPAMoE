@@ -396,7 +396,7 @@ def run_training_deepspeed(args):
             experts_config=config.load_expert_configs,
             in_channels=moe_in_channels, out_channels=config.out_channels, hidden_channels=config.hidden_channels,
             model_path=config.use_experts_path, is_specific=config.is_specific,
-            map_location="cpu", type_dict=config.type_id
+            map_location="cpu", type_dict=config.type_id, moe_mode=config.moe_mode,
         )
     else:
         experts = ExpertFactory.create_expert_ensemble(
