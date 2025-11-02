@@ -384,8 +384,6 @@ class MOEOperator(BaseModel, name='MOE'):
             for attr in ['s_processor', 'w_processor', 'fusion', 's_act', 'w_act', 'sw_act']:
                 setattr(self, attr, None)
 
-        if self.config["use_encoder"]:
-            self.proj = nn.Conv2d(in_channels, 1, 1)
         self.is_logger = is_logger
         self.reset_parameters_()
 
@@ -461,11 +459,47 @@ class MOEOperator(BaseModel, name='MOE'):
         if combined_output.shape[2] != 70 or combined_output.shape[3] != 70:
             combined_output = F.interpolate(combined_output, size=(70, 70), mode='bilinear', align_corners=False)
         
-        if self.config["use_encoder"]:
-            combined_output = self.proj(combined_output)
-        
         return combined_output, aux_loss
 
+    def _most_common_shape(
+        self,
+        all_shapes: List[Tuple[int, ...]],
+        default_shape: Optional[Tuple[int, ...]] = None
+    ) -> Tuple[int, ...]:
+        """
+        从收集到的空间形状中选出 target_shape。
+        若 all_shapes 为空则回退到 default_shape（若提供）或 x 的空间形状。
+        """
+        if not all_shapes:
+            return tuple(default_shape)
+        ndims = [len(s) for s in all_shapes]
+        target_ndim = Counter(ndims).most_common(1)[0][0]
+        shapes_same_ndim = [s for s in all_shapes if len(s) == target_ndim]
+        target = []
+        for d in range(target_ndim):
+            dim_sizes = [s[d] for s in shapes_same_ndim]
+            target.append(Counter(dim_sizes).most_common(1)[0][0])
+        return tuple(target)
+    
+    def _resize_to_shape(
+        self, 
+        out: torch.Tensor, 
+        target_shape: Tuple[int, ...]
+    ) -> torch.Tensor:
+        if out is None or out.dim() < 4 or out.shape[2:] == target_shape:
+            return out
+        try:
+            if len(target_shape) == 3:
+                mode = 'trilinear'
+            elif len(target_shape) == 2:
+                mode = 'bilinear'
+            else:
+                mode = 'linear'
+            return F.interpolate(out, size=target_shape, mode=mode, align_corners=True)
+        except Exception as e:
+            print(f"[ERROR] 插值失败: {e}；用零张量兜底。in={tuple(out.shape)} target={target_shape}")
+            return torch.zeros(out.shape[0], out.shape[1], *target_shape, device=out.device, dtype=out.dtype)
+    
     def _forward_velocity_type(self, x: torch.Tensor, class_weights: Optional[torch.Tensor], **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch_size = x.shape[0]
         device = x.device
@@ -548,12 +582,9 @@ class MOEOperator(BaseModel, name='MOE'):
         stacked = torch.stack(aligned, dim=1)  # [B, T, C, H, W]
         weight_tensor = weights.view(batch_size, num_types, 1, 1, 1)
         combined = (stacked * weight_tensor).sum(dim=1)
-
+        
         if combined.shape[2] != 70 or combined.shape[3] != 70:
             combined = F.interpolate(combined, size=(70, 70), mode='bilinear', align_corners=False)
-        
-        if self.config["use_encoder"]:
-            combined = self.proj(combined)
         
         return combined, None
 

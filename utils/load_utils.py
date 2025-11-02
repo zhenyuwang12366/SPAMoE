@@ -24,7 +24,8 @@ _SPECIFIC_BASE_DEFAULT_VARIANT = {
 }
 
 _EXPERT_FILE_PATTERN = re.compile(
-    r'^best_expert_(?P<name>.+)_(?P<i>\d+)_(?P<label>.+)\.pt$'
+    r'^best_expert_(?P<name>[A-Za-z][A-Za-z0-9_]*)_(?P<i>\d+)_(?P<label>[A-Za-z0-9_]+)\.pt$',
+    re.IGNORECASE
 )
 
 
@@ -419,8 +420,7 @@ def load_moe_experts(
             raise ValueError("type_dict['specific'] 为空，无法映射细分类别。")
 
         for f in experts_file:
-            stem = Path(f).stem
-            m = _EXPERT_FILE_PATTERN.match(stem)
+            m = _EXPERT_FILE_PATTERN.match(f)
             if not m:
                 print(f"[WARN] 文件名不匹配细化专家模式, 跳过: {f}")
                 continue
@@ -533,5 +533,25 @@ def load_moe_experts(
             hidden_channels,
             ordered,
         )
+
+    print(f"成功读取专家，专家数: {len(loaded_experts)}")
+
+    # ====== 打印每个专家的详细信息 ======
+    print("\n==== 已加载专家信息 ====")
+    for idx, expert in enumerate(loaded_experts):
+        num_params = sum(p.numel() for p in expert.parameters())
+        trainable_params = sum(p.numel() for p in expert.parameters() if p.requires_grad)
+        expert_class = expert.__class__.__name__
+        expert_shape_info = ""
+        try:
+            # 尝试提取模型的核心层结构
+            first_layer = next(expert.modules())
+            expert_shape_info = f"({type(first_layer).__name__})"
+        except Exception:
+            pass
+        print(f"[{idx:02d}] {expert_class:<25} "
+              f"参数总数: {num_params:<10} 可训练: {trainable_params:<10} {expert_shape_info}")
+
+    print("==== 专家加载完毕 ====\n")
 
     return loaded_experts

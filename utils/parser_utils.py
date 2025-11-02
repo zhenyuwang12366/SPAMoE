@@ -144,6 +144,7 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='每个尺度的缩放因子')
     parser.add_argument('--MNO_n_layers', type=int, default=3,
                         help='每个尺度使用的神经网络层数')
+    
     parser.add_argument('--LNO_n_modes', nargs=2, type=int, default=[16, 16],
                         help='局部变换后保留的模态数量')
     parser.add_argument('--LNO_n_layers', type=int, default=3,

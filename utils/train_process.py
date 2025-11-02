@@ -131,9 +131,11 @@ def train_one_epoch(
     best_model_path: Optional[str] = None,
     best_expert_path: Optional[str] = None,
     best_encoder_path: Optional[str] = None,
+    best_router_path: Optional[str] = None,
     last_model_path: Optional[str] = None,
     last_expert_path: Optional[str] = None,
     last_encoder_path: Optional[str] = None,
+    last_router_path: Optional[str] = None,
     experts_name: Optional[list] = None,
     data_dict: Optional[dict] = None,
     # 其他工具
@@ -435,6 +437,7 @@ def train_one_epoch(
         best_val_loss = val_loss
         model_to_save = model.module if (getattr(config, "distributed", None) and getattr(config.distributed, "use_distributed", False) and hasattr(model, "module")) else model
         encoder_to_save = encoder.module if (encoder is not None and hasattr(encoder, "module")) else encoder
+        router_to_save = model.module.router if (getattr(config, "distributed", None) and getattr(config.distributed, "use_distributed", False) and hasattr(model, "module")) else model.router
         # classifier_to_save = classifier.module if (classifier is not None and hasattr(classifier, "module")) else classifier
 
         checkpoint = {
@@ -449,12 +452,14 @@ def train_one_epoch(
             checkpoint['encoder_state_dict'] = encoder_to_save.state_dict()
         # if classifier_to_save is not None:
         #     checkpoint['classifier_state_dict'] = classifier_to_save.state_dict()
-        if train_encoder:
+        if train_encoder or (len(experts_name) == 1 and experts_name[0] == "all"):
             torch.save(encoder_to_save.state_dict(), best_encoder_path)
+            if router_to_save is not None:
+                torch.save(router_to_save.state_dict(), best_router_path)
         else:
             torch.save(checkpoint, best_model_path)
             
-            if experts_name is not None and len(experts_name) == 1 and best_expert_path is not None:
+            if experts_name is not None and len(experts_name) == 1 and experts_name[0] != "all" and best_expert_path is not None:
                 # 仅示例：若你的模型结构中存在 experts[0]
                 if hasattr(model_to_save, "experts") and len(model_to_save.experts) > 0:
                     torch.save({
@@ -464,6 +469,7 @@ def train_one_epoch(
     if is_logger and last_model_path is not None:
         model_to_save = model.module if (getattr(config, "distributed", None) and getattr(config.distributed, "use_distributed", False) and hasattr(model, "module")) else model
         encoder_to_save = encoder.module if (encoder is not None and hasattr(encoder, "module")) else encoder
+        router_to_save = model.module.router if (getattr(config, "distributed", None) and getattr(config.distributed, "use_distributed", False) and hasattr(model, "module")) else model.router
         # classifier_to_save = classifier.module if (classifier is not None and hasattr(classifier, "module")) else classifier
 
         checkpoint = {
@@ -478,12 +484,14 @@ def train_one_epoch(
             checkpoint['encoder_state_dict'] = encoder_to_save.state_dict()
         # if classifier_to_save is not None:
         #     checkpoint['classifier_state_dict'] = classifier_to_save.state_dict()
-        if train_encoder:
-            torch.save(encoder_to_save.state_dict(), last_encoder_path)
+        if train_encoder or (len(experts_name) == 1 and experts_name[0] == "all"):
+            torch.save(encoder_to_save.state_dict(), best_encoder_path)
+            if router_to_save is not None:
+                torch.save(router_to_save.state_dict(), best_router_path)
         else:
             torch.save(checkpoint, last_model_path)
 
-            if experts_name is not None and len(experts_name) == 1 and last_expert_path is not None:
+            if experts_name is not None and len(experts_name) == 1 and experts_name[0] != "all" and last_expert_path is not None:
                 if hasattr(model_to_save, "experts") and len(model_to_save.experts) > 0:
                     torch.save({
                         'expert_state_dict': model_to_save.experts[0].state_dict()

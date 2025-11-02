@@ -279,7 +279,7 @@ def main():
     if N_total == 0:
         raise RuntimeError("没有可写入的样本。")
 
-    # === 关键改动：创建新形状的数据集 ===
+    # === 数据集定义 ===
     inputs_ds = root.create_dataset(
         'inputs', shape=(N_total, 1, 1000, 350), chunks=(args.chunks, 1, 1000, 350),
         dtype=target_dtype, compressor=compressor
@@ -289,6 +289,8 @@ def main():
         dtype=target_dtype, compressor=compressor
     )
     labels_ds = root.create_dataset('labels', shape=(N_total,), chunks=(max(1,args.chunks),), dtype='int64', compressor=compressor)
+
+    # 字符串字段：使用可变长 UTF-8（保持与你原始实现一致）
     type_name_ds = root.create_dataset('type_name', shape=(N_total,), dtype=object, object_codec=zarr.codecs.VLenUTF8())
     input_file_ds = root.create_dataset('input_file', shape=(N_total,), dtype=object, object_codec=zarr.codecs.VLenUTF8())
 
@@ -335,8 +337,12 @@ def main():
         inputs_ds[sl] = x_cat
         outputs_ds[sl] = y_cat
         labels_ds[sl] = lab_val
-        type_name_ds[sl] = [type_key] * M
-        input_file_ds[sl] = [tag] * M
+
+        # ===== 关键修复：标量广播，避免 list 长度与 chunk 选区不匹配 =====
+        type_name_ds[sl] = type_key      # 原来是 [type_key] * M
+        input_file_ds[sl] = tag          # 原来是 [tag] * M
+        # =================================================================
+
         write_ptr += M
 
     sup_end = write_ptr
@@ -361,8 +367,12 @@ def main():
             sl = slice(write_ptr, write_ptr + M)
             inputs_ds[sl] = x_cat
             labels_ds[sl] = -1
-            type_name_ds[sl] = ["test"] * M
-            input_file_ds[sl] = [f"test/{os.path.basename(in_path)}"] * M
+
+            # ===== 关键修复：标量广播 =====
+            type_name_ds[sl] = "test"                                  # 原来是 ["test"] * M
+            input_file_ds[sl] = f"test/{os.path.basename(in_path)}"    # 原来是 [f"..."] * M
+            # =================================
+
             write_ptr += M
 
     assert write_ptr == N_total

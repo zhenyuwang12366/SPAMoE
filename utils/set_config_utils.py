@@ -202,7 +202,8 @@ def get_seismic_config(args: argparse.Namespace):
          #读取那些 .pt 文件（即每个专家的模型参数）；
          #按照文件名中的编号提取出专家编号；
          #做一致性校验（文件数量、编号是否跟配置匹配）；
-    if len(config.expert_configs) > 1 and config.top_k > 1 and args.use_moe and args.use_experts_path:
+    experts_name = []
+    if config.top_k > 1 and args.use_moe and args.use_experts_path:
         # 模型文件夹中的专家 best_expert_{experts_name}_{i}_{curve/flat/style}_{vel/fault/style}.pt
         save_experts = [
             int(f.split('_')[3]) for f in os.listdir(args.use_experts_path)
@@ -211,27 +212,23 @@ def get_seismic_config(args: argparse.Namespace):
         save_experts = list(set(save_experts))
         #注意，这里输出的save_experts是一个代表专家组模型序号的整数列表。详见OneNote2
 
-        # 检测正确性
-        if len(config.expert_configs) != len(save_experts):
-            raise ValueError(f"模型文件夹中专家组个数: {args.use_experts_path} 与选择专家组个数不匹配: {len(config.expert_configs)}")
-
-        chosen_experts = list(args.choose_experts or [])
-        missing = set(chosen_experts) - set(save_experts)
-        if missing:
-            raise ValueError(f"选择的专家组: {sorted(missing)} 无法与模型存储文件夹中的专家匹配")
+        print(f"选择了 {len(save_experts)} 个专家, 分别为 {save_experts}")
 
         config.use_moe = True
         config.use_experts_path = args.use_experts_path
 
+        experts_name.append("all")
+        experts_name_str = "all"
     # 这两行代码解释见OneNote3，不过我想知道为什么这两段代码在我们单个模型训练过程中没有起作用
     # 修复：使用enumerate来获取正确的索引，因为config.expert_configs已经被重新排序
-    experts_name = []
-    for idx, expert_config in enumerate(config.expert_configs):
-        if 'domain_type' in expert_config:
-            experts_name.append(f"{expert_config['domain_type']}_{args.choose_experts[idx]}")
-        else:
-            experts_name.append(f"{expert_config['type']}_{args.choose_experts[idx]}")
-    experts_name_str = '_'.join(experts_name)
+    else:
+        for idx, expert_config in enumerate(config.expert_configs):
+            if 'domain_type' in expert_config:
+                experts_name.append(f"{expert_config['domain_type']}_{args.choose_experts[idx]}")
+            else:
+                experts_name.append(f"{expert_config['type']}_{args.choose_experts[idx]}")
+        experts_name_str = '_'.join(experts_name)
+    
     config.output_dir = os.path.join(config.output_dir, experts_name_str)   
     
     # 设置损失函数加权系数

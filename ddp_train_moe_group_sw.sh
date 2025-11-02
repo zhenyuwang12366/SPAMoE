@@ -23,14 +23,14 @@ nohup bash scripts/run_distributed_seismic_moe.sh \
   --model_name moe_type \
   --num_gpus 2 \
   --num_workers 10 \
-  --zarr_path /root/auto-tmp/all.zarr \
+  --zarr_path /root/autodl-tmp/all.zarr \
   --status_json ./dataset_status/dataset_status.json \
   --family all \
   --batch_size 32 \
   --epochs 100 \
   --output_dir ../results \
   --use_moe \
-  --use_experts_path /root/auto-tmp/model_path_type_sum \
+  --use_experts_path /root/autodl-tmp/model_path_type_sum \
   --top_k 10 \
   --moe_mode group \
   --router_type swa \
