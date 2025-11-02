@@ -692,22 +692,31 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     start_epoch = 0
     if hasattr(args, "resume_path") and args.resume_path is not None and os.path.exists(args.resume_path):
         checkpoint = torch.load(args.resume_path, map_location=device, weights_only=False)
-        router_check = torch.load(args.router_resume_path, map_location=device, weights_only=False)
+        if args.router_resume_path is not None:
+            router_check = torch.load(args.router_resume_path, map_location=device, weights_only=False)
+        else:
+            router_check = None
         # 加载模型参数（注意：EMO.state_dict -> 仅 MoE）
         if config.distributed.use_distributed:
             if experts_name_str == "all":
-                model.module.load_state_dict(router_check)
+                if router_check is not None:
+                    model.module.moe.router.load_state_dict(router_check)
+                else:
+                    pass
             else:
-                model.module.load_state_dict(checkpoint['model_state_dict'])
+                model.module.moe.load_state_dict(checkpoint['model_state_dict'])
         else:
             if experts_name_str == "all":
-                model.load_state_dict(router_check)
+                if router_check is not None:
+                    model.moe.router.load_state_dict(router_check)
+                else:
+                    pass
             else:
-                model.load_state_dict(checkpoint['model_state_dict'])
+                model.moe.load_state_dict(checkpoint['model_state_dict'])
 
         encoder_state = checkpoint.get('encoder_state_dict')
         if emo_model.encoder is not None and encoder_state is not None and not getattr(args, "encoder_path", None):
-            encoder_target = model.module.encoder if (config.distributed.use_distributed and hasattr(model, "module")) else emo_model.encoder
+            encoder_target = model.module.encoder if (config.distributed.use_distributed and hasattr(model, "module")) else model.encoder
             missing, unexpected = load_encoder_weights(encoder_target, encoder_state, strict=False)
             if is_logger and (missing or unexpected):
                 print(f"[Encoder] Resume 加载缺失参数: {missing}, 多余参数: {unexpected}")

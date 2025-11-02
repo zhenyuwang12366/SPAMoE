@@ -199,6 +199,8 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='学习率（默认值由配置文件决定，可通过此参数覆盖）')
     parser.add_argument('--resume_path', type=str, default=None,
                         help='恢复训练的checkpoint路径，如 best_model_xxx.pt')
+    parser.add_argument('--router_resume_path', type=str, default=None,
+                        help="router path")
     parser.add_argument('--encoder_path', type=str, default=None,
                         help='单独加载encoder的checkpoint路径，并在训练时冻结其参数')
     
