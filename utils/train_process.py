@@ -39,7 +39,6 @@ def _evaluate_one_epoch(
         targets = batch['output'].to(device, non_blocking=True)
         if train_encoder:
             labels = batch['v_type'].to(device, non_blocking=True)
-        targets = targets.to(dtype=torch.float32)
 
         if encoder is not None:
             if amp_enabled:
@@ -47,13 +46,16 @@ def _evaluate_one_epoch(
                     encoded, weights, _ = encoder(inputs)
             else:
                 encoded, weights, _ = encoder(inputs)
-            encoded = encoded.to(dtype=torch.float32).detach()
-            weights = weights.to(dtype=torch.float32).detach() if weights is not None else None
         else:
-            encoded = inputs.to(dtype=torch.float32)
+            encoded = inputs
             weights = None
-        with torch.amp.autocast(device_type=device.type, enabled=False):
+            
+        if amp_enabled:
+            with torch.amp.autocast(device_type=device.type, enabled=True, dtype=torch.bfloat16):
+                preds, aux_loss = model(encoded, weights)
+        else:
             preds, aux_loss = model(encoded, weights)
+        
         if aux_loss is None:
             aux_loss = preds.new_zeros(())
 
@@ -139,7 +141,6 @@ def train_one_epoch(
     tqdm_module=None,   # 传入 tqdm（避免在函数内硬依赖）
     profile_timing: bool = False,            # 是否记录耗时
     amp_enabled: bool = False,
-    amp_scaler: Optional[torch.amp.GradScaler] = None,
     encoder_frozen: bool = False,
     # 是否训练encoder
     train_encoder: bool = False,
@@ -176,7 +177,7 @@ def train_one_epoch(
     micro_count = 0
     num_steps = len(train_loader)
     nan_detected = False
-    use_amp = bool(amp_enabled) and (amp_scaler is not None)
+    use_amp = bool(amp_enabled)
 
     # router type判断
     router_type = model.module.router_type if hasattr(model, "module") else model.router_type
@@ -220,19 +221,7 @@ def train_one_epoch(
             encoded = inputs
             weights = None
         
-        encoded = encoded.to(dtype=torch.float32)
-        weights = weights.to(dtype=torch.float32) if weights is not None else None
-        targets = targets.to(dtype=torch.float32)
-        
         del inputs
-        
-        # mem()
-        
-        if encoder_frozen:
-            encoded = encoded.detach()
-        
-        if encoder_frozen and weights is not None:
-            weights = weights.detach()
         
         if tb_active and type_weight_hist_sample is None and weights is not None:
             flat_weights = weights.detach().float().cpu().reshape(-1)
@@ -252,7 +241,10 @@ def train_one_epoch(
 
         step_has_nan = False
         with sync_ctx:
-            with torch.amp.autocast(device_type=device.type, enabled=False):
+            if use_amp:
+                    with torch.amp.autocast(device_type=device.type, enabled=True, dtype=torch.bfloat16):
+                        preds, aux_loss = model(encoded, weights)
+            else:
                 preds, aux_loss = model(encoded, weights)
             if aux_loss is None:
                 aux_loss = preds.new_zeros(())
@@ -271,10 +263,7 @@ def train_one_epoch(
                 # —— 用于反传的缩放 —— #
                 current_group_size = accum_steps if not last_micro else ( (step % accum_steps) + 1 )
                 loss = loss_raw / current_group_size
-                if use_amp:
-                    amp_scaler.scale(loss).backward()
-                else:
-                    loss.backward()
+                loss.backward()
 
                 # —— 统计（用未缩放的口径，便于和 val 对齐） —— #
                 running_train_loss += loss_raw.item()
@@ -289,11 +278,7 @@ def train_one_epoch(
             break
 
         if last_micro:
-            if use_amp:
-                amp_scaler.step(optimizer)
-                amp_scaler.update()
-            else:
-                optimizer.step()
+            optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             micro_in_group = 0  # 结算完当前组，清零
 
@@ -522,15 +507,16 @@ def train_one_epoch(
                         vis_encoded, vis_weights, _ = encoder(inputs)
                 else:
                     vis_encoded, vis_weights, _ = encoder(inputs)
-                vis_encoded = vis_encoded.to(dtype=torch.float32).detach()
-                vis_weights = vis_weights.to(dtype=torch.float32).detach() if vis_weights is not None else None
             else:
-                vis_encoded = inputs.to(dtype=torch.float32)
+                vis_encoded = inputs
                 vis_weights = None
                 
-            with torch.amp.autocast(device_type=device.type, enabled=False):
+            if use_amp:
+                    with torch.amp.autocast(device_type=device.type, enabled=True, dtype=torch.bfloat16):
+                        preds, _ = model(vis_encoded, vis_weights)
+            else:
                 preds, _ = model(vis_encoded, vis_weights)
-
+            
         if input_inverse_transform is not None:
             inputs_v = input_inverse_transform(inputs)
         else:

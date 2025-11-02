@@ -27,8 +27,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import scripts.transforms as T
 from neuralop.models import MOEOperator, ExpertFactory
 from neuralop.models.encoder import get_encoder
+from neuralop.layers.spectral_convolution import SpectralConv
 from neuralop.data.datasets import SeismicDataset, ZarrSeismicDataset
-from neuralop.data.sampler.chunk_sampler import ChunkDistributedSampler
 from neuralop.data.dataloader.zarr_seismic_dataloader import build_loaders
 from neuralop.utils import count_model_params
 from scripts.scheduler import (
@@ -40,6 +40,8 @@ from neuralop.losses import L1L2Loss, SobelLoss, FourierMag_L1
 from utils import *
 
 print("-----------------------------------------------------------")
+
+patch_spectral_conv_forward(SpectralConv)
 
 def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     """
@@ -404,14 +406,18 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         is_classifier = config.is_classifier,
         batch_size=config.batch_size,
         v_type_num=config.v_type_num,
-        use_expert_memory_proxy=config.use_gpu_proxy
+        use_expert_memory_proxy=config.use_gpu_proxy,
+        use_encoder = config.use_encoder,
     )
     
     # 移动模型到设备
     if config.distributed.use_distributed:
+        
         if encoder_model is not None:
             encoder_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(encoder_model).to(device)
+        
         moe_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(moe_model).to(device)
+        
         if encoder_model is not None:
             encoder_model = DDP(
                 encoder_model, device_ids=[device.index],
@@ -424,7 +430,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             output_device=device.index,
             static_graph=False,
             find_unused_parameters=True,
-            gradient_as_bucket_view=False,
+            gradient_as_bucket_view=True,
         )
     else:
         if encoder_model is not None:
@@ -699,14 +705,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     amp_enabled = bool(use_amp) and device.type == 'cuda'
     moe_module = moe_model if not hasattr(moe_model, "module") else moe_model.module
     moe_has_complex = any(p.is_complex() for p in moe_module.parameters())
-    scaler_enabled = amp_enabled and not moe_has_complex
-    if amp_enabled and not scaler_enabled and is_logger:
-        print("[AMP] 检测到 MoE 含有复数参数，禁用 GradScaler，仅对 encoder 使用 autocast。")
-    scaler = torch.amp.GradScaler(device=device, enabled=scaler_enabled)
     optimizer.zero_grad(set_to_none=True)
-    REPORT_EVERY = max(1, getattr(args, "report_every", 5))
-    best_epoch_metrics = None
-    best_epoch_index = None
 
 #以上全是准备工作，下面是核心循环
     try:
@@ -749,7 +748,6 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                 tqdm_module=tqdm,
                 profile_timing=args.profile_timing,
                 amp_enabled=amp_enabled,
-                amp_scaler=scaler,
                 encoder_frozen=not encoder_requires_grad,
                 train_encoder=config.train_encoder,
                 tb_writer=tb_writer,
@@ -764,14 +762,6 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                 best_epoch_metrics = dict(stats)
                 best_epoch_metrics["epoch"] = epoch + 1
                 best_epoch_index = epoch + 1
-
-            # ====== 中间上报（仅 rank0 打印，供外层 Optuna 解析）======
-            # 注意：这里假设 stats["val_loss"] 已经做过 all_reduce 得到“全卡平均值”
-            if is_logger:
-                cur_val = float(stats.get("val_loss", float("nan")))
-                # 满足：到达REPORT_EVERY、或最后一个epoch、或提前stop时，打印一次
-                if ((epoch + 1) % REPORT_EVERY == 0) or ((epoch + 1) == config.epochs) or (stop_flag == 1):
-                    print(f"REPORT:{cur_val}:{epoch+1}", flush=True)
 
             # 可选：若内部早停信号触发，则跳出
             if stop_flag == 1:
@@ -1167,6 +1157,7 @@ def run_inference(n_args):
                 inputs_cpu = inputs.detach().cpu()
                 targets_cpu = targets.detach().cpu()
                 preds_cpu = preds.detach().cpu()
+                encoded_cpu = encoded.detach().cpu()
                 if input_inverse_transform is not None:
                     inputs_cpu = input_inverse_transform(inputs_cpu)
                 if output_inverse_transform is not None:
@@ -1177,6 +1168,7 @@ def run_inference(n_args):
                     "inputs": inputs_cpu,
                     "targets": targets_cpu,
                     "preds": preds_cpu,
+                    "encoded": encoded_cpu,
                     "logits": logits_cpu,
                     "batch": batch,
                 }
@@ -1230,7 +1222,13 @@ def run_inference(n_args):
             save_dir=img_path,
             max_samples=num_samples,
         )
-
+        visualize_encoded(
+            encoded_cpu,
+            save_dir=img_path,
+            max_samples=num_samples,
+            channels=config.moe_in_channels,
+            selection='l2',
+        )
     if test_sampler is not None and hasattr(test_sampler, "set_epoch"):
         test_sampler.set_epoch(0)
 

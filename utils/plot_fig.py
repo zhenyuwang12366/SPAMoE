@@ -929,3 +929,316 @@ def analyze_fourier_domain_safe(inputs, targets, predictions, save_dir='./result
         except Exception as e:
             print(f"样本 {i} 傅里叶分析失败: {str(e)}")
             continue
+
+def visualize_encoded(encoded,
+                      save_dir='./results/encoded_vis',
+                      max_samples=4,
+                      channels=None,           # 指定通道索引，如 [0,3,7]；None 则自动选择
+                      topk=4,                  # 自动选择的通道数
+                      selection='variance',    # 'variance' | 'l2' | 'random'
+                      norm_mode='percentile',  # 'percentile' | 'minmax'（空间域可视化归一化）
+                      p_low=1.0, p_high=99.0,  # 分位数上下界（percentile 模式）
+                      # 日志（与现有接口统一）
+                      tb_writer=None,
+                      wandb_run=None,
+                      global_step=None,
+                      log_prefix='vis/encoded'):
+    """
+    可视化 Encoder 输出特征并进行空间/频谱统计。
+    输入:
+        encoded: torch.Tensor [B, C, H, W]
+    输出:
+        - 每个样本一张 2xK 图 (K=通道数)：第一行空间特征、第二行功率谱(log)
+        - 每个样本对应 *.npy 与 *.txt 的统计文件
+        - encoded_vis_meta.json 记录通道选择与设置
+    """
+    import os, time, json, random
+    import numpy as np
+    import torch
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+    from scipy.fft import fft2, fftshift
+
+    os.makedirs(save_dir, exist_ok=True)
+    assert encoded.dim() == 4, f"encoded 应为 [B,C,H,W]，但收到 {tuple(encoded.shape)}"
+    B, C, H, W = encoded.shape
+    n_samples = min(B, max_samples)
+
+    # ---- 准备 CPU 数据，避免显存占用与梯度污染 ----
+    feat = encoded.detach().to('cpu')  # [B,C,H,W]
+
+    # ---- 通道选择：在整个 batch 上评分以稳定选择 ----
+    if channels is None:
+        k = min(topk, C)
+        if selection == 'random':
+            perm = torch.randperm(C)
+            channels = perm[:k].tolist()
+        else:
+            flat = feat.reshape(B, C, -1)  # [B,C,HW]
+            if selection == 'variance':
+                # 对 HW 求方差，再对 B 求平均
+                score = flat.var(dim=-1, unbiased=False).mean(dim=0)  # [C]
+            elif selection == 'l2':
+                score = (flat.pow(2).sum(dim=-1)).mean(dim=0)         # [C]
+            else:
+                raise ValueError(f"未知 selection: {selection}")
+            top_idx = torch.topk(score, k=k, largest=True).indices
+            channels = top_idx.tolist()
+    else:
+        channels = sorted(set(int(c) for c in channels if 0 <= int(c) < C))
+        if len(channels) == 0:
+            raise ValueError("channels 为空或越界")
+
+    K = len(channels)
+
+    # ---- 频域掩码（HF/LF）准备：与 H,W 无关但按每个样本/通道二维大小重新生成 ----
+    def make_freq_masks(h, w):
+        cy, cx = h // 2, w // 2
+        yy, xx = np.ogrid[:h, :w]
+        dist = np.sqrt((yy - cy)**2 + (xx - cx)**2)
+        rmin = min(h, w)
+        low_mask  = dist < 0.3 * rmin
+        high_mask = dist > 0.7 * rmin
+        return low_mask, high_mask, (cy, cx)
+
+    # ---- 逐样本可视化与统计 ----
+    for i in range(n_samples):
+        try:
+            # 取该样本的 K 个通道特征：[K,H,W]
+            fmap = feat[i, channels].numpy()
+
+            # 计算统一的图像布局：2 行 K 列
+            fig, axes = plt.subplots(2, K, figsize=(4.8 * K, 8), constrained_layout=True)
+            if K == 1:
+                axes = np.array([[axes[0]], [axes[1]]])  # 统一 2xK 索引
+
+            # === 统计容器 ===
+            ch_stats = []  # 每通道一个 dict
+            # 为了统一颜色范围，可选两种策略：
+            #   1) 按通道各自归一化（对比结构更清晰）
+            #   2) 也可以先遍历求全通道的全局分位数，再统一 vmin/vmax（需要可比性时可改下面策略）
+            # 这里按通道各自归一化（与你现有函数风格一致）
+
+            # 频域掩码（对 H,W 固定，因为本样本内所有通道同尺寸）
+            low_mask, high_mask, (cy, cx) = make_freq_masks(H, W)
+
+            # 用于计算通道间相关（空间 & 频谱）
+            # 空间：直接用 fmap[k] 拉平
+            # 频谱：用 log(PSD+eps) 拉平
+            spatial_mat = np.zeros((K, H * W), dtype=np.float64)
+            spectral_mat = np.zeros((K, H * W), dtype=np.float64)
+
+            # === 遍历通道 ===
+            for j, ch in enumerate(channels):
+                arr = fmap[j]  # [H,W]
+
+                # --- 空间统计 ---
+                mean_ = float(np.mean(arr))
+                std_  = float(np.std(arr))
+                min_  = float(np.min(arr))
+                max_  = float(np.max(arr))
+                l2_   = float(np.sqrt(np.sum(arr**2)) + 1e-12)
+
+                # --- 归一化（用于显示） ---
+                if norm_mode == 'percentile':
+                    lo = np.percentile(arr, p_low)
+                    hi = np.percentile(arr, p_high)
+                    if hi <= lo:
+                        lo, hi = float(min_), float(max_) if max_ > min_ else (min_, min_ + 1e-6)
+                    vis_img = np.clip((arr - lo) / (hi - lo + 1e-12), 0.0, 1.0)
+                    vmin, vmax = 0.0, 1.0
+                    range_note = f"[{norm_mode}] lo={lo:.3e}, hi={hi:.3e}"
+                elif norm_mode == 'minmax':
+                    lo, hi = min_, max_
+                    if hi <= lo:
+                        hi = lo + 1e-6
+                    vis_img = (arr - lo) / (hi - lo)
+                    vmin, vmax = 0.0, 1.0
+                    range_note = f"[{norm_mode}] min={min_:.3e}, max={max_:.3e}"
+                else:
+                    raise ValueError(f"未知 norm_mode: {norm_mode}")
+
+                # --- 频域 ---
+                fft2c = fftshift(fft2(arr))
+                psd   = np.abs(fft2c)**2
+                log_psd = np.log10(psd + 1e-10)
+
+                # 主频（相对中心的半径）
+                max_idx = np.unravel_index(np.argmax(psd), psd.shape)
+                dom_freq = float(np.sqrt((max_idx[0] - cy)**2 + (max_idx[1] - cx)**2))
+
+                # 频谱能量比例（本通道 vs 全部通道的总能量需后面再统一）
+                # 先记录本通道能量，稍后归一化
+                total_energy_ch = float(np.sum(psd))
+                low_e  = float(np.sum(psd[low_mask]))
+                high_e = float(np.sum(psd[high_mask]))
+                hf_ratio = float(high_e / (low_e + 1e-12))
+
+                # --- 可视化：第一行空间，第二行频谱 ---
+                im_spatial = axes[0, j].imshow(vis_img, cmap='viridis', aspect='auto', vmin=vmin, vmax=vmax)
+                axes[0, j].set_title(f'Encoder Feature | sample {i} | ch {ch}\n'
+                                     f'{range_note}\nμ={mean_:.3e}, σ={std_:.3e}, L2={l2_:.2e}')
+                axes[0, j].set_xticks([]); axes[0, j].set_yticks([])
+                plt.colorbar(im_spatial, ax=axes[0, j], fraction=0.046, pad=0.04).set_label('Normalized activation')
+
+                # 为增强对比，将频谱的 vmin/vmax 按该样本所选通道共同范围统一；先暂画，稍后再统一范围（需二次设定）
+                im_freq = axes[1, j].imshow(log_psd, cmap='viridis', aspect='auto')
+                axes[1, j].set_title(f'Power Spectrum (log10)\nDomFreq={dom_freq:.1f}, HF/LF={hf_ratio:.3f}')
+                axes[1, j].set_xticks([]); axes[1, j].set_yticks([])
+                plt.colorbar(im_freq, ax=axes[1, j], fraction=0.046, pad=0.04).set_label('log10(PSD)')
+
+                # 收集统计
+                ch_stats.append({
+                    'channel': int(ch),
+                    'spatial': {
+                        'mean': mean_, 'std': std_, 'min': min_, 'max': max_, 'l2': l2_
+                    },
+                    'spectral': {
+                        'psd_sum': total_energy_ch,
+                        'psd_mean': float(np.mean(psd)),
+                        'psd_max': float(np.max(psd)),
+                        'dominant_freq': dom_freq,
+                        'low_energy': low_e,
+                        'high_energy': high_e,
+                        'hf_ratio': hf_ratio
+                    }
+                })
+
+                # 准备相关矩阵数据
+                spatial_mat[j, :]  = arr.reshape(-1)
+                spectral_mat[j, :] = log_psd.reshape(-1)
+
+            # --- 统一频谱颜色范围（提升通道间可比性） ---
+            # 取本样本 K 个通道的 log_psd 联合分位数范围
+            # 为简单复用：重新计算一次 log_psd 的全局范围
+            #（也可在上面循环时缓存每个通道的 log_psd）
+            all_log_psd = []
+            for j in range(K):
+                arr = fmap[j]
+                log_psd = np.log10(np.abs(fftshift(fft2(arr)))**2 + 1e-10)
+                all_log_psd.append(log_psd)
+            all_log_psd = np.stack(all_log_psd, axis=0)  # [K,H,W]
+            vmin_freq = float(np.percentile(all_log_psd, 1.0))
+            vmax_freq = float(np.percentile(all_log_psd, 99.0))
+            if vmax_freq <= vmin_freq:
+                vmax_freq = vmin_freq + 1e-6
+            # 重设第二行图像的 clim
+            for j in range(K):
+                im = axes[1, j].images[0]
+                im.set_clim(vmin=vmin_freq, vmax=vmax_freq)
+
+            # --- 计算能量比例（通道在本样本所选通道中的份额） ---
+            total_energy_selected = float(sum(cs['spectral']['psd_sum'] for cs in ch_stats)) + 1e-12
+            for cs in ch_stats:
+                cs['spectral']['energy_ratio_selected'] = float(cs['spectral']['psd_sum'] / total_energy_selected)
+
+            # --- 通道间相关矩阵（空间域 / 频谱域） ---
+            # 使用 np.corrcoef，得到 KxK
+            def safe_corrcoef(mat):
+                try:
+                    C = np.corrcoef(mat)
+                    if np.isnan(C).any():
+                        # 若出现 NaN，用零替换（例如某通道恒常值）
+                        C = np.nan_to_num(C, nan=0.0, posinf=0.0, negative_inf=0.0)
+                except Exception:
+                    C = np.zeros((mat.shape[0], mat.shape[0]), dtype=np.float64)
+                return C
+
+            spatial_corr = safe_corrcoef(spatial_mat)
+            spectral_corr = safe_corrcoef(spectral_mat)
+
+            # --- 保存/日志 ---
+            png_path = os.path.join(save_dir, f'encoded_sample_{i}_ch_{"-".join(map(str,channels))}.png')
+            tb_tag   = f"{log_prefix}/sample_{i}/encoded_composed"
+            wb_key   = f"{log_prefix}/sample_{i}/encoded_figure"
+
+            if '_log_figure' in globals():
+                _log_figure(fig, png_path,
+                            tb_writer=tb_writer, tb_tag=tb_tag, step=global_step,
+                            wandb_run=wandb_run, wb_key=wb_key, dpi=300)
+            else:
+                fig.savefig(png_path, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+
+            # --- 组织结果字典 & 保存 NPY ---
+            analysis = {
+                'sample_id': int(i),
+                'shape': {'B': B, 'C_total': C, 'H': H, 'W': W},
+                'selected_channels': [int(c) for c in channels],
+                'norm_mode': norm_mode,
+                'selection': selection,
+                'stats_per_channel': ch_stats,
+                'inter_channel': {
+                    'spatial_corr': spatial_corr.tolist(),
+                    'spectral_corr': spectral_corr.tolist()
+                }
+            }
+            np.save(os.path.join(save_dir, f'encoded_analysis_sample_{i}.npy'), analysis)
+
+            # --- 写 TXT 摘要（与现有风格一致） ---
+            txt_path = os.path.join(save_dir, f'encoded_analysis_sample_{i}.txt')
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write("=" * 90 + "\n")
+                f.write(f"Encoder 特征可视化与频域分析 - 样本 {i}\n")
+                f.write("=" * 90 + "\n\n")
+                f.write(f"通道选择: {channels}  (mode={selection}, topk={K})\n")
+                f.write(f"可视化归一化: {norm_mode} (p_low={p_low}, p_high={p_high})\n\n")
+                # 每通道
+                for cs in ch_stats:
+                    ch = cs['channel']
+                    s  = cs['spatial']
+                    sp = cs['spectral']
+                    f.write(f"[Channel {ch}]\n")
+                    f.write(f"  空间: mean={s['mean']:.6e}, std={s['std']:.6e}, "
+                            f"min={s['min']:.6e}, max={s['max']:.6e}, L2={s['l2']:.6e}\n")
+                    f.write(f"  频谱: psd_mean={sp['psd_mean']:.6e}, psd_max={sp['psd_max']:.6e}, "
+                            f"dom_freq={sp['dominant_freq']:.3f}, HF/LF={sp['hf_ratio']:.6f}, "
+                            f"energy_ratio_selected={sp['energy_ratio_selected']:.6f}\n\n")
+
+                # 通道间相关
+                f.write("空间域通道间相关矩阵（K×K）:\n")
+                f.write(np.array2string(spatial_corr, formatter={'float_kind':lambda x: f"{x: .3f}"}))
+                f.write("\n\n频谱域通道间相关矩阵（K×K，基于 log10(PSD)）:\n")
+                f.write(np.array2string(spectral_corr, formatter={'float_kind':lambda x: f"{x: .3f}"}))
+                f.write("\n\n")
+
+                f.write("=" * 90 + "\n")
+                f.write(f"保存图像: {png_path}\n")
+                f.write(f"保存 NPY:  {os.path.join(save_dir, f'encoded_analysis_sample_{i}.npy')}\n")
+                f.write(f"完成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("=" * 90 + "\n")
+
+            # --- 终端打印摘要（与你之前风格相同） ---
+            print(f"[visualize_encoded] Sample {i} done.")
+            print(f"  Selected channels: {channels}")
+            for cs in ch_stats:
+                ch = cs['channel']; sp = cs['spectral']; s = cs['spatial']
+                print(f"    ch{ch:>3} | μ={s['mean']:.3e}, σ={s['std']:.3e}, "
+                      f"L2={s['l2']:.2e} | domF={sp['dominant_freq']:.1f}, HF/LF={sp['hf_ratio']:.3f}, "
+                      f"E%={sp['energy_ratio_selected']:.3f}")
+            print(f"  Spatial Corr (KxK): min={spatial_corr.min():.3f}, max={spatial_corr.max():.3f}")
+            print(f"  Spectral Corr (KxK): min={spectral_corr.min():.3f}, max={spectral_corr.max():.3f}")
+            print(f"  Saved: {png_path} | {txt_path}")
+            print("-" * 90)
+
+        except Exception as e:
+            print(f"[visualize_encoded] 样本 {i} 可视化失败: {e}")
+            import traceback; traceback.print_exc()
+            continue
+
+    # ---- 元数据记录（复现通道选择等） ----
+    meta = {
+        'shape': {'B': B, 'C': C, 'H': H, 'W': W},
+        'max_samples': n_samples,
+        'selected_channels': [int(c) for c in channels],
+        'selection': selection,
+        'topk': topk,
+        'norm_mode': norm_mode,
+        'p_low': p_low,
+        'p_high': p_high,
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+    }
+    with open(os.path.join(save_dir, 'encoded_vis_meta.json'), 'w', encoding='utf-8') as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+
+    print(f"[visualize_encoded] Done. samples={n_samples}, channels={channels}, savedir='{save_dir}'")

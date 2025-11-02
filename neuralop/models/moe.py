@@ -346,7 +346,7 @@ class MOEOperator(BaseModel, name='MOE'):
                 module = None
                 k = self.top_k if t == 's_processor' else self.w_k
                 if self.config.get(cfg_key, None) == 'linear':
-                    module = LinearMix(k, self.in_channels)
+                    module = LinearMix(k, self.out_channels)
                 elif self.config.get(cfg_key, None) == 'attention':
                     module = AttentionMix(
                         input_resolution=256, patch_size=16, in_channels=self.in_channels,out_channels=self.in_channels,
@@ -361,7 +361,7 @@ class MOEOperator(BaseModel, name='MOE'):
 
             # 融合层
             if fusion_type == 'linear':
-                self.fusion = LinearMix(self.top_k, self.in_channels)
+                self.fusion = LinearMix(self.top_k, self.out_channels)
             elif fusion_type == 'attention':
                 self.fusion = AttentionMix(
                     input_resolution=256, patch_size=16, in_channels=self.in_channels, out_channels=self.in_channels,
@@ -384,7 +384,8 @@ class MOEOperator(BaseModel, name='MOE'):
             for attr in ['s_processor', 'w_processor', 'fusion', 's_act', 'w_act', 'sw_act']:
                 setattr(self, attr, None)
 
-        self.proj = nn.Conv2d(in_channels, 1, 1)
+        if self.config["use_encoder"]:
+            self.proj = nn.Conv2d(in_channels, 1, 1)
         self.is_logger = is_logger
         self.reset_parameters_()
 
@@ -459,7 +460,10 @@ class MOEOperator(BaseModel, name='MOE'):
 
         if combined_output.shape[2] != 70 or combined_output.shape[3] != 70:
             combined_output = F.interpolate(combined_output, size=(70, 70), mode='bilinear', align_corners=False)
-        combined_output = self.proj(combined_output)
+        
+        if self.config["use_encoder"]:
+            combined_output = self.proj(combined_output)
+        
         return combined_output, aux_loss
 
     def _forward_velocity_type(self, x: torch.Tensor, class_weights: Optional[torch.Tensor], **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -547,7 +551,10 @@ class MOEOperator(BaseModel, name='MOE'):
 
         if combined.shape[2] != 70 or combined.shape[3] != 70:
             combined = F.interpolate(combined, size=(70, 70), mode='bilinear', align_corners=False)
-        combined = self.proj(combined)
+        
+        if self.config["use_encoder"]:
+            combined = self.proj(combined)
+        
         return combined, None
 
     # ---------------- 工具：按专家聚合 & 回填 ----------------

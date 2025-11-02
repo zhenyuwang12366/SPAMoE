@@ -1,10 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=FWINO_merge              # 作业名称
+#SBATCH --job-name=FWINO_wzy              # 作业名称
 #SBATCH --partition=gpu-4090-2             # 分区名称（请根据实际情况调整）
 #SBATCH --gres=gpu:2                       # 请求4个GPU
 #SBATCH --ntasks=1                         # 启动1个任务（torchrun会管理GPU）
 #SBATCH --cpus-per-task=10                  # 分配CPU
-#SBATCH --time=24:00:00                    # 最长运行时间
 #SBATCH --output=../results/output%j.txt             # 输出日志
 #SBATCH --no-requeue
 
@@ -23,32 +22,36 @@ python -c "import torch; print('PyTorch 版本:', torch.__version__)"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 bash scripts/run_distributed_seismic_moe.sh \
   --mode train \
-  --model_name moe_type \
+  --model_name FNO_no_enocder_70 \
+  --concat_channels \
+  --is_resize \
+  --H_size 70 \
+  --W_size 70 \
+  --is_specific \
   --num_gpus 2 \
   --num_workers 10 \
-  --data_dir /data1/home/teacher/teacher_s/t108790/FWINO/FWINO_data \
-  --family all \
+  --zarr_path /data1/home/teacher/teacher_s/t108790/curve_vel_b.zarr \
+  --status_json ./dataset_status/dataset_status.json \
+  --family curve_vel_b \
   --batch_size 32 \
+  --accum_steps 1\
   --epochs 100 \
-  --output_dir ../results/seismic_moe_${SLURM_JOB_NAME}_${SLURM_JOB_ID} \
-  --use_moe \
-  --use_experts_path /root/auto-tmp/model_path_type_sum \
-  --choose_experts 0 1 2 3\
-  --top_k 10 \
-  --moe_mode velocity_type \
-  --router_type basic \
-  --fusion_type basic \
-  --s_processor_type sum \
-  --w_processor_type sum \
-  --beta 0.5 \
-  --is_specific \
-  --is_classifier \
-  --v_type_num 10 \
-  --learning_rate 1e-4 \
+  --output_dir ../results \
+  --top_k 1 \
+  --choose_experts 0 \
+  --hidden_channels 128 \
+  --learning_rate 0.00026711555047527854 \
+  --weight_decay 0.08952068376871994 \
+  --scheduler_gamma 0.2966237496749535 \
+  --FNO_n_layers 6 \
+  --FNO_n_modes_height 64 \
+  --FNO_n_modes_width 64 \
   --lambda_g1v 0.43947650935102966 \
   --lambda_g2v 0.35339805101397564 \
   --lambda_grad_l1 0.15 \
   --lambda_fourier_mag_l1 0.05 \
-  --use_amp
-
-
+  --wavelet_type db6 \
+  --WNO_n_levels_height 3 \
+  --WNO_n_levels_width 2 \
+  --WNO_n_layers 4 \
+  --WNO_dropout_rate 0.10null

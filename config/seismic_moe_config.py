@@ -30,6 +30,7 @@ class SeismicMOEConfig(Default):
     use_gpu_proxy = False
     train_encoder = False
     use_encoder = True
+    draw_enc_pic = False
     backbone = 'vit'
     # v_type_id dict
     type_id_specific = {
