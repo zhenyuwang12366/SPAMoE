@@ -17,7 +17,7 @@ echo "Using DeepSpeed from: $(which deepspeed)"
 nohup deepspeed --num_gpus=4 scripts/train_seismic_moe.py \
   --mode train \
   --use_deepspeed \
-  --ds_config ./configs/deepspeed_zero3.json \
+  --ds_config ./scripts/deepspeed_zero3.json \
   --zarr_path /root/autodl-tmp/all.zarr \
   --status_json ./dataset_status/dataset_status.json \
   --family all \
