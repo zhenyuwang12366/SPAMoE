@@ -359,7 +359,7 @@ class MOEOperator(BaseModel, name='MOE'):
                 self.fusion = LinearMix(self.top_k, self.out_channels)
             elif fusion_type == 'attention':
                 self.fusion = AttentionMix(
-                    input_resolution=256, patch_size=16, in_channels=self.in_channels, out_channels=self.in_channels,
+                    input_resolution=256, patch_size=16, in_channels=self.in_channels, out_channels=self.out_channels,
                     width=512, layers=6, heads=8, num_experts=self.top_k,
                     use_cls_expert=False,
                 )
@@ -368,7 +368,7 @@ class MOEOperator(BaseModel, name='MOE'):
                 self.w_act = GroupActMerge(processor=self.w_processor)
                 self.sw_act = SWActMerge(beta=self.config.get('beta', 0.5))
             elif fusion_type == 'basic':
-                self.fusion = SumMix(self.in_channels)
+                self.fusion = SumMix(self.out_channels)
             else:
                 raise ValueError(f"未支持的融合类型: {fusion_type}")
         else:
