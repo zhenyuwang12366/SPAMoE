@@ -1,4 +1,4 @@
-# train_process.py
+# utils/train_process.py  （或你项目中的 train_process.py）
 import os
 import datetime
 import time
@@ -30,20 +30,12 @@ def maybe_autocast(enabled: bool, device: torch.device, dtype=torch.bfloat16):
 
 
 def _is_main_process(is_logger: bool, engine: Optional[Any] = None) -> bool:
-    """
-    保持你原有 is_logger 逻辑；当传入 DeepSpeed engine 时，用 engine 判断主进程，二者“与”以更安全。
-    """
     if engine is not None and hasattr(engine, "global_rank"):
         return is_logger and (engine.global_rank == 0)
     return is_logger
 
 
 def _get_current_lr(optimizer, engine=None, lr_scheduler=None):
-    """
-    统一获取当前学习率：
-    - DeepSpeed 优先从 engine.get_lr() 拿；
-    - 否则从外部 optimizer.param_groups[0]["lr"] 读取。
-    """
     if engine is not None and hasattr(engine, "get_lr"):
         lr_list = engine.get_lr()
         if isinstance(lr_list, (list, tuple)) and len(lr_list) > 0:
@@ -54,11 +46,6 @@ def _get_current_lr(optimizer, engine=None, lr_scheduler=None):
 
 
 def _maybe_step_scheduler(scheduler_step_mode: str, when: str, lr_scheduler, engine=None):
-    """
-    在 per_step / per_epoch 两种模式下调用 step。
-    对 DeepSpeed：若 ds_config 里已经配置了 LR scheduler，一般会被 engine 管理，这里仅在 lr_scheduler 非 None 时调用。
-    另外在 per_step 模式下，仅在梯度累计边界（gradient accumulation boundary）时 step。
-    """
     if lr_scheduler is None:
         return
     if when == "per_step" and scheduler_step_mode == "per_step":
@@ -76,26 +63,20 @@ def _evaluate_one_epoch(
     epoch,
     total_epoch,
     model,
-    encoder,
     is_logger,
     val_loader,
     device,
     criterion,
-    metrics_module,  # 需有 calculate_psnr(pred, tgt)
+    metrics_module,
     tqdm,
     amp_enabled: bool = False,
     train_encoder: bool = False,
-    # 新增：DeepSpeed engine（评估阶段仅用于 is_main 判断，不参与计算）
     engine: Optional[Any] = None,
 ):
     model.eval()
-    if encoder is not None:
-        encoder.eval()
-
     val_loss = 0.0
     mse_sum = mae_sum = psnr_sum = ce_sum = rmse_sum = ssim_sum = 0.0
 
-    # —— 安全创建进度条 —— #
     pbar_iter = val_loader
     if tqdm is not None:
         pbar_iter = tqdm(
@@ -111,14 +92,8 @@ def _evaluate_one_epoch(
         if train_encoder:
             labels = batch['v_type'].to(device, non_blocking=True)
 
-        if encoder is not None:
-            with maybe_autocast(amp_enabled, device):
-                encoded, weights, _ = encoder(inputs)
-        else:
-            encoded, weights = inputs, None
-
         with maybe_autocast(amp_enabled, device):
-            preds, aux_loss = model(encoded, weights)
+            preds, aux_loss, weights = model(inputs)
         if aux_loss is None:
             aux_loss = preds.new_zeros(())
 
@@ -151,19 +126,13 @@ def _evaluate_one_epoch(
 
 
 def _ds_gather_state_dict(module: torch.nn.Module) -> dict:
-    """
-    DeepSpeed ZeRO 下安全获取 module 的 state_dict（仅在 rank0 调用）。
-    非 DeepSpeed 或未使用 ZeRO 时，直接返回 module.state_dict()。
-    """
     if (deepspeed is None) or (DS_GatheredParameters is None):
         return module.state_dict()
 
-    # 若不是 ZeRO 优化器，直接返回
     params = [p for p in module.parameters() if hasattr(p, "ds_status")]
     if len(params) == 0:
         return module.state_dict()
 
-    # ZeRO：需要聚合参数后再取 state_dict
     state_dict = {}
     for name, param in module.named_parameters():
         if hasattr(param, "ds_id") and hasattr(param, "ds_status"):
@@ -175,7 +144,6 @@ def _ds_gather_state_dict(module: torch.nn.Module) -> dict:
         else:
             state_dict[name] = param.detach().cpu().clone()
 
-    # 同步保存 buffers
     for name, buf in module.named_buffers():
         state_dict[f"_buffer_{name}"] = buf.detach().cpu().clone()
     return state_dict
@@ -184,7 +152,6 @@ def _ds_gather_state_dict(module: torch.nn.Module) -> dict:
 def train_one_epoch(
     *args,
     model,
-    encoder=None,
     optimizer=None,
     criterion=None,
     train_loader=None,
@@ -195,10 +162,10 @@ def train_one_epoch(
     is_logger: bool = True,
     log_file: Optional[str] = None,
     results_dir=None,
-    coef: float = 0.01,                   # MoE负载均衡因子
-    lr_scheduler=None,                    # 学习率调度器
+    coef: float = 0.01,
+    lr_scheduler=None,
     scheduler_step_mode: str = "per_step",
-    accum_steps: int = 1,                 # 梯度累计
+    accum_steps: int = 1,
     vis_now: bool = False,
     input_inverse_transform: Optional[Callable] = None,
     output_inverse_transform: Optional[Callable] = None,
@@ -223,18 +190,13 @@ def train_one_epoch(
     encoder_frozen: bool = False,
     train_encoder: bool = False,
     tb_writer: Optional[SummaryWriter] = None,
-    # ===== 新增参数（可不传） =====
-    engine: Optional[Any] = None,         # DeepSpeed engine（传入则启用 DS 路径）
-    use_deepspeed: bool = False,          # 切换标志，默认 False；若 engine 非 None 将被自动置 True
+    engine: Optional[Any] = None,
+    use_deepspeed: bool = False,
     **kwargs,
 ):
-    """
-    深度保持你原本行为一致，只在“优化步、学习率、保存、is_main”处自动切换到 DeepSpeed。
-    """
     use_deepspeed = use_deepspeed or (engine is not None)
     tqdm = tqdm_module.tqdm if tqdm_module is not None else None
 
-    # 记录器启用条件（再与 DeepSpeed 主进程判定结合）
     tb_active = bool(tb_writer) and _is_main_process(is_logger, engine)
     type_weight_hist_sample = None
     max_type_weight_hist_samples = 65536
@@ -242,8 +204,6 @@ def train_one_epoch(
 
     start_time = time.time()
     model.train()
-    if encoder is not None:
-        encoder.train()
 
     running_train_loss = 0.0
     running_aux_loss = 0.0
@@ -251,21 +211,18 @@ def train_one_epoch(
     nan_detected = False
     use_amp = bool(amp_enabled)
 
-    # 读取 router / DDP 信息（保持你原逻辑）
     router_type = model.module.moe.router_type if hasattr(model, "module") else model.moe.router_type
     if "adamv" == router_type:
         router = model.module.moe.router if hasattr(model, "module") else model.moe.router
         assert hasattr(router, "step_validation"), "adamv router must impl. function step_validation"
 
-    is_ddp_like = hasattr(model, "no_sync")  # DDP 情况
+    is_ddp_like = hasattr(model, "no_sync")
     num_steps = len(train_loader)
 
-    # 分布式 sampler 设 epoch（原逻辑保留）
     if getattr(config, "distributed", None) and getattr(config.distributed, "use_distributed", False):
         if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
             train_loader.sampler.set_epoch(epoch)
 
-    # 优化器归零：DeepSpeed 用 engine.zero_grad()
     if use_deepspeed:
         engine.zero_grad()
     else:
@@ -288,28 +245,8 @@ def train_one_epoch(
         if train_encoder:
             labels = batch['v_type'].to(device, non_blocking=True)
 
-        # 编码器（可冻结）
-        grad_ctx = torch.no_grad() if (encoder is not None and encoder_frozen) else nullcontext()
-        with grad_ctx:
-            with maybe_autocast(use_amp, device):
-                if encoder is not None:
-                    encoded, weights, _ = encoder(inputs)
-                else:
-                    encoded, weights = inputs, None
-
-        # 释放原始 inputs
-        del inputs
-
-        if tb_active and type_weight_hist_sample is None and weights is not None:
-            flat_weights = weights.detach().float().cpu().reshape(-1)
-            if flat_weights.numel() > max_type_weight_hist_samples:
-                flat_weights = flat_weights[:max_type_weight_hist_samples]
-            type_weight_hist_sample = flat_weights
-
-        # 是否为该累计组的“最后一个 micro”
         last_micro = ((step + 1) % accum_steps == 0) or ((step + 1) == num_steps)
 
-        # DDP 同步控制：DeepSpeed 自管同步；仅在非 DeepSpeed 的 DDP 下使用 no_sync()
         sync_ctx = (
             (model.no_sync() if (is_ddp_like and not last_micro and not use_deepspeed) else nullcontext())
         )
@@ -317,7 +254,7 @@ def train_one_epoch(
         step_has_nan = False
         with sync_ctx:
             with maybe_autocast(use_amp, device):
-                preds, aux_loss = model(encoded, weights)
+                preds, aux_loss, weights = model(inputs)
             if aux_loss is None:
                 aux_loss = preds.new_zeros(())
             if train_encoder:
@@ -325,24 +262,27 @@ def train_one_epoch(
             else:
                 loss_dict = criterion(preds, targets)
 
-            # 未缩放真实训练损失
+            # —— 采样一次权重直方图 —— #
+            if tb_active and type_weight_hist_sample is None and (weights is not None):
+                flat_weights = weights.detach().float().cpu().reshape(-1)
+                if flat_weights.numel() > max_type_weight_hist_samples:
+                    flat_weights = flat_weights[:max_type_weight_hist_samples]
+                type_weight_hist_sample = flat_weights  # ← 只在首次设置
+
             loss_raw = loss_dict["loss"] + coef * aux_loss
 
             if not torch.isfinite(loss_raw).item():
                 step_has_nan = True
                 nan_detected = True
             else:
-                # 按组缩放
                 current_group_size = accum_steps if not last_micro else ((step % accum_steps) + 1)
                 loss_for_backward = loss_raw / current_group_size
 
                 if use_deepspeed:
-                    # DeepSpeed 反传
                     engine.backward(loss_for_backward)
                 else:
                     loss_for_backward.backward()
 
-                # 统计（用未缩放口径）
                 running_train_loss += loss_raw.item()
                 running_aux_loss += aux_loss.item()
                 micro_count += 1
@@ -357,7 +297,6 @@ def train_one_epoch(
             break
 
         if last_micro:
-            # 优化步
             if use_deepspeed:
                 engine.step()
                 engine.zero_grad(set_to_none=True)
@@ -365,22 +304,18 @@ def train_one_epoch(
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            # 学习率调度（per_step）
             _maybe_step_scheduler(scheduler_step_mode, "per_step", lr_scheduler, engine)
 
-            # 记录 LR
             if tb_active:
                 current_lr = _get_current_lr(optimizer, engine, lr_scheduler)
                 tb_writer.add_scalar("train/learning_rate", current_lr, global_step)
 
-        # tqdm 显示
         if _is_main_process(is_logger, engine) and tqdm is not None:
             pbar_iter.set_postfix({"train_loss": f"{loss_raw.item():.6f}"})
 
-        encoded = None
-        weights = None
+        # 释放引用
+        del preds, aux_loss
 
-    # —— 训练集平均 —— #
     if nan_detected and micro_count == 0:
         avg_train_loss = float("nan")
         avg_aux_loss = float("nan")
@@ -393,7 +328,6 @@ def train_one_epoch(
         tb_writer.add_scalar("train/epoch_loss", avg_train_loss, epoch_step)
         tb_writer.add_scalar("train/epoch_aux_loss", avg_aux_loss, epoch_step)
 
-    # —— 验证 —— #
     if nan_detected:
         val_stats = {
             "val_loss": float("inf"),
@@ -411,7 +345,6 @@ def train_one_epoch(
             epoch,
             getattr(config, "epochs", 0),
             model,
-            encoder,
             _is_main_process(is_logger, engine),
             val_loader,
             device,
@@ -424,7 +357,6 @@ def train_one_epoch(
         )
         val_loss = val_stats["val_loss"]
 
-    # —— 记录到 TensorBoard —— #
     if tb_active:
         tb_writer.add_scalar("val/loss", val_stats.get("val_loss", float("nan")), epoch_step)
         tb_writer.add_scalar("val/psnr", val_stats.get("psnr", float("nan")), epoch_step)
@@ -440,7 +372,7 @@ def train_one_epoch(
         if train_encoder:
             tb_writer.add_scalar("val/ce", val_stats.get("ce", float("nan")), epoch_step)
 
-    # —— Router 自适应控制（原逻辑保留）—— #
+    # —— Router 控制 —— #
     if router_type == 'adamv':
         signal = router.step_validation(val_loss)
         if is_ddp_like and not use_deepspeed:
@@ -448,19 +380,15 @@ def train_one_epoch(
             dist.all_reduce(signal_tensor, op=dist.ReduceOp.MAX)
             should_break = bool(signal_tensor.item())
         else:
-            # DeepSpeed 或非 DDP：rank0 直接判定
             should_break = (signal == "should_break")
 
         if should_break:
             router.k = max(1, router.k - 1)
             router.fixed = True
-
-            # 广播给其余 rank
             if (is_ddp_like and not use_deepspeed) or (use_deepspeed and dist.is_initialized()):
                 k_tensor = torch.tensor([router.k], device=device)
                 dist.broadcast(k_tensor, src=0)
                 router.k = int(k_tensor.item())
-
             if _is_main_process(is_logger, engine):
                 print(f'epoch: {epoch} AES probe failed -> fix top_k = {router.k}')
 
@@ -508,9 +436,8 @@ def train_one_epoch(
         if tag_path is None:
             return
 
-        # 统一取得“可保存”的 model / encoder / router
         model_for_save = model.module if hasattr(model, "module") else model
-        encoder_for_save = encoder.module if (encoder is not None and hasattr(encoder, "module")) else encoder
+        encoder_for_save = model_for_save.encoder if hasattr(model_for_save, "encoder") else None
         router_for_save = (model_for_save.moe.router if hasattr(model_for_save, "moe") else None)
 
         base_ckpt = {
@@ -527,13 +454,10 @@ def train_one_epoch(
             "data_dict": data_dict,
         }
 
-        # 1) DeepSpeed：保存引擎 checkpoint（会把分布式分片都保存好）
         if use_deepspeed:
-            # tag 用 “best” 或 “last”+epoch
             tag = "best" if best else f"last-ep{epoch+1}"
             engine.save_checkpoint(os.path.dirname(tag_path), tag=tag)
 
-            # 额外在 rank0 保存“聚合后（state_dict）”的模块：model/encoder/router
             attach = {}
             attach["model_state_dict"] = _ds_gather_state_dict(model_for_save)
             if encoder_for_save is not None:
@@ -541,7 +465,6 @@ def train_one_epoch(
             if router_for_save is not None:
                 attach["router_state_dict"] = _ds_gather_state_dict(router_for_save)
 
-            # 按专家单独保存（若只训练单一专家）
             if experts_name is not None and len(experts_name) == 1 and experts_name[0] != "all":
                 if hasattr(model_for_save, "experts") and len(model_for_save.experts) > 0:
                     attach["expert_state_dict"] = _ds_gather_state_dict(model_for_save.experts[0])
@@ -549,13 +472,12 @@ def train_one_epoch(
             torch.save({**base_ckpt, **attach}, tag_path)
 
         else:
-            # 非 DeepSpeed：与原逻辑一致
             checkpoint = {
                 **base_ckpt,
                 "model_state_dict": model_for_save.state_dict(),
             }
             if train_encoder or (experts_name and len(experts_name) == 1 and experts_name[0] == "all"):
-                checkpoint.pop("model_state_dict", None)  # 走 MOE 格式
+                checkpoint.pop("model_state_dict", None)
                 if router_for_save is not None:
                     checkpoint["router_state_dict"] = router_for_save.state_dict()
             if encoder_for_save is not None:
@@ -570,33 +492,24 @@ def train_one_epoch(
                         (best_expert_path if best else last_expert_path),
                     )
 
-    # 保存最佳
     if _is_main_process(is_logger, engine) and (val_loss < best_val_loss):
         best_val_loss = val_loss
         _save_checkpoints(best_model_path, best=True)
 
-    # 保存最新
     if _is_main_process(is_logger, engine) and (last_model_path is not None):
         _save_checkpoints(last_model_path, best=False)
 
-    # —— 打印概要 —— #
     if _is_main_process(is_logger, engine):
         print(f"Epoch {epoch+1}/{getattr(config, 'epochs', '?')}:")
         print(f"  Train Loss: {avg_train_loss:.6f}")
         print(f"  Val   Loss: {val_loss:.6f}")
 
-    # —— 可视化（仅主进程 & 触发时）—— #
     if _is_main_process(is_logger, engine) and vis_now and (visualize_results is not None):
         vis_batch = next(iter(val_loader))
         inputs = vis_batch['input'].to(device, non_blocking=True)
         targets = vis_batch['output'].to(device, non_blocking=True)
-        with torch.no_grad():
-            with maybe_autocast(use_amp, device):
-                if encoder is not None:
-                    vis_encoded, vis_weights, _ = encoder(inputs)
-                else:
-                    vis_encoded, vis_weights = inputs, None
-                preds, _ = model(vis_encoded, vis_weights)
+
+        preds, _, vis_weights = model(inputs)
 
         inputs_v = input_inverse_transform(inputs) if input_inverse_transform else inputs
         if output_inverse_transform:
@@ -638,14 +551,12 @@ def train_one_epoch(
             global_step=epoch,
         )
 
-    # —— 早停（主进程判定，后广播）—— #
     stop_flag = 0
     if getattr(config, "early_stop", False):
         if _is_main_process(is_logger, engine) and (early_stopper is not None) and (not nan_detected):
             if early_stopper.step(val_loss, epoch):
                 stop_flag = 1
 
-        # 广播（DeepSpeed/原生均可用 torch.distributed）
         if dist.is_initialized():
             flag_tensor = torch.tensor([stop_flag], device=device, dtype=torch.int32)
             torch.distributed.broadcast(flag_tensor, src=0)
@@ -661,10 +572,8 @@ def train_one_epoch(
             torch.distributed.broadcast(flag_tensor, src=0)
             stop_flag = int(flag_tensor.item())
 
-    # —— 学习率调度（per_epoch）—— #
     _maybe_step_scheduler(scheduler_step_mode, "per_epoch", lr_scheduler, engine)
 
-    # —— 耗时 —— #
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     if _is_main_process(is_logger, engine):

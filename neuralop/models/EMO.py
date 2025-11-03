@@ -59,21 +59,6 @@ class EMO(nn.Module):
         return getattr(self.moe, "hidden_channels", None)
 
     # ---------------------------
-    # 前向：与现有训练流程保持一致
-    # ---------------------------
-    def forward(
-        self,
-        encoded: torch.Tensor,
-        weights: Optional[torch.Tensor] = None,
-        **moe_kwargs: Any,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        兼容你当前的调用方式：
-            preds, aux = model(encoded, weights)
-        """
-        return self.moe(encoded, weights, **moe_kwargs)
-
-    # ---------------------------
     # 便捷：端到端(raw inputs)推理/训练
     # ---------------------------
     @torch.no_grad()
@@ -86,7 +71,7 @@ class EMO(nn.Module):
         encoded, weights, _ = self.encoder(inputs)
         return encoded, weights
 
-    def forward_raw(
+    def forward(
         self,
         inputs: torch.Tensor,
         *,
@@ -111,17 +96,12 @@ class EMO(nn.Module):
                 encoded, enc_weights, _ = self.encoder(inputs)
             weights = enc_weights if self._pass_encoder_logits_as_weights else None
 
-        if force_dtype is not None:
-            encoded = encoded.to(dtype=force_dtype)
-            if weights is not None:
-                weights = weights.to(dtype=force_dtype)
-
         if use_amp:
             with torch.amp.autocast(device_type=encoded.device.type, enabled=True, dtype=amp_dtype):
                 preds, aux = self.moe(encoded, weights, **moe_kwargs)
         else:
             preds, aux = self.moe(encoded, weights, **moe_kwargs)
-        return preds, aux
+        return preds, aux, enc_weights
 
     # ---------------------------
     # Checkpoint 兼容性：与原流程一致
