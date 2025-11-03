@@ -18,6 +18,7 @@ python -c "import torch; print('PyTorch 版本:', torch.__version__)"
 
 # === 启动训练 ===
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export MKL_THREADING_LAYER=GNU
 nohup bash scripts/run_distributed_seismic_moe.sh \
   --mode train \
   --use_gpu_proxy \
