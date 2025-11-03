@@ -485,6 +485,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         v_type_num=config.v_type_num,
         use_expert_memory_proxy=config.use_gpu_proxy,
         use_encoder=config.use_encoder,
+        device=device,
     )
 
     # ======================
