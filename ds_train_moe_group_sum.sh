@@ -21,7 +21,7 @@ nohup deepspeed --num_gpus=4 scripts/train_seismic_moe.py \
   --zarr_path /root/autodl-tmp/all.zarr \
   --status_json ./dataset_status/dataset_status.json \
   --family all \
-  --batch_size 32 \
+  --batch_size 16 \
   --epochs 100 \
   --output_dir ../results \
   --use_moe \

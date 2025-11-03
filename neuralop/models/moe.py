@@ -259,12 +259,12 @@ class MOEOperator(BaseModel, name='MOE'):
 
         self.experts = nn.ModuleList(experts)
         # >>> 显存管理透明代理（开关可由 config 控制）
-        use_proxy = self.config.get('use_expert_memory_proxy', True)
+        use_proxy = self.config.get('use_expert_memory_proxy', False)
         self.expert_proxy: Optional[ExpertMemoryProxy] = None
         if use_proxy:
             self.expert_proxy = ExpertMemoryProxy(
                 experts=list(self.experts),
-                device=self.config.get('device', 'cuda'),
+                device=self.config.get('device', None),
                 cache_size=self.config.get('expert_cache_size', 2),
                 amp_dtype=torch.bfloat16,
             )
