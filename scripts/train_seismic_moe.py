@@ -89,7 +89,18 @@ def _load_router_weights(model: nn.Module, router_path: Union[str, Path], map_lo
         if unexpected:
             print(f"[Router] 未使用参数（可能是检查点里包含了非路由器键）：{unexpected}")
 
-
+from collections import defaultdict
+import torch.distributed as dist
+def summarize_module_devices(module):
+    dev_map = defaultdict(int)
+    for n, p in module.named_parameters(recurse=True):
+        dev_map[str(p.device)] += p.numel()
+    for n, b in module.named_buffers(recurse=True):
+        dev_map[str(b.device)] += b.numel()
+    print(f"[Rank {dist.get_rank()}] Param/Buffer device distribution:")
+    for k, v in dev_map.items():
+        print(f"  {k}: {v} elems", flush=True)
+        
 class TransformedSubset(Subset):
     def __init__(self, dataset, transform=None):
         if hasattr(dataset, 'indices'):
@@ -647,6 +658,8 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         else:
             raise ValueError(f"Unsupported lr_scheduler_type: {scheduler_type}")
 
+    summarize_module_devices(model)
+    
     # ======================
     # 损失函数
     # ======================
