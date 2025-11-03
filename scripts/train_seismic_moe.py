@@ -3,7 +3,6 @@
 使用MOE（Mixture of Experts）架构训练地震数据的神经算子模型
 支持分布式训练 + DeepSpeed
 """
-import monkey_patch_ds_post_bwd
 import optuna
 import os
 import sys
