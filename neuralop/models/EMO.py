@@ -77,7 +77,6 @@ class EMO(nn.Module):
         *,
         use_amp: bool = False,
         amp_dtype: torch.dtype = torch.bfloat16,
-        force_dtype: Optional[torch.dtype] = torch.float32,
         **moe_kwargs: Any,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """

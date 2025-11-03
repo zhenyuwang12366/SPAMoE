@@ -93,7 +93,7 @@ def _evaluate_one_epoch(
             labels = batch['v_type'].to(device, non_blocking=True)
 
         with maybe_autocast(amp_enabled, device):
-            preds, aux_loss, weights = model(inputs)
+            preds, aux_loss, weights = model(inputs, use_amp=amp_enabled)
         if aux_loss is None:
             aux_loss = preds.new_zeros(())
 
@@ -254,7 +254,7 @@ def train_one_epoch(
         step_has_nan = False
         with sync_ctx:
             with maybe_autocast(use_amp, device):
-                preds, aux_loss, weights = model(inputs)
+                preds, aux_loss, weights = model(inputs, use_amp=use_amp)
             if aux_loss is None:
                 aux_loss = preds.new_zeros(())
             if train_encoder:
@@ -509,7 +509,7 @@ def train_one_epoch(
         inputs = vis_batch['input'].to(device, non_blocking=True)
         targets = vis_batch['output'].to(device, non_blocking=True)
 
-        preds, _, vis_weights = model(inputs)
+        preds, _, vis_weights = model(inputs, use_amp=use_amp)
 
         inputs_v = input_inverse_transform(inputs) if input_inverse_transform else inputs
         if output_inverse_transform:
