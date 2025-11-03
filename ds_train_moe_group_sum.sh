@@ -42,5 +42,4 @@ nohup deepspeed --num_gpus=4 scripts/train_seismic_moe.py \
   --lambda_grad_l1 0.15 \
   --lambda_fourier_mag_l1 0.05 \
   --use_amp > "$LOGFILE" 2>&1 &
-
 echo "DeepSpeed 启动完成，日志：$LOGFILE"

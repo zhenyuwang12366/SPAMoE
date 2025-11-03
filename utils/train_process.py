@@ -57,11 +57,16 @@ def _maybe_step_scheduler(scheduler_step_mode: str, when: str, lr_scheduler, eng
     """
     在 per_step / per_epoch 两种模式下调用 step。
     对 DeepSpeed：若 ds_config 里已经配置了 LR scheduler，一般会被 engine 管理，这里仅在 lr_scheduler 非 None 时调用。
+    另外在 per_step 模式下，仅在梯度累计边界（gradient accumulation boundary）时 step。
     """
     if lr_scheduler is None:
         return
     if when == "per_step" and scheduler_step_mode == "per_step":
-        lr_scheduler.step()
+        if (engine is not None) and hasattr(engine, "is_gradient_accumulation_boundary"):
+            if engine.is_gradient_accumulation_boundary():
+                lr_scheduler.step()
+        else:
+            lr_scheduler.step()
     elif when == "per_epoch" and scheduler_step_mode == "per_epoch":
         lr_scheduler.step()
 
@@ -90,9 +95,15 @@ def _evaluate_one_epoch(
     val_loss = 0.0
     mse_sum = mae_sum = psnr_sum = ce_sum = rmse_sum = ssim_sum = 0.0
 
+    # —— 安全创建进度条 —— #
+    pbar_iter = val_loader
     if tqdm is not None:
-        pbar_iter = tqdm(val_loader, desc=f"Epoch(eval) {epoch+1}/{total_epoch}", leave=False,
-                         disable=not _is_main_process(is_logger, engine))
+        pbar_iter = tqdm(
+            val_loader,
+            desc=f"Epoch(eval) {epoch+1}/{total_epoch}",
+            leave=False,
+            disable=not _is_main_process(is_logger, engine)
+        )
 
     for batch in pbar_iter:
         inputs = batch['input'].to(device, non_blocking=True)
@@ -164,7 +175,7 @@ def _ds_gather_state_dict(module: torch.nn.Module) -> dict:
         else:
             state_dict[name] = param.detach().cpu().clone()
 
-    # buffer 同样取一下
+    # 同步保存 buffers
     for name, buf in module.named_buffers():
         state_dict[f"_buffer_{name}"] = buf.detach().cpu().clone()
     return state_dict
@@ -256,7 +267,7 @@ def train_one_epoch(
 
     # 优化器归零：DeepSpeed 用 engine.zero_grad()
     if use_deepspeed:
-        engine.zero_grad(set_to_none=True)
+        engine.zero_grad()
     else:
         if optimizer is not None:
             optimizer.zero_grad(set_to_none=True)
@@ -530,7 +541,7 @@ def train_one_epoch(
             if router_for_save is not None:
                 attach["router_state_dict"] = _ds_gather_state_dict(router_for_save)
 
-            # 你原逻辑中 “只保存 expert” 的分支也保留
+            # 按专家单独保存（若只训练单一专家）
             if experts_name is not None and len(experts_name) == 1 and experts_name[0] != "all":
                 if hasattr(model_for_save, "experts") and len(model_for_save.experts) > 0:
                     attach["expert_state_dict"] = _ds_gather_state_dict(model_for_save.experts[0])

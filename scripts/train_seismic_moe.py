@@ -24,7 +24,10 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms import Compose
 
 # >>> DeepSpeed（仅导入，不影响非 DS 路径）
-import deepspeed
+try:
+    import deepspeed
+except Exception:
+    deepspeed = None
 
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -85,6 +88,30 @@ def _load_router_weights(model: nn.Module, router_path: Union[str, Path], map_lo
             print(f"[Router] 缺失参数（可能是非路由器键或名称不匹配）：{missing}")
         if unexpected:
             print(f"[Router] 未使用参数（可能是检查点里包含了非路由器键）：{unexpected}")
+
+
+class TransformedSubset(Subset):
+    def __init__(self, dataset, transform=None):
+        if hasattr(dataset, 'indices'):
+            super().__init__(dataset.dataset, dataset.indices)
+        else:
+            super().__init__(dataset, list(range(len(dataset))))
+        self.transform = transform
+
+    def _get_single(self, index: int):
+        sample = self.dataset[self.indices[index]]
+        sample = {**sample, 'idx': index}
+        if self.transform:
+            return self.transform(sample)
+        return sample
+
+    def __getitem__(self, index):
+        if isinstance(index, list):
+            return [self._get_single(i) for i in index]
+        return self._get_single(index)
+
+    def __getitems__(self, idx: list[int]):
+        return [self._get_single(index) for index in idx]
 
 
 def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
@@ -452,6 +479,8 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     # EMO + DDP / DeepSpeed
     # ======================
     if use_deepspeed:
+        if deepspeed is None:
+            raise RuntimeError("未安装 deepspeed，但传入了 --use_deepspeed")
         # DS 分支：不要 .to(device)，保持 CPU，让 deepspeed.initialize 接管
         emo_model = EMO(encoder_model, moe_model, pass_encoder_logits_as_weights=True)
 
@@ -479,76 +508,116 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     # ======================
     # 优化器 & 调度器
     # ======================
+    # 1) 学习率与步数
     if config.distributed.use_distributed and world_size > 2:
-        lr = config.learning_rate * math.sqrt(world_size)
+        lr = float(config.learning_rate) * math.sqrt(world_size)
     else:
-        lr = config.learning_rate
-
-    _param_src = emo_model if use_deepspeed else model
-    optim_params = [p for p in _param_src.parameters() if p.requires_grad]
-    assert len(optim_params) > 0, "No trainable parameters collected for optimizer!"
-    optimizer = torch.optim.AdamW(optim_params, lr=lr, betas=(0.9, 0.999), weight_decay=config.weight_decay)
-
-    encoder_requires_grad = False
-    if emo_model.encoder is not None:
-        encoder_requires_grad = any(p.requires_grad for p in emo_model.encoder.parameters())
+        lr = float(config.learning_rate)
 
     steps_per_epoch = max(1, len(train_loader))
-    warmup_iters = int(config.lr_warmup_epochs * steps_per_epoch)
+    total_num_steps = int(getattr(config, "epochs", 100) * steps_per_epoch)
+
+    eta_min = float(getattr(config, "lr_cosine_eta_min", 1e-6))
+    cos_min_ratio = 0.0 if lr <= 0 else max(0.0, min(1.0, eta_min / lr))
+
+    warmup_min_ratio = float(getattr(config, "lr_warmup_min_ratio", 0.0))
+    warmup_min_ratio = max(0.0, min(1.0, warmup_min_ratio))
+    warmup_method = str(getattr(config, "lr_warmup_method", "linear")).lower()
+    warmup_type = "linear" if "lin" in warmup_method else ("log" if "log" in warmup_method else "linear")
+
+    warmup_epochs = float(getattr(config, "lr_warmup_epochs", 0.0))
+    warmup_iters = int(max(0.0, warmup_epochs) * steps_per_epoch)
+
+    weight_decay = float(getattr(config, "weight_decay", 1e-2))
+
     warmup_kwargs = dict(
         warmup_factor=getattr(config, "lr_warmup_factor", 1.0 / 3),
         warmup_iters=warmup_iters,
         warmup_method=getattr(config, "lr_warmup_method", "linear"),
     )
 
-    scheduler_type = getattr(config, "lr_scheduler_type", "cos_restart")
-    if scheduler_type == "multistep":
-        lr_milestones = [int(steps_per_epoch * m) for m in config.milestones]
-        lr_scheduler = WarmupMultiStepLR(
-            optimizer=optimizer,
-            milestones=lr_milestones,
-            gamma=config.scheduler_gamma,
-            **warmup_kwargs,
-        )
-    elif scheduler_type == "cos":
-        t_max_epochs = getattr(config, "lr_cosine_tmax_epochs", max(1, config.epochs - config.lr_warmup_epochs))
-        t_max = max(1, int(t_max_epochs * steps_per_epoch))
-        lr_scheduler = WarmupCosineLR(
-            optimizer=optimizer,
-            T_max=t_max,
-            eta_min=config.lr_cosine_eta_min,
-            **warmup_kwargs,
-        )
-    elif scheduler_type == "cos_restart":
-        t0_epochs = getattr(config, "lr_cosine_restart_t0_epochs", 10)
-        T_0 = max(1, int(t0_epochs * steps_per_epoch))
-        lr_scheduler = WarmupCosineAnnealingWarmRestarts(
-            optimizer=optimizer,
-            T_0=T_0,
-            T_mult=config.lr_cosine_restart_t_mult,
-            eta_min=config.lr_cosine_eta_min,
-            **warmup_kwargs,
-        )
-    else:
-        raise ValueError(f"Unsupported lr_scheduler_type: {scheduler_type}")
+    # 2) 优化器参数（DS 下不提前创建外部 optimizer）
+    _param_src = emo_model if use_deepspeed else model
+    optim_params = [p for p in _param_src.parameters() if p.requires_grad]
+    assert len(optim_params) > 0, "No trainable parameters collected for optimizer!"
 
-    # DeepSpeed 初始化（托管 model/optimizer/scheduler）
+    optimizer = None
+    if not use_deepspeed:
+        optimizer = torch.optim.AdamW(
+            optim_params, lr=lr, betas=(0.9, 0.999), weight_decay=weight_decay
+        )
+
+    encoder_requires_grad = False
+    if getattr(emo_model, "encoder", None) is not None:
+        encoder_requires_grad = any(p.requires_grad for p in emo_model.encoder.parameters())
+
+    # 3) DeepSpeed 初始化（托管 model/optimizer/scheduler）
+    lr_scheduler = None  # DS 下由 initialize 返回；非 DS 下由你在下面构造
     if use_deepspeed:
+        if not args.ds_config:
+            raise ValueError("需提供 --deepspeed_config")
+        ds_cfg_path = Path(args.ds_config)
+        if not ds_cfg_path.exists():
+            raise ValueError(f"DeepSpeed 配置文件不存在: {ds_cfg_path}")
+
+        with open(ds_cfg_path, "r", encoding="utf-8") as f:
+            ds_cfg = json.load(f)
+
+        # ---- Optimizer：使用通用 Adam，避免 CPUAdam/JIT 扩展依赖 ----
+        ds_cfg["optimizer"] = {
+            "type": "Adam",
+            "params": {
+                "lr": float(lr),
+                "betas": [0.9, 0.999],
+                "eps": 1e-8,
+                "weight_decay": float(weight_decay),
+                "adam_w_mode": True
+            }
+        }
+
+        # ---- Scheduler：使用 WarmupCosineLR（若未提供则补上；若已存在则补全关键参数）----
+        sched = ds_cfg.get("scheduler")
+        if sched is None:
+            ds_cfg["scheduler"] = {
+                "type": "WarmupCosineLR",
+                "params": {
+                    "total_num_steps": int(total_num_steps),
+                    "warmup_num_steps": int(warmup_iters),
+                    "warmup_min_ratio": float(warmup_min_ratio),
+                    "warmup_type": str(warmup_type),
+                    "cos_min_ratio": float(cos_min_ratio),
+                    "last_batch_iteration": -1
+                }
+            }
+        else:
+            # 仅补齐缺失的关键字段，避免覆盖你已有配置
+            sched.setdefault("type", "WarmupCosineLR")
+            params = sched.setdefault("params", {})
+            params.setdefault("total_num_steps", int(total_num_steps))
+            params.setdefault("warmup_num_steps", int(warmup_iters))
+            params.setdefault("warmup_min_ratio", float(warmup_min_ratio))
+            params.setdefault("warmup_type", str(warmup_type))
+            # 某些 DeepSpeed 版本用 min_lr；这里保留 cos_min_ratio，同时不强制覆盖
+            params.setdefault("cos_min_ratio", float(cos_min_ratio))
+            params.setdefault("last_batch_iteration", -1)
+
+        # ---- ZeRO Offload 默认补全 ----
+        zero_cfg = ds_cfg.get("zero_optimization", {})
+        off_cfg = zero_cfg.get("offload_optimizer", {})
+        if isinstance(off_cfg, dict):
+            off_cfg.setdefault("device", "cpu")
+            off_cfg.setdefault("pin_memory", True)
+        zero_cfg["offload_optimizer"] = off_cfg
+        ds_cfg["zero_optimization"] = zero_cfg
+
+        # ---- initialize ----
         ds_init_kwargs = {
             "model": emo_model,
-            "model_parameters": optim_params,
-            "optimizer": optimizer,
-            "lr_scheduler": lr_scheduler,
+            "model_parameters": (p for p in emo_model.parameters() if p.requires_grad),
+            "config": ds_cfg,
         }
-        if isinstance(ds_config, str) and os.path.isfile(ds_config):
-            ds_init_kwargs["config"] = ds_config
-        elif isinstance(ds_config, dict):
-            ds_init_kwargs["config_params"] = ds_config
-        # 否则走 DeepSpeed 默认，保持最小侵入
-
         model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(**ds_init_kwargs)
-        model = model_engine  # 之后训练与保存都使用 model（DeepSpeedEngine）
-
+        model = model_engine  # 之后均使用 DeepSpeedEngine
         if is_logger:
             print("[DeepSpeed] 已启用 DeepSpeed 训练。")
             try:
@@ -556,6 +625,39 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             except Exception:
                 pass
 
+    # 4) 非 DeepSpeed：按原逻辑构造 LR scheduler；DeepSpeed：使用 DS 返回的 lr_scheduler（或 None）
+    if not use_deepspeed:
+        scheduler_type = getattr(config, "lr_scheduler_type", "cos_restart")
+        if scheduler_type == "multistep":
+            lr_milestones = [int(steps_per_epoch * m) for m in getattr(config, "milestones", [])]
+            lr_scheduler = WarmupMultiStepLR(
+                optimizer=optimizer,
+                milestones=lr_milestones,
+                gamma=getattr(config, "scheduler_gamma", 0.1),
+                **warmup_kwargs,
+            )
+        elif scheduler_type == "cos":
+            t_max_epochs = getattr(config, "lr_cosine_tmax_epochs", max(1, getattr(config, "epochs", 100) - getattr(config, "lr_warmup_epochs", 0)))
+            t_max = max(1, int(t_max_epochs * steps_per_epoch))
+            lr_scheduler = WarmupCosineLR(
+                optimizer=optimizer,
+                T_max=t_max,
+                eta_min=getattr(config, "lr_cosine_eta_min", 1e-6),
+                **warmup_kwargs,
+            )
+        elif scheduler_type == "cos_restart":
+            t0_epochs = getattr(config, "lr_cosine_restart_t0_epochs", 10)
+            T_0 = max(1, int(t0_epochs * steps_per_epoch))
+            lr_scheduler = WarmupCosineAnnealingWarmRestarts(
+                optimizer=optimizer,
+                T_0=T_0,
+                T_mult=getattr(config, "lr_cosine_restart_t_mult", 2),
+                eta_min=getattr(config, "lr_cosine_eta_min", 1e-6),
+                **warmup_kwargs,
+            )
+        else:
+            raise ValueError(f"Unsupported lr_scheduler_type: {scheduler_type}")
+    # use_deepspeed == True 时，lr_scheduler 使用 deepspeed.initialize 返回的对象或 None
     # ======================
     # 损失函数
     # ======================
@@ -735,12 +837,13 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         elif encoder_state is not None and getattr(args, "encoder_path", None) and is_logger:
             print(f"[Encoder] 跳过从 resume checkpoint 加载 encoder，使用外部提供的 {args.encoder_path}。")
 
-        # Optimizer / scheduler
-        try:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        except Exception as e:
-            if is_logger:
-                print(f"[Resume] 跳过 optimizer_state_dict 加载：{e}")
+        # 仅非 DeepSpeed 时恢复外部 optimizer
+        if (not use_deepspeed) and (optimizer is not None):
+            try:
+                optimizer.load_state_dict(checkpoint.get('optimizer_state_dict', {}))
+            except Exception as e:
+                if is_logger:
+                    print(f"[Resume] 跳过 optimizer_state_dict 加载：{e}")
 
         data_dict = checkpoint.get('data_dict', None)
         start_epoch = int(checkpoint.get('epoch', -1)) + 1
@@ -752,7 +855,14 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             print("未提供 resume 路径，或路径无效，将从头开始训练。")
 
     amp_enabled = bool(use_amp) and (device.type == 'cuda')
-    optimizer.zero_grad(set_to_none=True)
+    if use_deepspeed:
+        model.zero_grad()
+    else:
+        optimizer.zero_grad(set_to_none=True)
+
+    # ========= 关键：初始化“最佳指标缓存” =========
+    best_epoch_metrics = None
+    best_epoch_index = 0
 
     # ======================
     # 核心训练循环
@@ -760,9 +870,13 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     try:
         for epoch in range(start_epoch, config.epochs):
             vis_now = (is_logger and ((epoch + 1) % args.vis_freq == 0))
+
+            # DeepSpeed 下避免把 encoder 绕过引擎；非 DS 与原来一致
+            encoder_for_loop = None if use_deepspeed else (encoder_model if encoder_model is not None else None)
+
             stats, best_val_loss, stop_flag = train_one_epoch(
                 model=model,
-                encoder=encoder_model if encoder_model is not None else None,
+                encoder=encoder_for_loop,
                 optimizer=optimizer,
                 criterion=criterion,
                 train_loader=train_loader,
@@ -801,6 +915,9 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                 encoder_frozen=not any(p.requires_grad for p in encoder_model.parameters()) if encoder_model else True,
                 train_encoder=config.train_encoder,
                 tb_writer=tb_writer,
+                # ==== 关键：把 DeepSpeed 引擎传入 ====
+                engine=(model if use_deepspeed else None),
+                use_deepspeed=use_deepspeed,
             )
 
             if (
@@ -849,30 +966,6 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             tb_writer.close()
 
     return model, best_val_loss
-
-
-class TransformedSubset(Subset):
-    def __init__(self, dataset, transform=None):
-        if hasattr(dataset, 'indices'):
-            super().__init__(dataset.dataset, dataset.indices)
-        else:
-            super().__init__(dataset, list(range(len(dataset))))
-        self.transform = transform
-
-    def _get_single(self, index: int):
-        sample = self.dataset[self.indices[index]]
-        sample = {**sample, 'idx': index}
-        if self.transform:
-            return self.transform(sample)
-        return sample
-
-    def __getitem__(self, index):
-        if isinstance(index, list):
-            return [self._get_single(i) for i in index]
-        return self._get_single(index)
-
-    def __getitems__(self, idx: list[int]):
-        return [self._get_single(index) for index in idx]
 
 
 def run_inference(n_args):
