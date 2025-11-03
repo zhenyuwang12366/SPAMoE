@@ -257,9 +257,7 @@ class MOEOperator(BaseModel, name='MOE'):
         if self.moe_mode == 'velocity_type' and (self.v_type_num is None or self.v_type_num <= 0):
             self.v_type_num = len(experts)
 
-        # 专家列表（索引即身份）
         self.experts = nn.ModuleList(experts)
-
         # >>> 显存管理透明代理（开关可由 config 控制）
         use_proxy = self.config.get('use_expert_memory_proxy', True)
         self.expert_proxy: Optional[ExpertMemoryProxy] = None
@@ -268,12 +266,9 @@ class MOEOperator(BaseModel, name='MOE'):
                 experts=list(self.experts),
                 device=self.config.get('device', 'cuda'),
                 cache_size=self.config.get('expert_cache_size', 2),
-                amp_dtype=(torch.float16 if self.config.get('proxy_fp16', True) else None),
-                convert_param_dtype_on_gpu=self.config.get('proxy_convert_param_dtype', True),
-                safety_ratio=self.config.get('proxy_safety_ratio', 1.2),
-                measure_on_first_use=self.config.get('proxy_measure_on_first_use', True),
+                amp_dtype=torch.bfloat32,
             )
-
+        
         # 派生属性
         if self.moe_mode == 'velocity_type':
             self.num_experts = len(experts)

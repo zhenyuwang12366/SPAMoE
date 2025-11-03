@@ -28,7 +28,7 @@ class SeismicMOEConfig(Default):
     W_size = 256
     concat_channels = True
     moe_mode = 'standard'    # standard: 直接专家模式, group: 分组模式, velocity_type: 速度图类型模式
-    use_gpu_proxy = False
+    use_gpu_proxy = True
     train_encoder = False
     use_encoder = True
     draw_enc_pic = False

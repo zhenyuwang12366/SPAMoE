@@ -128,6 +128,11 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     experts_name_str = runtime_ctx["experts_name_str"]
     use_amp = config.use_amp
 
+    # <<< 新增：DeepSpeed 必须把当前进程绑定到自己的 GPU >>>
+    if use_deepspeed:
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    
     # ======================
     # 数据加载（Zarr 或文件）
     # ======================

@@ -33,12 +33,12 @@ class ExpertMemoryProxy:
         # CPU 常驻（不改变 experts 顺序/绑定）
         self.cpu_experts: List[torch.nn.Module] = []
         for m in experts:
-            m = m.cpu()
+            m = m.cpu().copy()
             m.eval()
             for p in m.parameters():
                 p.requires_grad_(False)
             self.cpu_experts.append(m)
-
+        
         # GPU LRU 缓存：idx -> model
         self.gpu_cache: OrderedDict[int, torch.nn.Module] = OrderedDict()
         # 每个专家上卡显存估计（字节）

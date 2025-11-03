@@ -21,6 +21,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 nohup bash scripts/run_distributed_seismic_moe.sh \
   --mode train \
   --use_deepspeed \
+  --use_gpu_proxy \
   --model_name moe_group_sum \
   --num_gpus 4 \
   --num_workers 64 \
@@ -32,7 +33,7 @@ nohup bash scripts/run_distributed_seismic_moe.sh \
   --output_dir ../results \
   --use_moe \
   --use_experts_path /root/autodl-tmp/other_experts \
-  --top_k 10 \
+  --top_k 2 \
   --moe_mode group \
   --router_type basic \
   --fusion_type basic \
