@@ -23,8 +23,8 @@ nohup bash scripts/run_distributed_seismic_moe.sh \
   --use_deepspeed \
   --use_gpu_proxy \
   --model_name moe_group_sum \
-  --num_gpus 4 \
-  --num_workers 64 \
+  --num_gpus 6 \
+  --num_workers 96 \
   --zarr_path /root/autodl-tmp/all.zarr \
   --status_json ./dataset_status/dataset_status.json \
   --family all \
