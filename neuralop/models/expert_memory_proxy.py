@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import gc
 import torch
 import copy
 import contextlib
@@ -18,10 +19,10 @@ class ExpertMemoryProxy:
         experts: List[torch.nn.Module],
         device: str | torch.device = "cuda",
         cache_size: int = 2,
-        amp_dtype: Optional[torch.dtype] = torch.float16,  # 可设为 torch.bfloat16 或 None
-        convert_param_dtype_on_gpu: bool = True,           # 上卡后将权重/缓冲也转 dtype 进一步省显存
-        safety_ratio: float = 1.20,                        # 动态显存判断的安全系数
-        measure_on_first_use: bool = True,                 # 首次精测该专家的上卡显存占用
+        amp_dtype: Optional[torch.dtype] = torch.float16,
+        convert_param_dtype_on_gpu: bool = True,
+        safety_ratio: float = 1.20,
+        measure_on_first_use: bool = True,
     ):
         self.device = torch.device(device)
         self.cache_size = int(cache_size)
@@ -30,19 +31,28 @@ class ExpertMemoryProxy:
         self.safety_ratio = float(safety_ratio)
         self.measure_on_first_use = bool(measure_on_first_use)
 
-        # CPU 常驻（不改变 experts 顺序/绑定）
         self.cpu_experts: List[torch.nn.Module] = []
-        for m in experts:
-            m = m.cpu().copy()
-            m.eval()
-            for p in m.parameters():
-                p.requires_grad_(False)
-            self.cpu_experts.append(m)
-        
-        # GPU LRU 缓存：idx -> model
         self.gpu_cache: OrderedDict[int, torch.nn.Module] = OrderedDict()
-        # 每个专家上卡显存估计（字节）
         self.model_mem_est: Dict[int, int] = {}
+
+        # ======= 主迁移与释放 =======
+        for idx, m in enumerate(experts):
+            # 把专家移到 CPU 并冻结
+            m_cpu = m.to("cpu", non_blocking=True)
+            m_cpu.eval()
+            for p in m_cpu.parameters():
+                p.requires_grad_(False)
+
+            # 存储副本
+            self.cpu_experts.append(m_cpu)
+
+            # 立刻释放原 experts[idx] 的 GPU 显存
+            del experts[idx]
+            del m  # 删除 GPU 变量引用
+
+        # 手动触发垃圾回收 + 清缓存
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # -------- 内部工具 --------
 
