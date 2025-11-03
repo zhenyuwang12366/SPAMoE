@@ -266,7 +266,7 @@ class MOEOperator(BaseModel, name='MOE'):
                 experts=list(self.experts),
                 device=self.config.get('device', 'cuda'),
                 cache_size=self.config.get('expert_cache_size', 2),
-                amp_dtype=torch.bfloat32,
+                amp_dtype=torch.bfloat16,
             )
         
         # 派生属性
