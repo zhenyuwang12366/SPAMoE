@@ -1,29 +1,23 @@
 #!/bin/bash
-
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOGDIR=logs
-mkdir -p $LOGDIR
-LOGFILE=$LOGDIR/seismic_moe_${TIMESTAMP}.log
-
-# === 进入工作目录（如果未用 sbatch --chdir） ===
-#cd /data1/home/teacher/teacher_s/t108790/FWINO_wzy || exit
-
-# === 激活 Conda 虚拟环境 ===
 . "/root/miniconda3/etc/profile.d/conda.sh"
 conda activate seismic_moe
 
-# === 打印验证信息（可选）===
-echo "当前 Python: $(which python)"
-python -c "import torch; print('PyTorch 版本:', torch.__version__)"
-
-# === 启动训练 ===
+export PATH="$CONDA_PREFIX/bin:$PATH"
+export MKL_THREADING_LAYER=GNU
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-nohup bash scripts/run_distributed_seismic_moe.sh \
+
+LOGDIR=logs
+mkdir -p "$LOGDIR"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+LOGFILE="$LOGDIR/deepspeed_${TIMESTAMP}.log"
+
+echo "Using DeepSpeed from: $(which deepspeed)"
+nohup deepspeed --num_gpus=4 scripts/train_seismic_moe.py \
   --mode train \
   --use_deepspeed \
-  --model_name moe_group_sum \
-  --num_gpus 4 \
-  --num_workers 64 \
+  --ds_config ./configs/deepspeed_zero3.json \
   --zarr_path /root/autodl-tmp/all.zarr \
   --status_json ./dataset_status/dataset_status.json \
   --family all \
@@ -47,6 +41,6 @@ nohup bash scripts/run_distributed_seismic_moe.sh \
   --lambda_g2v 0.35339805101397564 \
   --lambda_grad_l1 0.15 \
   --lambda_fourier_mag_l1 0.05 \
-  --use_amp \
-  > "$LOGFILE" 2>&1 &
-echo "ddp训练已启动，日志记录在：$LOGFILE"
+  --use_amp > "$LOGFILE" 2>&1 &
+
+echo "DeepSpeed 启动完成，日志：$LOGFILE"

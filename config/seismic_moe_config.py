@@ -326,10 +326,10 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
+                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
                 'conv_kind': 'dwt',
-                'wavelet': 'db6',
+                'wavelet': 'coif4',
                 'biort': 'near_sym_b',
                 'qshift': 'qshift_b',
                 'n_layers': 4,
@@ -340,10 +340,10 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
+                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
                 'conv_kind': 'dwt',
-                'wavelet': 'db6',
+                'wavelet': 'coif4',
                 'biort': 'near_sym_b',
                 'qshift': 'qshift_b',
                 'n_layers': 4,
@@ -354,10 +354,10 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
+                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
                 'conv_kind': 'dwt',
-                'wavelet': 'db6',
+                'wavelet': 'coif4',
                 'biort': 'near_sym_b',
                 'qshift': 'qshift_b',
                 'n_layers': 4,
@@ -368,10 +368,10 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
+                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
                 'conv_kind': 'dwt',
-                'wavelet': 'db6',
+                'wavelet': 'coif4',
                 'biort': 'near_sym_b',
                 'qshift': 'qshift_b',
                 'n_layers': 4,
@@ -382,10 +382,10 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
+                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
                 'conv_kind': 'dwt',
-                'wavelet': 'db6',
+                'wavelet': 'coif4',
                 'biort': 'near_sym_b',
                 'qshift': 'qshift_b',
                 'n_layers': 4,
@@ -396,10 +396,10 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
+                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
                 'conv_kind': 'dwt',
-                'wavelet': 'db6',
+                'wavelet': 'coif4',
                 'biort': 'near_sym_b',
                 'qshift': 'qshift_b',
                 'n_layers': 4,
@@ -410,10 +410,10 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
+                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
                 'conv_kind': 'dwt',
-                'wavelet': 'db6',
+                'wavelet': 'coif4',
                 'biort': 'near_sym_b',
                 'qshift': 'qshift_b',
                 'n_layers': 4,
@@ -424,10 +424,10 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
+                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
                 'conv_kind': 'dwt',
-                'wavelet': 'db6',
+                'wavelet': 'coif4',
                 'biort': 'near_sym_b',
                 'qshift': 'qshift_b',
                 'n_layers': 4,
@@ -438,10 +438,10 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
+                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
                 'conv_kind': 'dwt',
-                'wavelet': 'db6',
+                'wavelet': 'coif4',
                 'biort': 'near_sym_b',
                 'qshift': 'qshift_b',
                 'n_layers': 4,
@@ -452,10 +452,10 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
+                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
                 'conv_kind': 'dwt',
-                'wavelet': 'db6',
+                'wavelet': 'coif4',
                 'biort': 'near_sym_b',
                 'qshift': 'qshift_b',
                 'n_layers': 4,

@@ -40,6 +40,7 @@ from neuralop.data.dataloader.zarr_seismic_dataloader import build_loaders
 from neuralop.models.encoder import get_encoder
 from neuralop.models.moe import MOEOperator
 from neuralop.models.expert_factory import ExpertFactory
+from neuralop.models.EMO import EMO
 from neuralop.losses import L1L2Loss, SobelLoss, FourierMag_L1
 from neuralop.layers.spectral_convolution import SpectralConv
 from tltorch.factorized_tensors.core import FactorizedTensor
@@ -182,6 +183,7 @@ def run_training_deepspeed(args):
     experts_name_str = runtime_ctx["experts_name_str"]
 
     # -------- 数据准备（与你原逻辑一致）--------
+    data_dict = None
     if getattr(args, "zarr_path", None) or getattr(config, "zarr_path", None):
         zarr_path = getattr(args, "zarr_path", None) or getattr(config, "zarr_path", None)
         json_path = getattr(args, "status_json", None) or getattr(config, "status_json", None)
@@ -418,41 +420,59 @@ def run_training_deepspeed(args):
     # -------- 在 DeepSpeed 初始化之前，打 SpectralConv 修复补丁 --------
     patch_spectral_conv_dtype_fix(moe_model, verbose=is_logger)
 
-    # -------- 组合模型（Encoder bf16，MoE FP32）--------
-    class CombinedModel(torch.nn.Module):
-        def __init__(self, enc, moe, train_encoder: bool, device: torch.device):
+    # -------- 组合模型（与 train_seismic_moe.py 一致）--------
+    emo_model = EMO(
+        encoder_model if config.use_encoder else None,
+        moe_model,
+        pass_encoder_logits_as_weights=True,
+    )
+
+    if encoder_freeze and emo_model.encoder is not None:
+        emo_model.freeze_encoder()
+    elif emo_model.encoder is not None:
+        if config.train_encoder:
+            emo_model.encoder.train()
+        else:
+            emo_model.encoder.eval()
+
+    class DeepSpeedEMOWrapper(torch.nn.Module):
+        def __init__(self, emo: EMO, device: torch.device, train_encoder: bool):
             super().__init__()
-            self.enc = enc
-            self.moe = moe
-            self.train_encoder = train_encoder
+            self.emo = emo
             self.device = device
+            self.train_encoder = train_encoder
+
+        @property
+        def moe(self):
+            return self.emo.moe
 
         def forward(self, batch):
             x = batch['input']
             y = batch.get('output', None)
-            labels = batch.get('labels', None)
+            labels = None
 
+            encoder = self.emo.encoder
             logits = None
-            # 1) 仅 Encoder 在 bf16 autocast 下运行
-            if self.enc is not None:
+            if encoder is not None:
                 with torch.amp.autocast(device_type=_autocast_device_str(self.device), dtype=torch.bfloat16, enabled=True):
-                    feat, logits, _ = self.enc(x)  # 计算发生在 bf16
-                x = feat.float()  # 回到 FP32，避免后续 bf16 传染到 MoE
+                    feat, logits, _ = encoder(x)
+                x = feat.float()
             else:
                 x = x.float()
 
-            # 2) MoE/主干在 FP32 小岛中运行（显式禁用 AMP）
             with torch.amp.autocast(device_type=_autocast_device_str(self.device), enabled=False):
-                pred, aux_loss = self.moe(x, logits)  # 全程 FP32
+                pred, aux_loss = self.emo.moe(x, logits)
+
             if self.train_encoder:
+                labels = batch.get('v_type', batch.get('labels', None))
                 return pred, y, logits, labels, aux_loss
             return pred, y, aux_loss
 
     train_encoder_flag = bool(
-        config.use_encoder and (encoder_model is not None) and
-        (config.train_encoder or any(p.requires_grad for p in encoder_model.parameters()))
+        emo_model.encoder is not None and
+        (config.train_encoder or any(p.requires_grad for p in emo_model.encoder.parameters()))
     )
-    model_for_engine = CombinedModel(encoder_model if config.use_encoder else None, moe_model, train_encoder_flag, device=device)
+    model_for_engine = DeepSpeedEMOWrapper(emo_model, device=device, train_encoder=train_encoder_flag)
 
     # ======================= DeepSpeed：AdamW+WarmupCosineLR（比例），并强制关闭全局 AMP =======================
 
@@ -571,6 +591,7 @@ def run_training_deepspeed(args):
             return {"loss": total, "l1": loss_dict["l1"], "l2": loss_dict["l2"]}
 
     metrics = SeismicMetrics()
+    use_wandb = bool(getattr(args, "use_wandb", False) and wandb is not None)
 
     # -------- 输出目录 / 日志（修复：rank0 创建，所有 rank barrier）--------
     def _slugify(text: str) -> str:
@@ -612,6 +633,9 @@ def run_training_deepspeed(args):
             json.dump((config.to_dict() if hasattr(config, "to_dict") else vars(config)), f, indent=2, default=str)
         with open(results_dir / "args.json", "w", encoding="utf-8") as f:
             json.dump(vars(args), f, indent=2, default=str)
+        if data_dict is not None:
+            with open(results_dir / "data_stats.json", "w", encoding="utf-8") as f:
+                json.dump(data_dict, f, indent=2, default=float)
         header = ("    Epoch    |    Train Loss    |    Val Loss    |    MAE    |    MSE    |    PSNR    |    RMSE    |    SSIM    |    CE    |\n"
                   if train_encoder_flag else
                   "    Epoch    |    Train Loss    |    Val Loss    |    MAE    |    MSE    |    PSNR    |    RMSE    |    SSIM    |\n")
@@ -651,7 +675,18 @@ def run_training_deepspeed(args):
                 train_loader.sampler.set_epoch(epoch)
 
             # Train
-            run_train = {"loss": 0.0}
+            aux_coef = 0.01
+            train_total = 0.0
+            train_base = 0.0
+            train_aux = 0.0
+            train_l1 = 0.0
+            train_l2 = 0.0
+            train_ce = 0.0
+            train_steps = 0
+            type_weight_hist_sample = None
+            max_hist_samples = 65536
+            lr_this_epoch = None
+
             train_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs}", leave=False, disable=not is_logger)
             for step, batch in enumerate(train_iter):
                 batch = _to_device(batch, engine.device)
@@ -659,50 +694,108 @@ def run_training_deepspeed(args):
                 if train_encoder_flag:
                     pred, y, logits, labels, aux_loss = out
                     loss_dict = criterion(pred, y, logits, labels)
+                    if is_logger and type_weight_hist_sample is None and logits is not None:
+                        flat = logits.detach().float().cpu().reshape(-1)
+                        if flat.numel() > max_hist_samples:
+                            flat = flat[:max_hist_samples]
+                        type_weight_hist_sample = flat
                 else:
                     pred, y, aux_loss = out
                     loss_dict = criterion(pred, y)
+                    logits = None
+                    labels = None
                 if aux_loss is None:
                     aux_loss = pred.new_zeros(())
-                loss = loss_dict["loss"] + 0.01 * aux_loss
-                engine.backward(loss)
-                engine.step()      # 调度器由 DeepSpeed 内部推进
-                step_loss = float(loss.detach().item())
-                run_train["loss"] += step_loss
-                if is_logger:
-                    train_iter.set_postfix(train_loss=f"{step_loss:.6f}")
+                total_loss = loss_dict["loss"] + aux_coef * aux_loss
+                if not torch.isfinite(total_loss):
+                    raise RuntimeError(f"Encountered non-finite loss at step {step}: {total_loss.item()}")
 
-            num_steps = max(1, step + 1)
-            train_loss = run_train["loss"] / num_steps
+                engine.backward(total_loss)
+                engine.step()      # 调度器由 DeepSpeed 内部推进
+
+                step_total = float(total_loss.detach().item())
+                train_total += step_total
+                train_base += float(loss_dict["loss"].detach().item())
+                train_aux += float(aux_loss.detach().item())
+                if "l1" in loss_dict:
+                    train_l1 += float(loss_dict["l1"])
+                if "l2" in loss_dict:
+                    train_l2 += float(loss_dict["l2"])
+                if train_encoder_flag and "ce" in loss_dict:
+                    train_ce += float(loss_dict["ce"])
+                train_steps += 1
+
+                lr_list = engine.get_lr() if hasattr(engine, "get_lr") else None
+                if lr_list:
+                    lr_this_epoch = float(lr_list[0])
+                elif engine.optimizer is not None and engine.optimizer.param_groups:
+                    lr_this_epoch = float(engine.optimizer.param_groups[0]["lr"])
+
+                if is_logger:
+                    postfix = {"train_loss": f"{step_total:.6f}"}
+                    if train_encoder_flag and "ce" in loss_dict:
+                        postfix["ce"] = f"{float(loss_dict['ce']):.4f}"
+                    train_iter.set_postfix(postfix)
+
+            num_steps = max(1, train_steps)
+            avg_train_loss = train_total / num_steps
+            avg_train_base = train_base / num_steps
+            avg_train_aux = train_aux / num_steps
+            avg_train_l1 = train_l1 / num_steps if num_steps > 0 else 0.0
+            avg_train_l2 = train_l2 / num_steps if num_steps > 0 else 0.0
+            avg_train_ce = train_ce / num_steps if (train_encoder_flag and num_steps > 0) else 0.0
 
             # ---------- Val ----------
             engine.eval()
             with torch.no_grad():
                 # 累加“和”方便跨卡规约
-                sum_meter = {"loss": 0.0, "mae": 0.0, "mse": 0.0, "psnr": 0.0, "rmse": 0.0, "ssim": 0.0}
+                sum_loss = 0.0
+                sum_l1 = 0.0
+                sum_l2 = 0.0
+                sum_psnr = 0.0
+                sum_rmse = 0.0
+                sum_ssim = 0.0
+                sum_ce = 0.0
                 cnt_batches = 0
 
                 val_iter = tqdm(val_loader, desc=f"Eval {epoch+1}/{config.epochs}", leave=False, disable=not is_logger)
                 for vstep, vbatch in enumerate(val_iter):
                     vbatch = _to_device(vbatch, engine.device)
                     out = engine(vbatch)
-                    pred, y = out[0], out[1]
+                    if train_encoder_flag:
+                        pred, y, logits, labels, _ = out
+                        loss_dict = criterion(pred, y, logits, labels)
+                    else:
+                        pred, y, _ = out
+                        loss_dict = criterion(pred, y)
                     res = metrics(pred, y)
-                    for k in sum_meter:
-                        sum_meter[k] += float(res.get(k, 0.0))
+                    sum_loss += float(loss_dict["loss"])
+                    sum_l1 += float(loss_dict["l1"])
+                    sum_l2 += float(loss_dict["l2"])
+                    sum_psnr += float(res.get("psnr", 0.0))
+                    sum_rmse += float(res.get("rmse", 0.0))
+                    sum_ssim += float(res.get("ssim", 0.0))
+                    if train_encoder_flag:
+                        sum_ce += float(loss_dict.get("ce", 0.0))
                     cnt_batches += 1
                     if is_logger:
                         val_iter.set_postfix(
-                            val_loss=f"{float(res.get('loss', 0.0)):.6f}",
-                            mae=f"{float(res.get('mae', 0.0)):.4f}",
+                            val_loss=f"{float(loss_dict['loss']):.6f}",
+                            mae=f"{float(loss_dict['l1']):.4f}",
                             psnr=f"{float(res.get('psnr', 0.0)):.2f}"
                         )
 
                 # 本 rank 的求和与计数
-                local_sums = torch.tensor(
-                    [sum_meter["loss"], sum_meter["mae"], sum_meter["mse"], sum_meter["psnr"], sum_meter["rmse"], sum_meter["ssim"]],
-                    dtype=torch.float64, device=engine.device
-                )
+                if train_encoder_flag:
+                    local_sums = torch.tensor(
+                        [sum_loss, sum_l1, sum_l2, sum_psnr, sum_rmse, sum_ssim, sum_ce],
+                        dtype=torch.float64, device=engine.device
+                    )
+                else:
+                    local_sums = torch.tensor(
+                        [sum_loss, sum_l1, sum_l2, sum_psnr, sum_rmse, sum_ssim],
+                        dtype=torch.float64, device=engine.device
+                    )
                 local_cnt = torch.tensor([cnt_batches], dtype=torch.float64, device=engine.device)
 
                 # 跨 rank 规约：SUM
@@ -718,15 +811,129 @@ def run_training_deepspeed(args):
                 val_psnr = float(local_sums[3].item() / denom)
                 val_rmse = float(local_sums[4].item() / denom)
                 val_ssim = float(local_sums[5].item() / denom)
+                val_ce = float(local_sums[6].item() / denom) if train_encoder_flag else 0.0
+
+            epoch_step = epoch + 1
+
+            # TensorBoard logging (rank0)
+            if tb_writer is not None and is_logger:
+                tb_writer.add_scalar("train/epoch_loss", avg_train_loss, epoch_step)
+                tb_writer.add_scalar("train/base_loss", avg_train_base, epoch_step)
+                tb_writer.add_scalar("train/epoch_aux_loss", avg_train_aux, epoch_step)
+                tb_writer.add_scalar("train/l1", avg_train_l1, epoch_step)
+                tb_writer.add_scalar("train/l2", avg_train_l2, epoch_step)
+                if train_encoder_flag:
+                    tb_writer.add_scalar("train/ce", avg_train_ce, epoch_step)
+                tb_writer.add_scalar("val/loss", val_loss, epoch_step)
+                tb_writer.add_scalar("val/mae", val_mae, epoch_step)
+                tb_writer.add_scalar("val/mse", val_mse, epoch_step)
+                tb_writer.add_scalar("val/psnr", val_psnr, epoch_step)
+                tb_writer.add_scalar("val/rmse", val_rmse, epoch_step)
+                tb_writer.add_scalar("val/ssim", val_ssim, epoch_step)
+                if train_encoder_flag:
+                    tb_writer.add_scalar("val/ce", val_ce, epoch_step)
+                tb_writer.add_scalars(
+                    "loss/epoch",
+                    {"train": avg_train_loss, "val": val_loss},
+                    epoch_step,
+                )
+                if lr_this_epoch is not None:
+                    tb_writer.add_scalar("train/learning_rate", lr_this_epoch, epoch_step)
+                if type_weight_hist_sample is not None:
+                    tb_writer.add_histogram("encoder/type_logits", type_weight_hist_sample, epoch_step)
 
             # ---------- 记录到日志（仅 logger 打印/落盘）----------
             if is_logger:
                 if train_encoder_flag:
-                    row = f"{epoch+1:>8d} | {train_loss:>14.6f} | {val_loss:>12.6f} | {val_mae:>8.6f} | {val_mse:>8.6f} | {val_psnr:>8.4f} | {val_rmse:>8.6f} | {val_ssim:>8.6f} | {'-':>6} |\n"
+                    row = f"{epoch_step:>8d} | {avg_train_loss:>14.6f} | {val_loss:>12.6f} | {val_mae:>8.6f} | {val_mse:>8.6f} | {val_psnr:>8.4f} | {val_rmse:>8.6f} | {val_ssim:>8.6f} | {val_ce:>8.6f} |\n"
                 else:
-                    row = f"{epoch+1:>8d} | {train_loss:>14.6f} | {val_loss:>12.6f} | {val_mae:>8.6f} | {val_mse:>8.6f} | {val_psnr:>8.4f} | {val_rmse:>8.6f} | {val_ssim:>8.6f} |\n"
+                    row = f"{epoch_step:>8d} | {avg_train_loss:>14.6f} | {val_loss:>12.6f} | {val_mae:>8.6f} | {val_mse:>8.6f} | {val_psnr:>8.4f} | {val_rmse:>8.6f} | {val_ssim:>8.6f} |\n"
                 with open(log_file, "a", encoding="utf-8") as f:
                     f.write(row)
+
+            if use_wandb and is_logger:
+                wandb_log = {
+                    "epoch": epoch_step,
+                    "train/loss": avg_train_loss,
+                    "train/base_loss": avg_train_base,
+                    "train/aux_loss": avg_train_aux,
+                    "train/l1": avg_train_l1,
+                    "train/l2": avg_train_l2,
+                    "val/loss": val_loss,
+                    "val/mae": val_mae,
+                    "val/mse": val_mse,
+                    "val/psnr": val_psnr,
+                    "val/rmse": val_rmse,
+                    "val/ssim": val_ssim,
+                }
+                if train_encoder_flag:
+                    wandb_log["train/ce"] = avg_train_ce
+                    wandb_log["val/ce"] = val_ce
+                if lr_this_epoch is not None:
+                    wandb_log["train/learning_rate"] = lr_this_epoch
+                wandb.log(wandb_log, step=epoch_step)
+
+            # Router (adamv) validation hook
+            if hasattr(engine, "module") and hasattr(engine.module, "moe"):
+                moe_module = engine.module.moe
+                router = getattr(moe_module, "router", None)
+                router_type = getattr(moe_module, "router_type", "")
+                if router_type == "adamv" and router is not None and hasattr(router, "step_validation"):
+                    signal = router.step_validation(val_loss)
+                    should_break = (signal == "should_break")
+                    if deepspeed.comm.get_world_size() > 1:
+                        flag_tensor = torch.tensor([1 if should_break else 0], device=engine.device, dtype=torch.int64)
+                        deepspeed.comm.all_reduce(flag_tensor, op=deepspeed.comm.ReduceOp.MAX)
+                        should_break = bool(flag_tensor.item())
+                    if should_break:
+                        current_k = int(getattr(router, "k", getattr(router, "top_k", moe_module.top_k)))
+                        new_k = max(1, current_k - 1)
+                        if hasattr(router, "k"):
+                            router.k = new_k
+                        if hasattr(router, "top_k"):
+                            router.top_k = new_k
+                        if hasattr(router, "fixed"):
+                            router.fixed = True
+                        moe_module.top_k = new_k
+                        moe_module.w_k = max(0, moe_module.num_experts - new_k)
+                        if deepspeed.comm.get_world_size() > 1:
+                            shared_k = torch.tensor([new_k], device=engine.device, dtype=torch.int64)
+                            deepspeed.comm.broadcast(shared_k, src=0)
+                            new_k = int(shared_k.item())
+                            if hasattr(router, "k"):
+                                router.k = new_k
+                            if hasattr(router, "top_k"):
+                                router.top_k = new_k
+                            moe_module.top_k = new_k
+                            moe_module.w_k = max(0, moe_module.num_experts - new_k)
+                        if is_logger:
+                            print(f"[Router] AdamV adjust top_k -> {new_k}")
+
+            epoch_metrics = {
+                "epoch": epoch_step,
+                "train_loss": float(avg_train_loss),
+                "train_base_loss": float(avg_train_base),
+                "train_aux_loss": float(avg_train_aux),
+                "train_l1": float(avg_train_l1),
+                "train_l2": float(avg_train_l2),
+                "val_loss": float(val_loss),
+                "mae": float(val_mae),
+                "mse": float(val_mse),
+                "psnr": float(val_psnr),
+                "rmse": float(val_rmse),
+                "ssim": float(val_ssim),
+                "val_mae": float(val_mae),
+                "val_mse": float(val_mse),
+                "val_psnr": float(val_psnr),
+                "val_rmse": float(val_rmse),
+                "val_ssim": float(val_ssim),
+            }
+            if train_encoder_flag:
+                epoch_metrics["train_ce"] = float(avg_train_ce)
+                epoch_metrics["val_ce"] = float(val_ce)
+            if lr_this_epoch is not None:
+                epoch_metrics["learning_rate"] = float(lr_this_epoch)
+            epoch_metrics["router_top_k"] = int(getattr(engine.module.moe, "top_k", 0))
 
             # ---------- 全局同步 best，并在同一把尺子上判定 improved ----------
             if deepspeed.comm.get_world_size() > 1:
@@ -757,13 +964,29 @@ def run_training_deepspeed(args):
                 if is_logger:
                     print(f"[DeepSpeed] saved checkpoint: {save_tag}")
 
-                best_epoch_metrics = {
-                    "train_loss": float(train_loss), "val_loss": float(val_loss),
-                    "mae": float(val_mae), "mse": float(val_mse),
-                    "psnr": float(val_psnr), "rmse": float(val_rmse), "ssim": float(val_ssim),
-                }
+                best_epoch_metrics = dict(epoch_metrics)
                 best_epoch_index = epoch + 1
+                if is_logger:
+                    with open(results_dir / "best_metrics.json", "w", encoding="utf-8") as f:
+                        json.dump(best_epoch_metrics, f, indent=2)
             # ====== 改动点结束 ======
+
+            # 保存最近一次 checkpoint
+            try:
+                engine.save_checkpoint(results_dir.as_posix(), tag="last", save_zero_checkpoint_only=True)
+            except TypeError:
+                engine.save_checkpoint(results_dir.as_posix(), tag="last")
+            if deepspeed.comm.get_world_size() > 1:
+                deepspeed.comm.barrier()
+            if is_logger:
+                with open(results_dir / "last_metrics.json", "w", encoding="utf-8") as f:
+                    json.dump(epoch_metrics, f, indent=2)
+
+            if is_logger:
+                print(
+                    f"[Epoch {epoch_step:03d}] train_loss={avg_train_loss:.6f} "
+                    f"val_loss={val_loss:.6f} psnr={val_psnr:.4f} mae={val_mae:.6f}"
+                )
 
             # 可视化（仅 logger；指标提升或到达周期）
             if is_logger and (improved or ((epoch + 1) % int(getattr(config, "vis_every", 5)) == 0)):
@@ -790,7 +1013,7 @@ def run_training_deepspeed(args):
                         vis_in_v, vis_y_v, vis_pred_v,
                         save_dir=vis_dir, max_samples=num_samples,
                         tb_writer=tb_writer,
-                        wandb_run=(wandb if wandb is not None else None),
+                        wandb_run=(wandb if use_wandb else None),
                         global_step=epoch
                     )
                     if vis_logits is not None:
@@ -809,7 +1032,7 @@ def run_training_deepspeed(args):
                         save_dir=results_dir / f"fourier_analysis_epoch_{epoch+1}",
                         max_samples=num_samples,
                         tb_writer=tb_writer,
-                        wandb_run=(wandb if wandb is not None else None),
+                        wandb_run=(wandb if use_wandb else None),
                         global_step=epoch,
                     )
                 except Exception as _viz_err:
@@ -842,6 +1065,10 @@ def run_training_deepspeed(args):
                         "best/ssim": best_epoch_metrics.get("ssim", float("nan")),
                         "best/epoch": float(best_epoch_index or 0),
                     })
+                    if "val_ce" in best_epoch_metrics:
+                        metric_summary["best/val_ce"] = best_epoch_metrics.get("val_ce", float("nan"))
+                    if "train_ce" in best_epoch_metrics:
+                        metric_summary["best/train_ce"] = best_epoch_metrics.get("train_ce", float("nan"))
                 tb_writer.add_hparams(hparam_summary, metric_summary)
                 print("已写入hparams")
     finally:

@@ -1,7 +1,7 @@
 # scripts/train_seismic_moe.py
 """
 使用MOE（Mixture of Experts）架构训练地震数据的神经算子模型
-支持分布式训练
+支持分布式训练 + DeepSpeed
 """
 import optuna
 import os
@@ -23,13 +23,16 @@ from torch.utils.data import DataLoader, random_split, Subset, DistributedSample
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms import Compose
 
+# >>> DeepSpeed（仅导入，不影响非 DS 路径）
+import deepspeed
+
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import scripts.transforms as T
 from neuralop.models import MOEOperator, ExpertFactory
 from neuralop.models.encoder import get_encoder
-from neuralop.models.EMO import EMO  # <<< NEW: 引入 EMO 封装
+from neuralop.models.EMO import EMO
 from neuralop.layers.spectral_convolution import SpectralConv
 from neuralop.data.datasets import SeismicDataset, ZarrSeismicDataset
 from neuralop.data.dataloader.zarr_seismic_dataloader import build_loaders
@@ -41,23 +44,18 @@ from scripts.scheduler import (
 )
 from neuralop.losses import L1L2Loss, SobelLoss, FourierMag_L1
 from utils import *
-# 假定以下工具存在：get_seismic_config, load_encoder_weights, load_moe_experts, train_one_epoch, EarlyStopping,
+# 需存在的工具：get_seismic_config, load_encoder_weights, load_moe_experts, train_one_epoch, EarlyStopping,
 # plot_loss_curve, safe_random_split, patch_spectral_conv_forward, SeismicMetrics,
 # visualize_results, analyze_fourier_domain, visualize_encoded, save_type_predictions_txt,
 # build_argparser_and_parse
 
 print("-----------------------------------------------------------")
-
 patch_spectral_conv_forward(SpectralConv)
 
 # =========================
 # ONLY-ROUTER LOADER UTILS
 # =========================
 def _filter_state_by_prefix(sd: Dict[str, torch.Tensor], prefixes) -> Dict[str, torch.Tensor]:
-    """
-    从 state_dict 中筛选出以给定前缀开头的键。
-    prefixes: str 或 (str, ...)
-    """
     if isinstance(prefixes, str):
         prefixes = (prefixes,)
     keep = {}
@@ -68,10 +66,6 @@ def _filter_state_by_prefix(sd: Dict[str, torch.Tensor], prefixes) -> Dict[str, 
 
 
 def _load_router_weights(model: nn.Module, router_path: Union[str, Path], map_location="cpu", is_logger=False):
-    """
-    从 router_path 加载路由器/门控模块相关权重到 MOE 模型（strict=False，仅注入路由器相关参数）。
-    注意：这里的 model 是 EMO 或 MOEOperator，二者都兼容 .load_state_dict
-    """
     router_path = str(router_path)
     ckpt = torch.load(router_path, map_location=map_location, weights_only=False)
     sd = (ckpt.get("router_state_dict")
@@ -81,7 +75,6 @@ def _load_router_weights(model: nn.Module, router_path: Union[str, Path], map_lo
     if not isinstance(sd, dict):
         raise ValueError(f"无法从 {router_path} 提取可用的 state_dict。")
 
-    # 根据你的 MOEOperator 的真实模块名前缀调整
     router_prefixes = ("router.", "gate.", "routing.", "router_net.", "router_module.")
     router_sd = _filter_state_by_prefix(sd, router_prefixes)
 
@@ -95,22 +88,17 @@ def _load_router_weights(model: nn.Module, router_path: Union[str, Path], map_lo
 
 
 def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
-    """
-    训练地震数据的MOE模型
-
-    Parameters
-    ----------
-    args : argparse.Namespace
-        命令行参数
-    """
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     config, runtime_ctx = get_seismic_config(args)
 
+    use_deepspeed: bool = bool(getattr(args, "use_deepspeed", False))
+    ds_config = getattr(args, "ds_config", None)
+
     device = runtime_ctx["device"]
     is_logger = runtime_ctx["is_logger"]
     world_size = runtime_ctx["world_size"]
-    local_rank = runtime_ctx["local_rank"]
+    local_rank = args.local_rank if use_deepspeed else runtime_ctx["local_rank"]
     experts_name = runtime_ctx["experts_name"]
     experts_name_str = runtime_ctx["experts_name_str"]
     use_amp = config.use_amp
@@ -121,9 +109,9 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     if args.zarr_path is not None:
         json_path = getattr(args, 'status_json', None)
         assert json_path is not None, "使用zarr数据集格式，需要指定归一化统计量json"
-        # 1) 构建 train/val 两个 Zarr 数据集（直接按 splits 读取，不再 random_split）
+
         zarr_path = getattr(args, 'zarr_path', None)
-        assert zarr_path is not None, "使用zarr数据格式时请在 args.zarr_path 指定 seismic_moe.zarr 路径"
+        assert zarr_path is not None, "使用zarr数据格式时请在 args.zarr_path 指定路径"
 
         with open(json_path, 'r') as f:
             data_dict_raw = json.load(f)
@@ -133,17 +121,18 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         else:
             data_dict = data_dict_raw['per_type'][config.family]
 
-        # 创建数据处理器
         from neuralop.data.datasets.seismic_dataset import SeismicDataProcessor
         input_transform = Compose([
             T.LogTransform(k=args.k),
-            T.MinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k))
-        ])  # data
+            T.MinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k),
+                              T.log_transform(data_dict['input_max'], k=args.k))
+        ])
         output_transform = Compose([
             T.MinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
-        ])  # model
+        ])
         input_inverse_transform = Compose([
-            T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k)),
+            T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k),
+                                     T.log_transform(data_dict['input_max'], k=args.k)),
             T.InverseLogTransform(k=args.k)
         ])
         output_inverse_transform = Compose([
@@ -194,7 +183,6 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         else:
             raise ValueError("不支持的 family")
 
-        # 创建完整数据集
         full_dataset = SeismicDataset(
             data_dir=config.data_dir,
             family=config.family,
@@ -204,9 +192,8 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             config=config
         )
 
-        # 分割数据集为训练集和验证集
         dataset_size = len(full_dataset)
-        train_size, val_size = safe_random_split(dataset_size, [1-val_ratio, val_ratio])
+        train_size, val_size = safe_random_split(dataset_size, [1 - val_ratio, val_ratio])
 
         if is_logger:
             print(f"数据集总大小: {dataset_size}")
@@ -229,24 +216,27 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                 print(f"警告：训练集和验证集有{len(overlap)}个重叠样本！")
             else:
                 print("验证成功：训练集和验证集没有重叠样本")
-            assert len(train_dataset) == train_size, f"训练集大小不匹配：{len(train_dataset)} vs {train_size}"
-            assert len(val_dataset) == val_size, f"验证集大小不匹配：{len(val_dataset)} vs {val_size}"
+            assert len(train_dataset) == train_size
+            assert len(val_dataset) == val_size
 
         from neuralop.data.datasets.seismic_dataset import SeismicDataProcessor
         input_transform = Compose([
             T.LogTransform(k=args.k),
-            T.MinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k))
-        ]) # data
+            T.MinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k),
+                              T.log_transform(data_dict['input_max'], k=args.k))
+        ])
         output_transform = Compose([
             T.MinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
-        ]) # model
+        ])
         input_inverse_transform = Compose([
-            T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k)),
+            T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k),
+                                     T.log_transform(data_dict['input_max'], k=args.k)),
             T.InverseLogTransform(k=args.k)
         ])
         output_inverse_transform = Compose([
             T.InverseMinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
         ])
+
         data_processor = SeismicDataProcessor(
             input_transform=input_transform,
             output_transform=output_transform,
@@ -275,7 +265,6 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                 pin_memory=True,
                 persistent_workers=train_num_workers > 0
             )
-
             val_num_workers = train_num_workers
             val_sampler = DistributedSampler(
                 val_dataset_with_transform,
@@ -302,7 +291,6 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                 pin_memory=True,
                 persistent_workers=train_num_workers > 0
             )
-
             val_loader = DataLoader(
                 val_dataset_with_transform,
                 batch_size=config.test_batch_size,
@@ -317,7 +305,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         if prefetch is not None:
             print(f'prefetch_factor={prefetch}')
 
-    # 检查数据形状
+    # 形状检查
     sample_batch = next(iter(train_loader))
     if is_logger:
         input_shape = sample_batch['input'].shape
@@ -325,11 +313,10 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         print(f"输入张量形状: {input_shape}")
         print(f"输出张量形状: {output_shape}")
         if len(input_shape) < 3 or len(input_shape) > 4:
-            print(f"警告：输入形状不符合预期，应为3D或4D张量，实际为{len(input_shape)}D")
+            print(f"警告：输入形状不符合预期（3D/4D），实际为{len(input_shape)}D")
         if len(output_shape) < 3:
             print(f"警告：输出形状不符合预期，应为3D或更高维张量，实际为{len(output_shape)}D")
 
-    # 获取实际的输入通道数
     in_channels = sample_batch['input'].shape[1]
     config.in_channels = in_channels
 
@@ -361,6 +348,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                 type_act='softmax',
                 backbone=config.backbone,
             )
+
         if getattr(args, "encoder_path", None):
             missing, unexpected = load_encoder_weights(
                 encoder_model,
@@ -387,16 +375,21 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                     if n.startswith("head."):
                         p.requires_grad_(False)
 
-        encoder_model.eval()
-
-        with torch.no_grad():
-            encoder_probe, _, _ = encoder_model(sample_batch['input'])
-        moe_in_channels = encoder_probe.shape[1]
-        del encoder_probe
-        if encoder_freeze:
-            encoder_model.eval()
+        # ====== moe_in_channels 的确定 ======
+        if use_deepspeed:
+            # DS 分支：避免额外前向探针，直接使用已知 out_channels
+            moe_in_channels = 128
         else:
-            encoder_model.train()
+            encoder_model.eval()
+            with torch.no_grad():
+                encoder_probe, _, _ = encoder_model(sample_batch['input'])
+            moe_in_channels = encoder_probe.shape[1]
+            del encoder_probe
+            if encoder_freeze:
+                encoder_model.eval()
+            else:
+                encoder_model.train()
+
         if is_logger:
             print(f"Encoder 输出通道数(供 MoE 使用): {moe_in_channels}")
     else:
@@ -409,6 +402,9 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     # ======================
     # 构建 Experts + MOE
     # ======================
+    # DS 分支关键：专家一律 CPU 加载，防止初始化前显存爆炸
+    experts_map_location = "cpu" if use_deepspeed else device
+
     if config.use_moe and config.use_experts_path:
         experts = load_moe_experts(
             experts_config=config.load_expert_configs,
@@ -417,7 +413,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             hidden_channels=config.hidden_channels,
             model_path=config.use_experts_path,
             is_specific=config.is_specific,
-            map_location=device,
+            map_location=experts_map_location,   # <<< 关键修改
             type_dict=config.type_id,
             moe_mode=config.moe_mode,
         )
@@ -441,32 +437,39 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         moe_mode=getattr(config, "moe_mode", "standard"),
         is_logger=is_logger,
         router_type=config.router_type,
-        s_processor_type = config.s_processor_type,
-        w_processor_type = config.w_processor_type,
-        beta = config.beta,
-        is_specific = config.is_specific,
-        is_classifier = config.is_classifier,
+        s_processor_type=config.s_processor_type,
+        w_processor_type=config.w_processor_type,
+        beta=config.beta,
+        is_specific=config.is_specific,
+        is_classifier=config.is_classifier,
         batch_size=config.batch_size,
         v_type_num=config.v_type_num,
         use_expert_memory_proxy=config.use_gpu_proxy,
-        use_encoder = config.use_encoder,
+        use_encoder=config.use_encoder,
     )
 
     # ======================
-    # 封装为 EMO + SyncBN + DDP
+    # EMO + DDP / DeepSpeed
     # ======================
-    emo_model = EMO(encoder_model, moe_model, pass_encoder_logits_as_weights=True)
-    if config.distributed.use_distributed:
-        emo_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(emo_model).to(device)
-        model = DDP(
-            emo_model, device_ids=[device.index],
-            output_device=device.index,
-            static_graph=False,
-            find_unused_parameters=True,           # 门控/未用分支更稳妥
-            gradient_as_bucket_view=True,
-        )
+    if use_deepspeed:
+        # DS 分支：不要 .to(device)，保持 CPU，让 deepspeed.initialize 接管
+        emo_model = EMO(encoder_model, moe_model, pass_encoder_logits_as_weights=True)
+
+        # 优化器与调度器保留你的配置，稍后交给 DS 托管
+        model = emo_model  # 先占位
     else:
-        model = emo_model.to(device)
+        emo_model = EMO(encoder_model, moe_model, pass_encoder_logits_as_weights=True)
+        if config.distributed.use_distributed:
+            emo_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(emo_model).to(device)
+            model = DDP(
+                emo_model, device_ids=[device.index],
+                output_device=device.index,
+                static_graph=False,
+                find_unused_parameters=True,
+                gradient_as_bucket_view=True,
+            )
+        else:
+            model = emo_model.to(device)
 
     if encoder_model is not None and encoder_freeze:
         encoder_model.eval()
@@ -476,23 +479,20 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     # ======================
     # 优化器 & 调度器
     # ======================
-    # Scale lr according to effective batch size
     if config.distributed.use_distributed and world_size > 2:
         lr = config.learning_rate * math.sqrt(world_size)
     else:
         lr = config.learning_rate
 
-    # 统一从 EMO(或 DDP(EMO)) 中收集需要训练的参数
-    optim_params = [p for p in model.parameters() if p.requires_grad]
+    _param_src = emo_model if use_deepspeed else model
+    optim_params = [p for p in _param_src.parameters() if p.requires_grad]
     assert len(optim_params) > 0, "No trainable parameters collected for optimizer!"
     optimizer = torch.optim.AdamW(optim_params, lr=lr, betas=(0.9, 0.999), weight_decay=config.weight_decay)
 
-    # encoder 是否训练，用于 train_one_epoch 的 grad_ctx
     encoder_requires_grad = False
     if emo_model.encoder is not None:
         encoder_requires_grad = any(p.requires_grad for p in emo_model.encoder.parameters())
 
-    # Convert scheduler to be per iteration instead of per epoch
     steps_per_epoch = max(1, len(train_loader))
     warmup_iters = int(config.lr_warmup_epochs * steps_per_epoch)
     warmup_kwargs = dict(
@@ -511,11 +511,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             **warmup_kwargs,
         )
     elif scheduler_type == "cos":
-        t_max_epochs = getattr(
-            config,
-            "lr_cosine_tmax_epochs",
-            max(1, config.epochs - config.lr_warmup_epochs),
-        )
+        t_max_epochs = getattr(config, "lr_cosine_tmax_epochs", max(1, config.epochs - config.lr_warmup_epochs))
         t_max = max(1, int(t_max_epochs * steps_per_epoch))
         lr_scheduler = WarmupCosineLR(
             optimizer=optimizer,
@@ -535,6 +531,30 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         )
     else:
         raise ValueError(f"Unsupported lr_scheduler_type: {scheduler_type}")
+
+    # DeepSpeed 初始化（托管 model/optimizer/scheduler）
+    if use_deepspeed:
+        ds_init_kwargs = {
+            "model": emo_model,
+            "model_parameters": optim_params,
+            "optimizer": optimizer,
+            "lr_scheduler": lr_scheduler,
+        }
+        if isinstance(ds_config, str) and os.path.isfile(ds_config):
+            ds_init_kwargs["config"] = ds_config
+        elif isinstance(ds_config, dict):
+            ds_init_kwargs["config_params"] = ds_config
+        # 否则走 DeepSpeed 默认，保持最小侵入
+
+        model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(**ds_init_kwargs)
+        model = model_engine  # 之后训练与保存都使用 model（DeepSpeedEngine）
+
+        if is_logger:
+            print("[DeepSpeed] 已启用 DeepSpeed 训练。")
+            try:
+                print(f"[DeepSpeed] Zero Stage: {model.zero_optimization_stage()}")
+            except Exception:
+                pass
 
     # ======================
     # 损失函数
@@ -687,60 +707,51 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         )
 
     # ======================
-    # Resume（保持原逻辑）
+    # Resume（保持原逻辑，兼容 DS）
     # ======================
     start_epoch = 0
     if hasattr(args, "resume_path") and args.resume_path is not None and os.path.exists(args.resume_path):
-        checkpoint = torch.load(args.resume_path, map_location=device, weights_only=False)
-        if args.router_resume_path is not None:
-            router_check = torch.load(args.router_resume_path, map_location=device, weights_only=False)
-        else:
-            router_check = None
-        # 加载模型参数（注意：EMO.state_dict -> 仅 MoE）
-        if config.distributed.use_distributed:
-            if experts_name_str == "all":
-                if router_check is not None:
-                    model.module.moe.router.load_state_dict(router_check)
-                else:
-                    pass
-            else:
-                model.module.moe.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            if experts_name_str == "all":
-                if router_check is not None:
-                    model.moe.router.load_state_dict(router_check)
-                else:
-                    pass
-            else:
-                model.moe.load_state_dict(checkpoint['model_state_dict'])
+        checkpoint = torch.load(args.resume_path, map_location="cpu", weights_only=False)
 
+        # 注意：model 可能是 DDP(EMO) / EMO / DeepSpeedEngine
+        target_model = model.module if hasattr(model, "module") else model
+        target_moe = target_model.moe if hasattr(target_model, "moe") else None
+
+        router_check = checkpoint.get("router_state_dict", None)
+        if target_moe is not None:
+            if experts_name_str == "all":
+                if router_check is not None:
+                    target_moe.router.load_state_dict(router_check, strict=False)
+            else:
+                target_moe.load_state_dict(checkpoint['model_state_dict'], strict=False)
+
+        # Encoder
         encoder_state = checkpoint.get('encoder_state_dict')
-        if emo_model.encoder is not None and encoder_state is not None and not getattr(args, "encoder_path", None):
-            encoder_target = model.module.encoder if (config.distributed.use_distributed and hasattr(model, "module")) else model.encoder
+        if hasattr(target_model, "encoder") and (encoder_state is not None) and not getattr(args, "encoder_path", None):
+            encoder_target = target_model.encoder
             missing, unexpected = load_encoder_weights(encoder_target, encoder_state, strict=False)
             if is_logger and (missing or unexpected):
                 print(f"[Encoder] Resume 加载缺失参数: {missing}, 多余参数: {unexpected}")
         elif encoder_state is not None and getattr(args, "encoder_path", None) and is_logger:
             print(f"[Encoder] 跳过从 resume checkpoint 加载 encoder，使用外部提供的 {args.encoder_path}。")
 
-        # 加载优化器状态
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # Optimizer / scheduler
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except Exception as e:
+            if is_logger:
+                print(f"[Resume] 跳过 optimizer_state_dict 加载：{e}")
 
-        # 加载归一化参数
-        data_dict = checkpoint['data_dict']
-
-        start_epoch = checkpoint['epoch'] + 1
+        data_dict = checkpoint.get('data_dict', None)
+        start_epoch = int(checkpoint.get('epoch', -1)) + 1
 
         if is_logger:
-            print(f"==> 成功从 {args.resume_path} 恢复模型")
-            print(f"==> 从第 {start_epoch} 个 epoch 继续训练")
+            print(f"==> 成功从 {args.resume_path} 恢复模型，从第 {start_epoch} 个 epoch 继续训练")
     else:
         if is_logger:
             print("未提供 resume 路径，或路径无效，将从头开始训练。")
 
-    amp_enabled = bool(use_amp) and device.type == 'cuda'
-    moe_module = moe_model if not hasattr(moe_model, "module") else moe_model.module
-    moe_has_complex = any(p.is_complex() for p in moe_module.parameters())
+    amp_enabled = bool(use_amp) and (device.type == 'cuda')
     optimizer.zero_grad(set_to_none=True)
 
     # ======================
@@ -787,7 +798,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                 tqdm_module=tqdm,
                 profile_timing=args.profile_timing,
                 amp_enabled=amp_enabled,
-                encoder_frozen=not encoder_requires_grad,
+                encoder_frozen=not any(p.requires_grad for p in encoder_model.parameters()) if encoder_model else True,
                 train_encoder=config.train_encoder,
                 tb_writer=tb_writer,
             )
@@ -840,11 +851,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     return model, best_val_loss
 
 
-# 定义一个TransformedSubset类，用于对Dataset或Subset应用变换
 class TransformedSubset(Subset):
-    """
-    支持变换的数据集子集
-    """
     def __init__(self, dataset, transform=None):
         if hasattr(dataset, 'indices'):
             super().__init__(dataset.dataset, dataset.indices)
@@ -869,14 +876,6 @@ class TransformedSubset(Subset):
 
 
 def run_inference(n_args):
-    """
-    使用训练好的模型进行推理，推理前向流程与训练保持一致
-
-    Parameters
-    ----------
-    n_args : argparse.Namespace
-        命令行参数
-    """
     setting_dir = Path(getattr(n_args, "setting_path", ""))
     if not setting_dir:
         raise ValueError("推理模式需要指定包含 args.json/config.json 的 --setting_path 目录")
@@ -923,7 +922,6 @@ def run_inference(n_args):
     local_rank = runtime_ctx["local_rank"]
     experts_name_str = runtime_ctx["experts_name_str"]
 
-    # === checkpoint 读取策略（根据 experts_name_str）===
     checkpoint = None
     if experts_name_str == "all":
         if is_logger:
@@ -934,7 +932,6 @@ def run_inference(n_args):
             raise ValueError(f"模型文件不存在: {model_path}")
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
 
-    # === 归一化统计量（ALL 模式下通常要求 --status_json）===
     stats_from_ckpt = checkpoint.get("data_dict", None) if isinstance(checkpoint, dict) else None
     status_json = getattr(runtime_args, "status_json", None)
     stats_dict = None
@@ -944,8 +941,7 @@ def run_inference(n_args):
         if config.family == "all":
             stats_dict = status_payload.get("overall")
         else:
-            per_type = status_payload.get("per_type", {})
-            stats_dict = per_type.get(config.family)
+            stats_dict = status_payload.get("per_type", {}).get(config.family)
     if stats_dict is None:
         stats_dict = stats_from_ckpt
     if stats_dict is None:
@@ -1305,7 +1301,7 @@ def run_inference(n_args):
             max_samples=num_samples,
         )
         visualize_encoded(
-            visual_payload["encoded"],  # 修复变量引用
+            visual_payload["encoded"],
             save_dir=img_path,
             max_samples=num_samples,
             channels=config.moe_in_channels,
@@ -1323,7 +1319,6 @@ if __name__ == '__main__':
     if args.mode == 'train':
         run_training(args)
     elif args.mode == 'inference':
-        # 不再在此处强制要求 --model_path，以兼容 experts_name_str == "all" 的推理路径
         run_inference(args)
     elif args.mode == 'train_encoder':
         run_training(args)

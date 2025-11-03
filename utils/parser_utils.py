@@ -12,6 +12,8 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'inference','train_encoder'],
                         help='运行模式: 训练或推理')
     parser.add_argument('--model_name', type=str, default='MOE')
+    parser.add_argument('--use_deepspeed', action='store_true')
+    parser.add_argument('--ds_config', type=str, default='./scripts/ds_zero3_bf16_offload.json')
     parser.add_argument('--data_dir', type=str, default=None,
                         help='数据目录路径')
     parser.add_argument('--zarr_path', type=str, default=None,
@@ -50,6 +52,7 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
     parser.add_argument('--disable_mixed_precision', dest='mixed_precision', action='store_false',
                         help='禁用混合精度模式')
     parser.set_defaults(mixed_precision=None)
+    parser.add_argument('--local_rank', type=int)
     
     parser.add_argument('--lr_warmup_epochs', type=int, default=5,
                         help='学习率预热轮数（按 epoch 计）')
@@ -156,7 +159,7 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
     parser.add_argument('--use_moe', action='store_true',
                         help='是否使用moe, 使用会冻结专家模型')
     parser.add_argument('--moe_mode', type=str, default='standard',
-                        choices=['standard', 'velocity_type'],
+                        choices=['standard', 'velocity_type', 'group'],
                         help="MOE运行模式：'standard' 使用路由/融合，'velocity_type' 直接按类型权重融合预训练专家")
     parser.add_argument('--router_type', type=str, default='basic',
                         help='路由器类型: \'basic\'/\'adamv\'')

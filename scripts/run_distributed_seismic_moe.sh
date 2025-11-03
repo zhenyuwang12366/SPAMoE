@@ -17,6 +17,7 @@ OUTPUT_DIR="./results/distributed_seismic_moe"
 VIS_FREQ=5
 USE_WANDB=0
 USE_AMP=0
+USE_DEEPSPEED=0
 MIXED_PRECISION=""
 VAL_RATIO=0.2
 ACCUM_STEPS=1
@@ -133,6 +134,7 @@ while [[ $# -gt 0 ]]; do
     --vis_freq) VIS_FREQ="$2"; shift 2 ;;
     --use_wandb) USE_WANDB=1; shift ;;
     --use_amp) USE_AMP=1; shift ;;
+    --use_deepspeed) USE_DEEPSPEED=1; shift ;;
     --mixed_precision) MIXED_PRECISION=1; shift ;;
     --disable_mixed_precision) MIXED_PRECISION=0; shift ;;
 
@@ -512,6 +514,7 @@ fi
 [[ ${#DTCWT_TYPE[@]} -eq 2 ]] && ARGS+=( --dtcwt_type "${DTCWT_TYPE[@]}" )
 
 # 可选开关类参数
+[[ "$USE_DEEPSPEED" -eq 1 ]]   && ARGS+=( --use_deepspeed )
 [[ "$USE_AMP" -eq 1 ]]   && ARGS+=( --use_amp )
 [[ "$USE_WANDB" -eq 1 ]]   && ARGS+=( --use_wandb )
 [[ "$USE_MOE" -eq 1 ]]     && ARGS+=( --use_moe )

@@ -103,7 +103,7 @@ class ExpertFactory:
         elif domain_type == 'wavelet':
             # 小波神经算子专家
             if v_type_id is not None:
-                hidden_channels = kwargs.get('hidden_channels', 64)
+                hidden_channels = kwargs.get('hc', 64)
             if n_dim == 2:
                 # 为了避免参数冲突，检查kwargs中是否已包含必要的级别参数
                 levels_kwargs = {}
