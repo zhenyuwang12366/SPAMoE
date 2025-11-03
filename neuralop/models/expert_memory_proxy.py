@@ -38,14 +38,16 @@ class ExpertMemoryProxy:
 
         # ======= 主迁移与释放 =======
         # 注意：不要在遍历时修改原列表，先复制后遍历，遍历完再统一清空
-        for m in list(experts):  # 用 list() 拷贝，避免原地修改影响遍历
-            # 把专家移到 CPU 并冻结
+        for m in list(experts):
             m_cpu = m.to("cpu", non_blocking=True)
             m_cpu.eval()
             for p in m_cpu.parameters():
                 p.requires_grad_(False)
 
-            # 存储副本，顺序与原 experts 保持一致
+            # ★ 提前预置为普通属性（不是 buffer）
+            if not hasattr(m_cpu, "ds_grads_remaining"):
+                m_cpu.ds_grads_remaining = 0
+
             self.cpu_experts.append(m_cpu)
 
         # 释放原 experts 的引用（如果你希望尽快释放）
@@ -99,12 +101,19 @@ class ExpertMemoryProxy:
         return idx
 
     def _clone_to_device(self, m_cpu: torch.nn.Module) -> torch.nn.Module:
-        # 用 deepcopy，完全保留模块属性；避免依赖空构造器
         m_gpu = copy.deepcopy(m_cpu)
-        m_gpu.to(self.device, non_blocking=True if self.device.type == "cuda" else False)
+        m_gpu.to(self.device, non_blocking=self.device.type=="cuda")
         m_gpu.eval()
         for p in m_gpu.parameters():
             p.requires_grad_(False)
+
+        # ★ 依然只设“普通属性”，不要 register_buffer
+        #   避免之后 DeepSpeed 在 backward 里做 `module.ds_grads_remaining = 0`
+        #   时出现类型冲突
+        if not hasattr(m_gpu, "ds_grads_remaining"):
+            m_gpu.ds_grads_remaining = 0
+
+        # 下面保持你的 dtype 转换逻辑（注意：只转浮点 buffer）
         if self.amp_dtype is not None and self.convert_param_dtype_on_gpu:
             for p in m_gpu.parameters():
                 if p.is_floating_point():
@@ -112,6 +121,7 @@ class ExpertMemoryProxy:
             for name, b in m_gpu.named_buffers(recurse=True):
                 if b.is_floating_point():
                     setattr(m_gpu, name, b.to(self.amp_dtype))
+
         return m_gpu
 
     def _estimate_model_mem_once(self, idx: int) -> int:
@@ -294,7 +304,8 @@ class ExpertMemoryProxy:
                     budget = need[i][1]  # 至少保证单个
 
             # 贪心装一批
-            batch_ids: List[int], used = [], 0
+            batch_ids: List[int] = []
+            used = 0
             j = i
             while j < total and used + need[j][1] <= budget:
                 batch_ids.append(need[j][0])
