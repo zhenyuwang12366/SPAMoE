@@ -41,8 +41,8 @@ class WNOBlock2d(nn.Module):
     """
     2D 小波神经算子块:
       - 每层: x ← K(x) + W(x)；最后一层不激活；Channel-MLP 残差
-      - 仅小波路径禁用 AMP（fp32）
-      - 进入/离开块时，样本级右下 pad 到 2^L 倍数并精确裁剪
+      - 仅小波路径禁用 AMP（fp32），其余保持外层 AMP dtype（bf16/fp16）
+      - 进入/离开块时，样本级右下 pad 到 2^L 倍数并精确裁剪（由 WaveConv 内部处理）
     """
     def __init__(
         self,
@@ -134,11 +134,19 @@ class WNOBlock2d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 仅小波路径禁用 AMP，保证 DWT/IDWT / DTCWT 数值稳定
-        pad_mode = 'symmetric' if self.conv_kind == 'dwt' else 'reflect'
+        orig_dtype = x.dtype
 
         for i in range(self.n_layers):
-            kx = self.convs[i](x)            # K(x)
-            wx = self.w_local[i](x)          # W(x)
+            # --- 小波分支 K(x): 强制 fp32 & 关闭 autocast ---
+            with torch.autocast(device_type="cuda", enabled=False):
+                x32 = x.to(torch.float32)
+                kx32 = self.convs[i](x32)     # WaveConv 内部若用 pytorch_wavelets，将与 float32 滤波器对齐
+            kx = kx32.to(dtype=orig_dtype)     # 回到外层 AMP 的 dtype（bf16/fp16/fp32）
+
+            # --- 像素 1×1 分支 W(x): 保持外层 AMP dtype 计算 ---
+            wx = self.w_local[i](x)
+
+            # 融合
             x = kx + wx
 
             if i != self.n_layers - 1:
@@ -291,7 +299,7 @@ class WNO2d(BaseModel):
         x = self.lifting_norm(x)
         x = self.lifting_drop(x)
 
-        # 主干（内部自带 2^L pad/unpad & fp32）
+        # 主干（内部自带 2^L pad/unpad；小波分支已强制 fp32 并禁用 AMP）
         x = self.wno_blocks(x)
 
         # 投影
@@ -319,8 +327,8 @@ class WNOBlock3d(nn.Module):
     """
     3D 小波神经算子块 (DWT):
       - 每层: x ← K(x) + W(x)；最后一层不激活；Channel-MLP 残差
-      - 仅小波路径禁用 AMP（fp32）
-      - 进入/离开块时，样本级右/后/下 pad 到 2^L 倍数并精确裁剪
+      - 仅小波路径禁用 AMP（fp32），其余保持外层 AMP dtype
+      - 进入/离开块时，样本级右/后/下 pad 到 2^L 倍数并精确裁剪（由 WaveConv 内部处理）
     """
     def __init__(
         self,
@@ -385,9 +393,18 @@ class WNOBlock3d(nn.Module):
             self.channel_mlp_skips = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+
         for i in range(self.n_layers):
-            kx = self.convs[i](x)            # K(x)
-            wx = self.w_local[i](x)          # W(x)
+            # --- 小波分支 K(x): 强制 fp32 & 关闭 autocast ---
+            with torch.autocast(device_type="cuda", enabled=False):
+                x32 = x.to(torch.float32)
+                kx32 = self.convs[i](x32)
+            kx = kx32.to(dtype=orig_dtype)
+
+            # --- 像素 1×1×1 分支 W(x): 保持外层 AMP dtype ---
+            wx = self.w_local[i](x)
+
             x = kx + wx
 
             if i != self.n_layers - 1:
@@ -526,7 +543,7 @@ class WNO3d(BaseModel):
         x = self.lifting_norm(x)
         x = self.lifting_drop(x)
 
-        # 主干（内部自带 2^L pad/unpad & fp32）
+        # 主干（内部自带 2^L pad/unpad；小波分支已强制 fp32 并禁用 AMP）
         x = self.wno_blocks(x)
 
         # 投影
