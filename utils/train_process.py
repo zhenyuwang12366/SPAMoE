@@ -246,8 +246,6 @@ def train_one_epoch(
             leave=False,
             disable=not _is_main_process(is_logger, engine),
         )
-
-    print(f"before step \n {mem()}")
     
     for step, batch in enumerate(pbar_iter):
         global_step = epoch * num_steps + step
@@ -261,8 +259,6 @@ def train_one_epoch(
         sync_ctx = (
             (model.no_sync() if (is_ddp_like and not last_micro and not use_deepspeed) else nullcontext())
         )
-
-        print(f"in train \n {mem()}")
         
         step_has_nan = False
         with sync_ctx:

@@ -16,15 +16,18 @@ conda activate seismic_moe
 # === 环境优化（与训练逻辑无关，但更稳）===
 # 1) 优先使用 CUDA async 内存池；失败则回退到默认池 + 碎片缓解
 choose_allocator_conf() {
-  # 先尝试 cudaMallocAsync（在子进程里设置 env，不污染当前）
+  # 在子进程里设置 env，不污染当前；只做一次最小可运行检查
   if PYTORCH_CUDA_ALLOC_CONF="backend:cudaMallocAsync,max_split_size_mb:256,garbage_collection_threshold:0.8" \
-     python - <<'PY' >/dev/null 2>&1; then
+     python - <<'PY' >/dev/null 2>&1
+import torch  # 触发 CUDA/allocator 初始化路径的最小导入
+PY
+  then
     echo "backend:cudaMallocAsync,max_split_size_mb:256,garbage_collection_threshold:0.8"
   else
     echo "max_split_size_mb:256,garbage_collection_threshold:0.8"
   fi
-PY
 }
+
 export PYTORCH_CUDA_ALLOC_CONF="$(choose_allocator_conf)"
 
 # 2) 线程/数学库
@@ -55,7 +58,7 @@ print("CUDA 可用:", torch.cuda.is_available())
 print("torch.version.cuda:", torch.version.cuda)
 if torch.cuda.is_available():
     print("GPU:", torch.cuda.get_device_name(0))
-# 读取 allocator 后端（2.5+ 提供该 API，否则跳过）
+# 读取 allocator 后端（2.5+ 提供该 API，否则显示 unknown）
 backend = None
 try:
     from torch.cuda import memory as tcm
@@ -100,4 +103,5 @@ nohup bash scripts/run_distributed_seismic_moe.sh \
   --lambda_fourier_mag_l1 0.05 \
   --use_amp \
   >> "$LOGFILE" 2>&1 &
+
 echo "DDP 训练已启动，日志：$LOGFILE"
