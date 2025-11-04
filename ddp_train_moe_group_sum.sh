@@ -58,7 +58,7 @@ PY
 nohup bash scripts/run_distributed_seismic_moe.sh \
   --mode train \
   --model_name moe_group_sum \
-  --resume_path /root/autodl-tmp/results/all/seismic_moe_all/moe_group_sum_router-basic_lr0.0001_bs8_all_20251104-193855/last_model_all.pt \
+  --resume_path /root/autodl-tmp/results/all/seismic_moe_all/moe_group_sum_router-basic_lr0.0001_bs8_all_20251104-213054/last_model_all.pt \
   --num_gpus 6 \
   --num_workers 4 \
   --zarr_path /root/autodl-tmp/all.zarr \

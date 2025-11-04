@@ -584,9 +584,6 @@ def train_one_epoch(
 
                 # 先裁样本，再搬到 CPU/numpy
                 num_samples = min(image_log_limit, inputs_v.shape[0])
-                inputs_v  = inputs_v[:num_samples].detach().to('cpu', non_blocking=True).float().numpy()
-                targets_v = targets_v[:num_samples].detach().to('cpu', non_blocking=True).float().numpy()
-                preds_v   = preds_v[:num_samples].detach().to('cpu', non_blocking=True).float().numpy()
 
                 wandb_run = wandb_module if (use_wandb and wandb_module is not None) else None
                 tb = tb_writer if tb_active else None
