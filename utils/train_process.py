@@ -531,9 +531,9 @@ def train_one_epoch(
         wandb_run = wandb_module if (use_wandb and wandb_module is not None) else None
         tb = tb_writer if tb_active else None
 
-        inputs_v = inputs_v.detach().numpy()
-        targets_v = targets_v.detach().numpy()
-        preds_v = preds_v.detach().numpy()
+        inputs_v = inputs_v.detach().cpu().numpy()
+        targets_v = targets_v.detach().cpu().numpy()
+        preds_v = preds_v.detach().cpu().numpy()
         
         visualize_results(
             inputs_v, targets_v, preds_v,
