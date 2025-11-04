@@ -358,7 +358,8 @@ def train_one_epoch(
         if train_encoder:
             del labels
         # 若确实显存紧张才打开；默认注释掉避免频繁 sync
-        torch.cuda.empty_cache()
+        if global_step % 500 == 0:
+            torch.cuda.empty_cache()
 
     # ====== 统计训练损失 ======
     if nan_detected and micro_count == 0:

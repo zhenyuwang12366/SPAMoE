@@ -6,6 +6,7 @@
 import optuna
 import os
 import sys
+import re
 import math
 import json
 import numpy as np
@@ -837,47 +838,135 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         )
 
     # ======================
-    # Resume（保持原逻辑，兼容 DS）
+    # Resume（与保存逻辑严格对偶；不对 moe 分开加载）
     # ======================
     start_epoch = 0
     if hasattr(args, "resume_path") and args.resume_path is not None and os.path.exists(args.resume_path):
-        checkpoint = torch.load(args.resume_path, map_location="cpu", weights_only=False)
+        ckpt_path = args.resume_path
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
-        # 注意：model 可能是 DDP(EMO) / EMO / DeepSpeedEngine
+        # 兼容 DDP(EMO) / EMO / DeepSpeedEngine
         target_model = model.module if hasattr(model, "module") else model
-        target_moe = target_model.moe if hasattr(target_model, "moe") else None
+        target_moe = getattr(target_model, "moe", None)
 
-        router_check = checkpoint.get("router_state_dict", None)
-        if target_moe is not None:
-            if experts_name_str == "all":
-                if router_check is not None:
-                    target_moe.router.load_state_dict(router_check, strict=False)
+        # ---------- 1) DeepSpeed 引擎状态（若保存时用 engine.save_checkpoint） ----------
+        if use_deepspeed and ("engine" in globals() or "engine" in locals()) and (model is not None):
+            resume_dir = os.path.dirname(ckpt_path)
+            resume_file = os.path.basename(ckpt_path)
+            ds_tag = getattr(args, "resume_tag", None)
+            if ds_tag is None:
+                m = re.search(r"(best|last-ep\d+)", resume_file)
+                ds_tag = m.group(1) if m else None
+
+            if ds_tag is not None:
+                load_path, client_state = model.load_checkpoint(resume_dir, tag=ds_tag)
+                if is_logger:
+                    print(f"[DeepSpeed] 已加载引擎状态: dir={resume_dir}, tag={ds_tag}, load_path={load_path}")
             else:
-                target_moe.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                if is_logger:
+                    print("[DeepSpeed][WARN] 未能推断 tag；若保存用过 engine.save_checkpoint，请提供 --resume_tag=best 或 last-epN")
 
-        # Encoder
-        encoder_state = checkpoint.get('encoder_state_dict')
-        if hasattr(target_model, "encoder") and (encoder_state is not None) and not getattr(args, "encoder_path", None):
-            encoder_target = target_model.encoder
-            missing, unexpected = load_encoder_weights(encoder_target, encoder_state, strict=False)
-            if is_logger and (missing or unexpected):
-                print(f"[Encoder] Resume 加载缺失参数: {missing}, 多余参数: {unexpected}")
-        elif encoder_state is not None and getattr(args, "encoder_path", None) and is_logger:
-            print(f"[Encoder] 跳过从 resume checkpoint 加载 encoder，使用外部提供的 {args.encoder_path}。")
+        # ---------- 2) 解析保存文件中各分量（仅按你的保存逻辑对偶恢复） ----------
+        model_check   = checkpoint.get("model_state_dict", None)       # 只有某些场景会存在
+        router_check  = checkpoint.get("router_state_dict", None)      # 非 DS + "all" 场景保存
+        encoder_check = checkpoint.get("encoder_state_dict", None)     # 两边都可能存在
+        expert_check  = checkpoint.get("expert_state_dict", None)      # 仅“单专家模式”可选存在（有时单独文件）
 
-        # 仅非 DeepSpeed 时恢复外部 optimizer
+        # 情况 A：非 DeepSpeed 且 experts_name_str == "all"
+        # 保存端：删除了 model_state_dict，仅保存 router_state_dict (+ encoder)
+        if (not use_deepspeed) and (experts_name_str == "all"):
+            if router_check is not None and (target_moe is not None) and hasattr(target_moe, "router") and (target_moe.router is not None):
+                missing, unexpected = target_moe.router.load_state_dict(router_check, strict=False)
+                if is_logger and (missing or unexpected):
+                    print(f"[Resume][all][router] 缺失参数: {missing}, 多余参数: {unexpected}")
+            else:
+                if is_logger:
+                    print("[Resume][all][router] ckpt 未含 router_state_dict（或模型无 moe.router），跳过 Router 恢复")
+
+            # Encoder：若未指定外部 encoder_path，则从 ckpt 恢复
+            if hasattr(target_model, "encoder") and (encoder_check is not None) and not getattr(args, "encoder_path", None):
+                missing, unexpected = load_encoder_weights(target_model.encoder, encoder_check, strict=False)
+                if is_logger and (missing or unexpected):
+                    print(f"[Resume][all][encoder] 缺失参数: {missing}, 多余参数: {unexpected}")
+            elif encoder_check is not None and getattr(args, "encoder_path", None) and is_logger:
+                print(f"[Resume][all][encoder] 检测到 --encoder_path，跳过从 ckpt 恢复 encoder")
+
+        else:
+            # 情况 B：其余所有场景（包括 DeepSpeed 或 非 DS 的普通/单专家/非 all）
+            # 保存端一定/常常包含整模 model_state_dict（DeepSpeed: 附加文件里；非 DS：默认就有）
+            if model_check is not None:
+                missing, unexpected = target_model.load_state_dict(model_check, strict=False)
+                if is_logger and (missing or unexpected):
+                    print(f"[Resume][generic][model] 缺失参数: {missing}, 多余参数: {unexpected}")
+            else:
+                if is_logger:
+                    print("[Resume][generic] ckpt 未包含 model_state_dict，跳过整模恢复（与保存逻辑一致）")
+
+            # 单专家模式下：如果你另存了专家专属文件，可通过 --resume_expert_path 再细粒度覆盖
+            if (experts_name is not None and len(experts_name) == 1 and experts_name[0] != "all"):
+                # 1) 从 ckpt 主文件里恢复到整模（上面已做）
+                # 2) 可选：再覆盖 experts[0]
+                resume_expert_path = getattr(args, "resume_expert_path", None)
+                if resume_expert_path and os.path.exists(resume_expert_path):
+                    try:
+                        expert_blob = torch.load(resume_expert_path, map_location="cpu", weights_only=False)
+                        expert_sd = expert_blob.get("expert_state_dict", None)
+                        if expert_sd is not None and (target_moe is not None) and hasattr(target_moe, "experts") and len(target_moe.experts) > 0:
+                            missing, unexpected = target_moe.experts[0].load_state_dict(expert_sd, strict=False)
+                            if is_logger and (missing or unexpected):
+                                print(f"[Resume][single-expert][experts[0]] 缺失参数: {missing}, 多余参数: {unexpected}")
+                            if is_logger:
+                                print(f"[Resume][single-expert] 已从 {resume_expert_path} 覆盖 experts[0]")
+                        elif is_logger:
+                            print(f"[Resume][single-expert] {resume_expert_path} 未含 expert_state_dict 或模型无 experts[0]")
+                    except Exception as e:
+                        if is_logger:
+                            print(f"[Resume][single-expert] 载入 resume_expert_path 失败：{e}")
+                elif expert_check is not None and (target_moe is not None) and hasattr(target_moe, "experts") and len(target_moe.experts) > 0:
+                    # 若主 ckpt 就带了 expert_state_dict（DeepSpeed 附件场景）
+                    missing, unexpected = target_moe.experts[0].load_state_dict(expert_check, strict=False)
+                    if is_logger and (missing or unexpected):
+                        print(f"[Resume][single-expert][experts[0]] 缺失参数: {missing}, 多余参数: {unexpected}")
+
+            # Encoder：DeepSpeed 与普通模式都可存在
+            if hasattr(target_model, "encoder") and (encoder_check is not None) and not getattr(args, "encoder_path", None):
+                missing, unexpected = load_encoder_weights(target_model.encoder, encoder_check, strict=False)
+                if is_logger and (missing or unexpected):
+                    print(f"[Resume][generic][encoder] 缺失参数: {missing}, 多余参数: {unexpected}")
+            elif encoder_check is not None and getattr(args, "encoder_path", None) and is_logger:
+                print(f"[Resume][generic][encoder] 检测到 --encoder_path，跳过从 ckpt 恢复 encoder")
+
+            # Router：即便不是 "all"，若 ckpt 附带了 router_state_dict 也可尝试恢复（保存时允许存在）
+            if router_check is not None and (target_moe is not None) and hasattr(target_moe, "router") and (target_moe.router is not None):
+                try:
+                    missing, unexpected = target_moe.router.load_state_dict(router_check, strict=False)
+                    if is_logger and (missing or unexpected):
+                        print(f"[Resume][generic][router] 缺失参数: {missing}, 多余参数: {unexpected}")
+                except Exception as e:
+                    if is_logger:
+                        print(f"[Resume][generic][router] 跳过 router_state_dict 加载：{e}")
+
+        # ---------- 3) Optimizer（仅非 DeepSpeed 会保存在 ckpt 里） ----------
         if (not use_deepspeed) and (optimizer is not None):
             try:
-                optimizer.load_state_dict(checkpoint.get('optimizer_state_dict', {}))
+                opt_state = checkpoint.get("optimizer_state_dict", None)
+                if opt_state:
+                    optimizer.load_state_dict(opt_state)
+                else:
+                    if is_logger:
+                        print("[Resume][optimizer] ckpt 未包含 optimizer_state_dict，跳过")
             except Exception as e:
                 if is_logger:
-                    print(f"[Resume] 跳过 optimizer_state_dict 加载：{e}")
+                    print(f"[Resume][optimizer] 跳过 optimizer_state_dict 加载：{e}")
 
-        data_dict = checkpoint.get('data_dict', None)
-        start_epoch = int(checkpoint.get('epoch', -1)) + 1
+        # ---------- 4) 训练元信息 ----------
+        data_dict   = checkpoint.get("data_dict", None)
+        start_epoch = int(checkpoint.get("epoch", -1)) + 1
+        if start_epoch < 0:
+            start_epoch = 0
 
         if is_logger:
-            print(f"==> 成功从 {args.resume_path} 恢复模型，从第 {start_epoch} 个 epoch 继续训练")
+            print(f"==> 成功从 {ckpt_path} 恢复，start_epoch = {start_epoch}")
     else:
         if is_logger:
             print("未提供 resume 路径，或路径无效，将从头开始训练。")
