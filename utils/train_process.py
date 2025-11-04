@@ -194,6 +194,15 @@ def train_one_epoch(
     use_deepspeed: bool = False,
     **kwargs,
 ):
+    def mem():
+        """打印当前 GPU 显存状态"""
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated(device) / 1e9  # 已分配显存
+        reserved  = torch.cuda.memory_reserved(device)  / 1e9  # 已缓存（已申请但未使用）显存
+        max_alloc = torch.cuda.max_memory_allocated(device) / 1e9  # 运行以来的峰值显存
+        print(f"[{device}] allocated={allocated:.2f} GB | reserved={reserved:.2f} GB | max={max_alloc:.2f} GB")
+    
+    
     use_deepspeed = use_deepspeed or (engine is not None)
     tqdm = tqdm_module.tqdm if tqdm_module is not None else None
 
@@ -238,6 +247,8 @@ def train_one_epoch(
             disable=not _is_main_process(is_logger, engine),
         )
 
+    print(f"before step \n {mem()}")
+    
     for step, batch in enumerate(pbar_iter):
         global_step = epoch * num_steps + step
         inputs = batch['input'].to(device, non_blocking=True)
@@ -251,6 +262,8 @@ def train_one_epoch(
             (model.no_sync() if (is_ddp_like and not last_micro and not use_deepspeed) else nullcontext())
         )
 
+        print(f"in train \n {mem()}")
+        
         step_has_nan = False
         with sync_ctx:
             with maybe_autocast(use_amp, device):

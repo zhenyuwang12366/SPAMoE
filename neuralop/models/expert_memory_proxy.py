@@ -36,28 +36,27 @@ class ExpertMemoryProxy:
         self.gpu_cache: OrderedDict[int, torch.nn.Module] = OrderedDict()
         self.model_mem_est: Dict[int, int] = {}
 
+        self.training = True
+        
         # ======= 主迁移与释放 =======
-        # 注意：不要在遍历时修改原列表，先复制后遍历，遍历完再统一清空
         for m in list(experts):
             m_cpu = m.to("cpu", non_blocking=True)
             m_cpu.eval()
             for p in m_cpu.parameters():
                 p.requires_grad_(False)
 
-            # ★ 提前预置为普通属性（不是 buffer）
+            # 作为普通属性避免被框架当作 buffer
             if not hasattr(m_cpu, "ds_grads_remaining"):
                 m_cpu.ds_grads_remaining = 0
 
             self.cpu_experts.append(m_cpu)
 
-        # 释放原 experts 的引用（如果你希望尽快释放）
+        # 释放原 experts 的引用（如果希望尽快释放）
         try:
             experts.clear()
         except Exception:
-            # 如果传入的是元组或其他不可变结构，忽略
             pass
 
-        # 手动触发垃圾回收 + 清缓存
         gc.collect()
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
@@ -76,20 +75,31 @@ class ExpertMemoryProxy:
         return contextlib.nullcontext()
 
     def _amp_ctx(self, dtype: Optional[torch.dtype]):
-        # 明确 device_type，避免在 CPU 场景行为不一致
+        """
+        AMP 上下文：仅在 dtype 不为 None 时启用 autocast。
+        device_type 与实际 device 匹配（cuda/cpu）。
+        """
         if dtype is not None:
             return torch.amp.autocast(device_type=self.device.type, dtype=dtype)
         return self._null_ctx()
+
+    def _fw_ctx(self):
+        """
+        前向上下文选择：
+        - 训练态（self.training=True 且全局 grad_enabled=True）：允许梯度（nullcontext）
+        - 评估态：使用 inference_mode 提速，避免构图
+        """
+        if getattr(self, "training", False) and torch.is_grad_enabled():
+            return self._null_ctx()
+        return torch.inference_mode()
 
     def _mem_info(self) -> Tuple[int, int]:
         if self.device.type == "cuda":
             free, total = torch.cuda.mem_get_info(self.device)
             return int(free), int(total)
-        # 非 CUDA 设备，给出一个“无限”空间的近似（不触发逐出逻辑）
-        return 1 << 60, 1 << 60  # 1 exa-ish
+        return 1 << 60, 1 << 60  # 非 CUDA：视为“无限”
 
     def _ensure_idx(self, idx: int) -> int:
-        # 统一索引守卫：必须是 0..len-1 的整型
         if not isinstance(idx, (int,)):
             try:
                 idx = int(idx)
@@ -102,18 +112,15 @@ class ExpertMemoryProxy:
 
     def _clone_to_device(self, m_cpu: torch.nn.Module) -> torch.nn.Module:
         m_gpu = copy.deepcopy(m_cpu)
-        m_gpu.to(self.device, non_blocking=self.device.type=="cuda")
+        m_gpu.to(self.device, non_blocking=self.device.type == "cuda")
         m_gpu.eval()
         for p in m_gpu.parameters():
             p.requires_grad_(False)
 
-        # ★ 依然只设“普通属性”，不要 register_buffer
-        #   避免之后 DeepSpeed 在 backward 里做 `module.ds_grads_remaining = 0`
-        #   时出现类型冲突
         if not hasattr(m_gpu, "ds_grads_remaining"):
             m_gpu.ds_grads_remaining = 0
 
-        # 下面保持你的 dtype 转换逻辑（注意：只转浮点 buffer）
+        # 仅将浮点参数/缓冲转为 amp_dtype（如 fp16/bf16）
         if self.amp_dtype is not None and self.convert_param_dtype_on_gpu:
             for p in m_gpu.parameters():
                 if p.is_floating_point():
@@ -127,7 +134,6 @@ class ExpertMemoryProxy:
     def _estimate_model_mem_once(self, idx: int) -> int:
         idx = self._ensure_idx(idx)
         if self.device.type != "cuda":
-            # 非 CUDA 设备：估一个参数/缓冲量级的近似
             m = self.cpu_experts[idx]
             bytes_params = sum(p.numel() * p.element_size() for p in m.parameters())
             bytes_bufs = sum(b.numel() * b.element_size() for b in m.buffers())
@@ -162,7 +168,6 @@ class ExpertMemoryProxy:
 
     def _evict_until_fit(self, need_bytes: int) -> bool:
         if self.device.type != "cuda":
-            # 非 CUDA 不做显存管理，视为始终 OK
             return True
 
         def ok():
@@ -205,19 +210,20 @@ class ExpertMemoryProxy:
         else:
             return m_gpu, False  # 临时加载，用完释放
 
-    # -------- 对外 API：功能等价调用 --------
+    # -------- 对外 API：功能等价调用（训练态允许梯度，评估态 inference） --------
 
-    @torch.no_grad()
     def forward_expert(self, expert_idx: int, x: torch.Tensor, **kwargs) -> torch.Tensor:
         """
         保证功能等价：experts[expert_idx](x, **kwargs)
         仅做显存调度，不改索引绑定、不改前向语义
+        - 训练：允许梯度（保持 autograd）
+        - 评估：inference_mode 提速
         """
         expert_idx = self._ensure_idx(expert_idx)
         x = x.to(self.device, non_blocking=True if self.device.type == "cuda" else False)
         m_gpu, cached = self._admit(expert_idx)
         try:
-            with torch.inference_mode(), self._amp_ctx(self.amp_dtype):
+            with self._fw_ctx(), self._amp_ctx(self.amp_dtype):
                 y = m_gpu(x, **kwargs)
         except RuntimeError as e:
             if "CUDA out of memory" in str(e) and self.device.type == "cuda":
@@ -226,7 +232,7 @@ class ExpertMemoryProxy:
                 torch.cuda.empty_cache()
                 m_tmp = self._clone_to_device(self.cpu_experts[expert_idx])
                 try:
-                    with torch.inference_mode(), self._amp_ctx(self.amp_dtype):
+                    with self._fw_ctx(), self._amp_ctx(self.amp_dtype):
                         y = m_tmp(x, **kwargs)
                 finally:
                     del m_tmp
@@ -240,7 +246,6 @@ class ExpertMemoryProxy:
                     torch.cuda.empty_cache()
         return y
 
-    @torch.no_grad()
     def forward_many(
         self,
         routed: Dict[int, torch.Tensor],
@@ -250,11 +255,11 @@ class ExpertMemoryProxy:
         批量前向：{expert_idx -> x_sub} → {expert_idx -> y_sub}
         - 索引即身份，直接使用传入的 expert_idx
         - fw_kwargs 可为 None 或 {idx: {...}}，逐专家透传
+        - 训练：允许梯度；评估：inference_mode
         """
         outs: Dict[int, torch.Tensor] = {}
         kw = fw_kwargs or {}
 
-        # 统一校验 routed / fw_kwargs key 边界
         n = len(self.cpu_experts)
         if n == 0 and (routed or kw):
             raise IndexError("[ExpertMemoryProxy] 当前没有任何专家，但收到了 routed/fw_kwargs 调用")
@@ -276,7 +281,7 @@ class ExpertMemoryProxy:
                 self.gpu_cache[idx] = m  # LRU: 最近使用
                 x_dev = x.to(self.device, non_blocking=True if self.device.type == "cuda" else False)
                 try:
-                    with torch.inference_mode(), self._amp_ctx(self.amp_dtype):
+                    with self._fw_ctx(), self._amp_ctx(self.amp_dtype):
                         outs[idx] = m(x_dev, **kw.get(idx, {}))
                 except IndexError as e:
                     raise IndexError(
@@ -327,7 +332,7 @@ class ExpertMemoryProxy:
                 for idx, m_gpu, cached in loaded:
                     x = routed[idx].to(self.device, non_blocking=True if self.device.type == "cuda" else False)
                     try:
-                        with torch.inference_mode(), self._amp_ctx(self.amp_dtype):
+                        with self._fw_ctx(), self._amp_ctx(self.amp_dtype):
                             outs[idx] = m_gpu(x, **kw.get(idx, {}))
                     except RuntimeError as e:
                         if "CUDA out of memory" in str(e) and self.device.type == "cuda":
@@ -336,7 +341,7 @@ class ExpertMemoryProxy:
                             torch.cuda.empty_cache()
                             m_tmp = self._clone_to_device(self.cpu_experts[idx])
                             try:
-                                with torch.inference_mode(), self._amp_ctx(self.amp_dtype):
+                                with self._fw_ctx(), self._amp_ctx(self.amp_dtype):
                                     outs[idx] = m_tmp(x, **kw.get(idx, {}))
                             finally:
                                 del m_tmp
