@@ -67,7 +67,7 @@ nohup bash scripts/run_distributed_seismic_moe.sh \
   --epochs 100 \
   --output_dir ../results \
   --use_moe \
-  --use_experts_path /root/autodl-tmp/model_path_type_sum \
+  --use_experts_path /root/autodl-tmp/other_experts \
   --top_k 2 \
   --moe_mode group \
   --router_type swa \
