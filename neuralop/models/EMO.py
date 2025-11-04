@@ -83,7 +83,6 @@ class EMO(nn.Module):
         直接给原始输入：自动走 encoder -> moe
         - use_amp: 是否在 encoder+moe 中使用 autocast
         - amp_dtype: autocast dtype（默认 bfloat16）
-        - force_dtype: 在送入 moe 前强制转换的 dtype（默认 float32；None 表示不转换）
         """
         if self.encoder is None:
             encoded, weights = inputs, None

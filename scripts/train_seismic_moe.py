@@ -48,10 +48,6 @@ from scripts.scheduler import (
 )
 from neuralop.losses import L1L2Loss, SobelLoss, FourierMag_L1
 from utils import *
-# 需存在的工具：get_seismic_config, load_encoder_weights, load_moe_experts, train_one_epoch, EarlyStopping,
-# plot_loss_curve, safe_random_split, patch_spectral_conv_forward, SeismicMetrics,
-# visualize_results, analyze_fourier_domain, visualize_encoded, save_type_predictions_txt,
-# build_argparser_and_parse
 
 print("-----------------------------------------------------------")
 patch_spectral_conv_forward(SpectralConv)
@@ -500,14 +496,20 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         emo_model = EMO(encoder_model, moe_model, pass_encoder_logits_as_weights=True)
         model = emo_model  # 先占位，初始化后会替换为 DeepSpeedEngine
     else:
+        if experts_name_str == "all":
+            static_graph = True
+            find_unused_parameters = False
+        else:
+            static_graph = False
+            find_unused_parameters = True
         emo_model = EMO(encoder_model, moe_model, pass_encoder_logits_as_weights=True)
         if config.distributed.use_distributed:
             emo_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(emo_model).to(device)
             model = DDP(
                 emo_model, device_ids=[device.index],
                 output_device=device.index,
-                static_graph=True,
-                find_unused_parameters=False,
+                static_graph=static_graph,
+                find_unused_parameters=find_unused_parameters,
                 gradient_as_bucket_view=True,
             )
         else:
@@ -678,29 +680,34 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     # 训练分类 + 回归（encoder logits 参与 CE）
     if config.train_encoder:
         def criterion(pred: torch.Tensor, gt: torch.Tensor, logits: torch.Tensor, labels: torch.Tensor):
-            # base: 必须返回 Tensor 分量 {"loss", "l1", "l2"}
-            loss_dict = base_loss(pred, gt)
-            total_loss_t = loss_dict["loss"]                    # Tensor (标量)
+            # 在损失阶段禁用 AMP，并统一到 fp32 计算，避免混精度导致的 dtype 冲突/数值不稳
+            with torch.amp.autocast(device_type=pred.device.type, enabled=False):
+                pred32 = pred.float()
+                gt32 = gt.float()
 
-            # grad L1
-            grad_val_t = pred.new_zeros(())
-            if grad_loss_module is not None:
-                grad_res = grad_loss_module(pred, gt)           # {"loss": tensor}
-                grad_val_t = grad_res["loss"]
-                total_loss_t = total_loss_t + lambda_grad_l1 * grad_val_t
+                # base: 必须返回 Tensor 分量 {"loss", "l1", "l2"}
+                loss_dict = base_loss(pred32, gt32)
+                total_loss_t = loss_dict["loss"]  # Tensor (标量)
 
-            # fourier L1
-            fourier_val_t = pred.new_zeros(())
-            if fourier_loss_module is not None:
-                fourier_res = fourier_loss_module(pred, gt)     # {"loss": tensor}
-                fourier_val_t = fourier_res["loss"]
-                total_loss_t = total_loss_t + lambda_fourier_mag_l1 * fourier_val_t
+                # grad L1
+                grad_val_t = pred32.new_zeros(())
+                if grad_loss_module is not None:
+                    grad_res = grad_loss_module(pred32, gt32)   # {"loss": tensor}
+                    grad_val_t = grad_res["loss"]
+                    total_loss_t = total_loss_t + lambda_grad_l1 * grad_val_t
 
-            # Cross Entropy
-            ce_val_t = pred.new_zeros(())
-            if logits is not None and labels is not None:
-                ce_val_t = F.cross_entropy(logits, labels.long(), reduction="mean")
-                total_loss_t = total_loss_t + lambda_ce * ce_val_t
+                # fourier L1
+                fourier_val_t = pred32.new_zeros(())
+                if fourier_loss_module is not None:
+                    fourier_res = fourier_loss_module(pred32, gt32)  # {"loss": tensor}
+                    fourier_val_t = fourier_res["loss"]
+                    total_loss_t = total_loss_t + lambda_fourier_mag_l1 * fourier_val_t
+
+                # Cross Entropy（同样在 fp32 下计算）
+                ce_val_t = pred32.new_zeros(())
+                if logits is not None and labels is not None:
+                    ce_val_t = F.cross_entropy(logits.float(), labels.long(), reduction="mean")
+                    total_loss_t = total_loss_t + lambda_ce * ce_val_t
 
             # 返回两套（*_t: 反传用；无后缀: 日志用 float）
             combined = {
@@ -723,20 +730,25 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             return combined
     else:
         def criterion(pred: torch.Tensor, gt: torch.Tensor):
-            loss_dict = base_loss(pred, gt)
-            total_loss_t = loss_dict["loss"]
+            # 在损失阶段禁用 AMP，并统一到 fp32 计算
+            with torch.amp.autocast(device_type=pred.device.type, enabled=False):
+                pred32 = pred.float()
+                gt32 = gt.float()
 
-            grad_val_t = pred.new_zeros(())
-            if grad_loss_module is not None:
-                grad_res = grad_loss_module(pred, gt)
-                grad_val_t = grad_res["loss"]
-                total_loss_t = total_loss_t + lambda_grad_l1 * grad_val_t
+                loss_dict = base_loss(pred32, gt32)
+                total_loss_t = loss_dict["loss"]
 
-            fourier_val_t = pred.new_zeros(())
-            if fourier_loss_module is not None:
-                fourier_res = fourier_loss_module(pred, gt)
-                fourier_val_t = fourier_res["loss"]
-                total_loss_t = total_loss_t + lambda_fourier_mag_l1 * fourier_val_t
+                grad_val_t = pred32.new_zeros(())
+                if grad_loss_module is not None:
+                    grad_res = grad_loss_module(pred32, gt32)
+                    grad_val_t = grad_res["loss"]
+                    total_loss_t = total_loss_t + lambda_grad_l1 * grad_val_t
+
+                fourier_val_t = pred32.new_zeros(())
+                if fourier_loss_module is not None:
+                    fourier_res = fourier_loss_module(pred32, gt32)
+                    fourier_val_t = fourier_res["loss"]
+                    total_loss_t = total_loss_t + lambda_fourier_mag_l1 * fourier_val_t
 
             combined = {
                 # tensors for backward
