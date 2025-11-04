@@ -849,6 +849,9 @@ class MOEOperator(BaseModel, name='MOE'):
                             except Exception as e:
                                 _log(f"[ERROR] 专家 {eid} 处理异常：{e}，使用零张量代替")
                                 y_by_eid[eid] = _zeros_like_x(x_sub.size(0), C, x_sub)
+                                import traceback
+                                traceback.print_exc()
+                                exit(0)
                 except Exception as e:
                     _log(f"[ERROR] forward_many 异常：{e}；该列以零张量兜底")
                     batch_outputs = [_zeros_like_x(1, C, x[b:b+1]) for b in range(batch_size)]
@@ -923,16 +926,6 @@ class MOEOperator(BaseModel, name='MOE'):
         if not outputs:
             _log("[WARN] 没有有效的组/专家输出，返回零张量列表")
             return [torch.zeros(batch_size, C, *target_shape, device=device, dtype=x.dtype) for _ in range(top_k)]
-
-        if len(shape_log) > 0:
-            _log("[DEBUG] 专家/组内子模型输出形状样例（最多每类展示3条）：")
-            shown = 0
-            for key, shapes in shape_log.items():
-                _log(f"  {key}: {shapes[:3]}{' ...' if len(shapes) > 3 else ''}")
-                shown += 1
-                if shown >= 20:
-                    _log("  ... ")
-                    break
 
         return outputs
 

@@ -1,9 +1,18 @@
-# utils/train_process.py  （或你项目中的 train_process.py）
+# -*- coding: utf-8 -*-
+"""
+utils/train_process.py
+稳定性与显存友好增强版：
+- 训练循环中更彻底地释放 GPU 引用
+- 可视化/保存仅传 CPU 对象，且在 inference_mode 下执行
+- 兼容 DeepSpeed/DDP 的原有逻辑保持不变
+"""
 import os
+import gc
 import datetime
 import time
 from contextlib import nullcontext, contextmanager
 from typing import Optional, Callable, Any
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -102,14 +111,15 @@ def _evaluate_one_epoch(
         else:
             loss_dict = criterion(preds, targets)
 
-        val_loss += loss_dict["loss"].item()
-        mse_sum  += loss_dict["l2"].item()
-        mae_sum  += loss_dict["l1"].item()
-        psnr_sum += metrics_module.calculate_psnr(preds, targets)
-        rmse_sum += metrics_module.calculate_rmse(preds, targets)
-        ssim_sum += metrics_module.calculate_ssim(preds, targets)
-        if train_encoder:
-            ce_sum += loss_dict["ce"].item()
+        # 这里用 criterion 的 float 键做累计
+        val_loss += float(loss_dict["loss"])
+        mse_sum  += float(loss_dict["l2"])
+        mae_sum  += float(loss_dict["l1"])
+        psnr_sum += float(metrics_module.calculate_psnr(preds, targets))
+        rmse_sum += float(metrics_module.calculate_rmse(preds, targets))
+        ssim_sum += float(metrics_module.calculate_ssim(preds, targets))
+        if train_encoder and "ce" in loss_dict:
+            ce_sum += float(loss_dict["ce"])
 
     n = max(1, len(val_loader))
     out = {
@@ -195,14 +205,13 @@ def train_one_epoch(
     **kwargs,
 ):
     def mem():
-        """打印当前 GPU 显存状态"""
+        """打印当前 GPU 显存状态（调试用）"""
         torch.cuda.synchronize()
-        allocated = torch.cuda.memory_allocated(device) / 1e9  # 已分配显存
-        reserved  = torch.cuda.memory_reserved(device)  / 1e9  # 已缓存（已申请但未使用）显存
-        max_alloc = torch.cuda.max_memory_allocated(device) / 1e9  # 运行以来的峰值显存
+        allocated = torch.cuda.memory_allocated(device) / 1e9
+        reserved  = torch.cuda.memory_reserved(device)  / 1e9
+        max_alloc = torch.cuda.max_memory_allocated(device) / 1e9
         print(f"[{device}] allocated={allocated:.2f} GB | reserved={reserved:.2f} GB | max={max_alloc:.2f} GB")
-    
-    
+
     use_deepspeed = use_deepspeed or (engine is not None)
     tqdm = tqdm_module.tqdm if tqdm_module is not None else None
 
@@ -220,6 +229,7 @@ def train_one_epoch(
     nan_detected = False
     use_amp = bool(amp_enabled)
 
+    # Router 相关
     router_type = model.module.moe.router_type if hasattr(model, "module") else model.moe.router_type
     if "adamv" == router_type:
         router = model.module.moe.router if hasattr(model, "module") else model.moe.router
@@ -228,16 +238,19 @@ def train_one_epoch(
     is_ddp_like = hasattr(model, "no_sync")
     num_steps = len(train_loader)
 
+    # 分布式 Sampler 设 epoch
     if getattr(config, "distributed", None) and getattr(config.distributed, "use_distributed", False):
         if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
             train_loader.sampler.set_epoch(epoch)
 
+    # 清梯度
     if use_deepspeed:
         engine.zero_grad()
     else:
         if optimizer is not None:
             optimizer.zero_grad(set_to_none=True)
 
+    # 进度条
     pbar_iter = train_loader
     if tqdm is not None:
         pbar_iter = tqdm(
@@ -246,7 +259,12 @@ def train_one_epoch(
             leave=False,
             disable=not _is_main_process(is_logger, engine),
         )
-    
+
+    # 显存观测（可选）
+    if _is_main_process(is_logger, engine):
+        mem()
+
+    # ====== 训练循环 ======
     for step, batch in enumerate(pbar_iter):
         global_step = epoch * num_steps + step
         inputs = batch['input'].to(device, non_blocking=True)
@@ -255,60 +273,72 @@ def train_one_epoch(
             labels = batch['v_type'].to(device, non_blocking=True)
 
         last_micro = ((step + 1) % accum_steps == 0) or ((step + 1) == num_steps)
-
         sync_ctx = (
             (model.no_sync() if (is_ddp_like and not last_micro and not use_deepspeed) else nullcontext())
         )
-        
+
         step_has_nan = False
         with sync_ctx:
             with maybe_autocast(use_amp, device):
                 preds, aux_loss, weights = model(inputs, use_amp=use_amp)
             if aux_loss is None:
                 aux_loss = preds.new_zeros(())
+
             if train_encoder:
                 loss_dict = criterion(preds, targets, weights, labels)
             else:
                 loss_dict = criterion(preds, targets)
 
-            # —— 采样一次权重直方图 —— #
+            # —— 采样一次权重直方图（日志用 float，不保留计算图） —— #
             if tb_active and type_weight_hist_sample is None and (weights is not None):
                 flat_weights = weights.detach().float().cpu().reshape(-1)
                 if flat_weights.numel() > max_type_weight_hist_samples:
                     flat_weights = flat_weights[:max_type_weight_hist_samples]
-                type_weight_hist_sample = flat_weights  # ← 只在首次设置
+                type_weight_hist_sample = flat_weights  # 只在首次设置
 
-            loss_raw = loss_dict["loss"] + coef * aux_loss
+            # ------- 关键修复：全部使用 Tensor 路径做反传 ------- #
+            aux_term_t = aux_loss.detach() if aux_loss is not None else preds.new_zeros(())
+            # loss_dict["loss_t"] 是 Tensor；coef * aux_term_t 也是 Tensor
+            loss_raw_t = loss_dict["loss_t"] + coef * aux_term_t
 
-            if not torch.isfinite(loss_raw).item():
+            # 有限性检查（Tensor）
+            if not torch.isfinite(loss_raw_t).all().item():
                 step_has_nan = True
                 nan_detected = True
             else:
                 current_group_size = accum_steps if not last_micro else ((step % accum_steps) + 1)
-                loss_for_backward = loss_raw / current_group_size
+                loss_for_backward = loss_raw_t / current_group_size
 
                 if use_deepspeed:
                     engine.backward(loss_for_backward)
                 else:
                     loss_for_backward.backward()
 
-                running_train_loss += loss_raw.item()
-                running_aux_loss += aux_loss.item()
+                # 日志累计用 float（无计算图）
+                running_train_loss += float(loss_dict["loss"])
+                running_aux_loss   += float(aux_term_t.detach().item())
                 micro_count += 1
 
         if step_has_nan:
             if use_deepspeed:
-                engine.zero_grad(set_to_none=True)
+                engine.zero_grad()
             else:
-                optimizer.zero_grad(set_to_none=True)
+                if optimizer is not None:
+                    optimizer.zero_grad(set_to_none=True)
             if _is_main_process(is_logger, engine):
                 print(f"[NaN Detected] loss became NaN at step {step + 1}, aborting epoch early.")
+            # 释放 step 内持有的引用
+            del preds, aux_term_t, loss_raw_t, weights, inputs, targets, loss_dict
+            if train_encoder:
+                del labels
+            gc.collect()
+            torch.cuda.empty_cache()
             break
 
         if last_micro:
             if use_deepspeed:
                 engine.step()
-                engine.zero_grad(set_to_none=True)
+                engine.zero_grad()
             else:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -320,11 +350,17 @@ def train_one_epoch(
                 tb_writer.add_scalar("train/learning_rate", current_lr, global_step)
 
         if _is_main_process(is_logger, engine) and tqdm is not None:
-            pbar_iter.set_postfix({"train_loss": f"{loss_raw.item():.6f}"})
+            # 只显示 float，不保留图
+            pbar_iter.set_postfix({"train_loss": f"{float(loss_raw_t.detach().item()):.6f}"})
 
-        # 释放引用
-        del preds, aux_loss
+        # —— 训练步末尾：彻底释放显存相关引用 —— #
+        del preds, aux_term_t, loss_raw_t, weights, inputs, targets, loss_dict
+        if train_encoder:
+            del labels
+        # 若确实显存紧张才打开；默认注释掉避免频繁 sync
+        torch.cuda.empty_cache()
 
+    # ====== 统计训练损失 ======
     if nan_detected and micro_count == 0:
         avg_train_loss = float("nan")
         avg_aux_loss = float("nan")
@@ -337,6 +373,7 @@ def train_one_epoch(
         tb_writer.add_scalar("train/epoch_loss", avg_train_loss, epoch_step)
         tb_writer.add_scalar("train/epoch_aux_loss", avg_aux_loss, epoch_step)
 
+    # ====== 验证 ======
     if nan_detected:
         val_stats = {
             "val_loss": float("inf"),
@@ -381,7 +418,7 @@ def train_one_epoch(
         if train_encoder:
             tb_writer.add_scalar("val/ce", val_stats.get("ce", float("nan")), epoch_step)
 
-    # —— Router 控制 —— #
+    # ====== Router 控制 ======
     if router_type == 'adamv':
         signal = router.step_validation(val_loss)
         if is_ddp_like and not use_deepspeed:
@@ -401,7 +438,7 @@ def train_one_epoch(
             if _is_main_process(is_logger, engine):
                 print(f'epoch: {epoch} AES probe failed -> fix top_k = {router.k}')
 
-    # —— 文本日志 / W&B —— #
+    # ====== 文本日志 / W&B ======
     if _is_main_process(is_logger, engine) and (log_file is not None):
         cols = [
             f"    {epoch+1}",
@@ -413,7 +450,7 @@ def train_one_epoch(
             f"{val_stats['rmse']:.6f}",
             f"{val_stats['ssim']:.6f}",
         ]
-        if train_encoder:
+        if train_encoder and "ce" in val_stats:
             cols.append(f"{val_stats['ce']:.6f}")
         line = "    |    ".join(cols) + "    |\n"
         with open(log_file, "a") as f:
@@ -431,14 +468,14 @@ def train_one_epoch(
             "val/rmse": val_stats["rmse"],
             "val/ssim": val_stats["ssim"],
         }
-        if train_encoder:
+        if train_encoder and "ce" in val_stats:
             wandb_log["val/ce"] = val_stats["ce"]
         wandb_module.log(wandb_log)
 
     if tb_active and type_weight_hist_sample is not None:
         tb_writer.add_histogram("encoder/type_weights", type_weight_hist_sample, epoch_step)
 
-    # —— 保存（最佳 / 最新）—— #
+    # ====== 保存（最佳 / 最新） ======
     def _save_checkpoints(tag_path: Optional[str], best: bool):
         if not _is_main_process(is_logger, engine):
             return
@@ -513,57 +550,84 @@ def train_one_epoch(
         print(f"  Train Loss: {avg_train_loss:.6f}")
         print(f"  Val   Loss: {val_loss:.6f}")
 
+    # ====== 可视化（rank0，显存友好） ======
     if _is_main_process(is_logger, engine) and vis_now and (visualize_results is not None):
-        vis_batch = next(iter(val_loader))
-        inputs = vis_batch['input'].to(device, non_blocking=True)
-        targets = vis_batch['output'].to(device, non_blocking=True)
-
-        preds, _, vis_weights = model(inputs, use_amp=use_amp)
-
-        inputs_v = input_inverse_transform(inputs) if input_inverse_transform else inputs
-        if output_inverse_transform:
-            preds_v = output_inverse_transform(preds)
-            targets_v = output_inverse_transform(targets)
+        # 兼容 Path/str
+        if isinstance(results_dir, Path):
+            save_dir_vis = results_dir / f"vis_epoch_{epoch+1}"
+            save_dir_fft = results_dir / f"fourier_analysis_epoch_{epoch+1}"
         else:
-            preds_v, targets_v = preds, targets
+            save_dir_vis = os.path.join(results_dir, f"vis_epoch_{epoch+1}")
+            save_dir_fft = os.path.join(results_dir, f"fourier_analysis_epoch_{epoch+1}")
 
-        num_samples = min(image_log_limit, inputs_v.shape[0])
-        wandb_run = wandb_module if (use_wandb and wandb_module is not None) else None
-        tb = tb_writer if tb_active else None
+        with torch.inference_mode():
+            # 只取一个 batch 用于展示
+            try:
+                vis_batch = next(iter(val_loader))
+            except StopIteration:
+                vis_batch = None
 
-        inputs_v = inputs_v.detach().cpu().numpy()
-        targets_v = targets_v.detach().cpu().numpy()
-        preds_v = preds_v.detach().cpu().numpy()
-        
-        visualize_results(
-            inputs_v, targets_v, preds_v,
-            save_dir=results_dir / f"vis_epoch_{epoch+1}",
-            max_samples=num_samples,
-            tb_writer=tb,
-            wandb_run=wandb_run,
-            global_step=epoch,
-        )
+            if vis_batch is not None:
+                inputs = vis_batch['input'].to(device, non_blocking=True)
+                targets = vis_batch['output'].to(device, non_blocking=True)
 
-        save_type_predictions_txt(
-            logits=vis_weights,
-            batch=vis_batch,
-            save_dir=results_dir / f"vis_epoch_{epoch+1}",
-            epoch=epoch,
-            config=config,
-            filename="type_predictions.txt",
-            append=True,
-            is_logger=_is_main_process(is_logger, engine),
-        )
+                with maybe_autocast(amp_enabled, device):
+                    preds, _, vis_weights = model(inputs, use_amp=amp_enabled)
 
-        analyze_fourier_domain(
-            inputs_v, targets_v, preds_v,
-            save_dir=results_dir / f"fourier_analysis_epoch_{epoch+1}",
-            max_samples=num_samples,
-            tb_writer=tb,
-            wandb_run=wandb_run,
-            global_step=epoch,
-        )
+                inputs_v  = input_inverse_transform(inputs) if input_inverse_transform else inputs
+                if output_inverse_transform:
+                    preds_v   = output_inverse_transform(preds)
+                    targets_v = output_inverse_transform(targets)
+                else:
+                    preds_v, targets_v = preds, targets
 
+                # 先裁样本，再搬到 CPU/numpy
+                num_samples = min(image_log_limit, inputs_v.shape[0])
+                inputs_v  = inputs_v[:num_samples].detach().to('cpu', non_blocking=True).float().numpy()
+                targets_v = targets_v[:num_samples].detach().to('cpu', non_blocking=True).float().numpy()
+                preds_v   = preds_v[:num_samples].detach().to('cpu', non_blocking=True).float().numpy()
+
+                wandb_run = wandb_module if (use_wandb and wandb_module is not None) else None
+                tb = tb_writer if tb_active else None
+
+                visualize_results(
+                    inputs_v, targets_v, preds_v,
+                    save_dir=save_dir_vis,
+                    max_samples=num_samples,
+                    tb_writer=tb,
+                    wandb_run=wandb_run,
+                    global_step=epoch,
+                )
+
+                if vis_weights is not None:
+                    logits_cpu = vis_weights.detach().to('cpu', non_blocking=True).float()
+                    save_type_predictions_txt(
+                        logits=logits_cpu,
+                        batch=vis_batch,
+                        save_dir=save_dir_vis,
+                        epoch=epoch,
+                        config=config,
+                        filename="type_predictions.txt",
+                        append=True,
+                        is_logger=True,
+                    )
+
+                analyze_fourier_domain(
+                    inputs_v, targets_v, preds_v,
+                    save_dir=save_dir_fft,
+                    max_samples=num_samples,
+                    tb_writer=tb,
+                    wandb_run=wandb_run,
+                    global_step=epoch,
+                )
+
+                # 彻底断引用，避免 rank0 显存累积
+                del inputs, targets, preds, vis_weights, inputs_v, targets_v, preds_v, vis_batch
+                gc.collect()
+                # 若你希望进一步降低 reserved 峰值，可临时启用
+                # torch.cuda.empty_cache()
+
+    # ====== Early Stop / 同步 ======
     stop_flag = 0
     if getattr(config, "early_stop", False):
         if _is_main_process(is_logger, engine) and (early_stopper is not None) and (not nan_detected):

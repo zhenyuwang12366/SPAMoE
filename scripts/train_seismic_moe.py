@@ -128,6 +128,8 @@ class TransformedSubset(Subset):
 def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = True
     config, runtime_ctx = get_seismic_config(args)
 
     use_deepspeed: bool = bool(getattr(args, "use_deepspeed", False))
@@ -503,8 +505,8 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             model = DDP(
                 emo_model, device_ids=[device.index],
                 output_device=device.index,
-                static_graph=False,
-                find_unused_parameters=True,
+                static_graph=True,
+                find_unused_parameters=False,
                 gradient_as_bucket_view=True,
             )
         else:
@@ -672,60 +674,83 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     grad_loss_module = SobelLoss().to(device) if lambda_grad_l1 > 0 else None
     fourier_loss_module = FourierMag_L1().to(device) if lambda_fourier_mag_l1 > 0 else None
 
+    # 训练分类 + 回归（encoder logits 参与 CE）
     if config.train_encoder:
         def criterion(pred: torch.Tensor, gt: torch.Tensor, logits: torch.Tensor, labels: torch.Tensor):
+            # base: 必须返回 Tensor 分量 {"loss", "l1", "l2"}
             loss_dict = base_loss(pred, gt)
-            total_loss = loss_dict["loss"]
+            total_loss_t = loss_dict["loss"]                    # Tensor (标量)
 
-            grad_val = pred.new_zeros(())
+            # grad L1
+            grad_val_t = pred.new_zeros(())
             if grad_loss_module is not None:
-                grad_res = grad_loss_module(pred, gt)
-                grad_val = grad_res["loss"]
-                total_loss = total_loss + lambda_grad_l1 * grad_val
+                grad_res = grad_loss_module(pred, gt)           # {"loss": tensor}
+                grad_val_t = grad_res["loss"]
+                total_loss_t = total_loss_t + lambda_grad_l1 * grad_val_t
 
-            fourier_val = pred.new_zeros(())
+            # fourier L1
+            fourier_val_t = pred.new_zeros(())
             if fourier_loss_module is not None:
-                fourier_res = fourier_loss_module(pred, gt)
-                fourier_val = fourier_res["loss"]
-                total_loss = total_loss + lambda_fourier_mag_l1 * fourier_val
+                fourier_res = fourier_loss_module(pred, gt)     # {"loss": tensor}
+                fourier_val_t = fourier_res["loss"]
+                total_loss_t = total_loss_t + lambda_fourier_mag_l1 * fourier_val_t
 
-            ce_val = pred.new_zeros(())
+            # Cross Entropy
+            ce_val_t = pred.new_zeros(())
             if logits is not None and labels is not None:
-                ce_val = F.cross_entropy(logits, labels.long(), reduction="mean")
-                total_loss = total_loss + lambda_ce * ce_val
+                ce_val_t = F.cross_entropy(logits, labels.long(), reduction="mean")
+                total_loss_t = total_loss_t + lambda_ce * ce_val_t
 
+            # 返回两套（*_t: 反传用；无后缀: 日志用 float）
             combined = {
-                "loss": total_loss,
-                "l1": loss_dict["l1"],
-                "l2": loss_dict["l2"],
-                "grad_l1": grad_val.detach(),
-                "fourier_l1": fourier_val.detach(),
-                "ce": ce_val.detach(),
+                # tensors for backward
+                "loss_t":       total_loss_t,
+                "l1_t":         loss_dict["l1"],
+                "l2_t":         loss_dict["l2"],
+                "grad_l1_t":    grad_val_t,
+                "fourier_l1_t": fourier_val_t,
+                "ce_t":         ce_val_t,
+
+                # floats for logging
+                "loss":         float(total_loss_t.detach().item()),
+                "l1":           float(loss_dict["l1"].detach().item()),
+                "l2":           float(loss_dict["l2"].detach().item()),
+                "grad_l1":      float(grad_val_t.detach().item()),
+                "fourier_l1":   float(fourier_val_t.detach().item()),
+                "ce":           float(ce_val_t.detach().item()),
             }
             return combined
     else:
         def criterion(pred: torch.Tensor, gt: torch.Tensor):
             loss_dict = base_loss(pred, gt)
-            total_loss = loss_dict["loss"]
+            total_loss_t = loss_dict["loss"]
 
-            grad_val = pred.new_zeros(())
+            grad_val_t = pred.new_zeros(())
             if grad_loss_module is not None:
                 grad_res = grad_loss_module(pred, gt)
-                grad_val = grad_res["loss"]
-                total_loss = total_loss + lambda_grad_l1 * grad_val
+                grad_val_t = grad_res["loss"]
+                total_loss_t = total_loss_t + lambda_grad_l1 * grad_val_t
 
-            fourier_val = pred.new_zeros(())
+            fourier_val_t = pred.new_zeros(())
             if fourier_loss_module is not None:
                 fourier_res = fourier_loss_module(pred, gt)
-                fourier_val = fourier_res["loss"]
-                total_loss = total_loss + lambda_fourier_mag_l1 * fourier_val
+                fourier_val_t = fourier_res["loss"]
+                total_loss_t = total_loss_t + lambda_fourier_mag_l1 * fourier_val_t
 
             combined = {
-                "loss": total_loss,
-                "l1": loss_dict["l1"],
-                "l2": loss_dict["l2"],
-                "grad_l1": grad_val.detach(),
-                "fourier_l1": fourier_val.detach(),
+                # tensors for backward
+                "loss_t":       total_loss_t,
+                "l1_t":         loss_dict["l1"],
+                "l2_t":         loss_dict["l2"],
+                "grad_l1_t":    grad_val_t,
+                "fourier_l1_t": fourier_val_t,
+
+                # floats for logging
+                "loss":         float(total_loss_t.detach().item()),
+                "l1":           float(loss_dict["l1"].detach().item()),
+                "l2":           float(loss_dict["l2"].detach().item()),
+                "grad_l1":      float(grad_val_t.detach().item()),
+                "fourier_l1":   float(fourier_val_t.detach().item()),
             }
             return combined
 
