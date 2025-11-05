@@ -582,7 +582,6 @@ def train_one_epoch(
                 else:
                     preds_v, targets_v = preds, targets
 
-                # 先裁样本，再搬到 CPU/numpy
                 num_samples = min(image_log_limit, inputs_v.shape[0])
 
                 wandb_run = wandb_module if (use_wandb and wandb_module is not None) else None
