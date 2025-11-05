@@ -1095,24 +1095,27 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
 
 def run_inference(n_args):
     """
-    基于 EMO 接口的推理流程：
-      - 统一构建 Encoder + MOE -> EMO
-      - 'all' 模式：从目录加载各专家，仅加载 router 和 encoder 权重
-      - 常规模式：从 checkpoint 加载 model_state_dict（MoE）与可选 encoder_state_dict
-      - 评估 Zarr split（默认 val），保存可视化与类型预测文本
+    推理流程（与训练流程严格对偶）：
+      1) 载入训练期 args/config，并用 CLI 覆盖
+      2) 构建数据管线（Zarr + 归一化）
+      3) 构建 Encoder + MOE -> EMO（参数与训练完全一致）
+      4) 权重加载：
+         - 'all'：仅加载 router（以及必须提供 encoder_path）；专家从目录 load
+         - 其他：从 checkpoint 加载 MoE（model_state_dict 或 router_state_dict），Encoder 优先 encoder_path
+      5) AMP(bf16) 推理、指标统计、可视化/类型预测保存/频域分析
     """
-    from torchvision.transforms import Compose
     import tqdm
     from argparse import Namespace
+    from torchvision.transforms import Compose
 
     # ===== 读取训练期保存的 args/config，并被 CLI 覆盖 =====
     setting_dir = Path(getattr(n_args, "setting_path", ""))
     if not setting_dir:
-        raise ValueError("推理模式需要指定包含 args.json/config.json 的 --setting_path 目录")
+        raise ValueError("推理需要 --setting_path（包含训练时保存的 args.json 与 config.json）")
     if not setting_dir.exists():
-        raise ValueError(f"配置目录不存在: {setting_dir}")
+        raise ValueError(f"--setting_path 不存在: {setting_dir}")
 
-    args_path = setting_dir / "args.json"
+    args_path   = setting_dir / "args.json"
     config_path = setting_dir / "config.json"
     if not args_path.exists():
         raise ValueError(f"缺少训练时保存的参数文件: {args_path}")
@@ -1132,15 +1135,16 @@ def run_inference(n_args):
     runtime_args_dict["mode"] = "inference"
     runtime_args = Namespace(**runtime_args_dict)
 
-    # ===== 初始化 config / 运行环境 =====
+    # ===== 初始化 config / 运行环境（与训练一致） =====
     config, runtime_ctx = get_seismic_config(runtime_args)
-    device = runtime_ctx["device"]
-    is_logger = runtime_ctx["is_logger"]
-    world_size = runtime_ctx["world_size"]
-    local_rank = runtime_ctx["local_rank"]
+    device       = runtime_ctx["device"]
+    is_logger    = runtime_ctx["is_logger"]
+    world_size   = runtime_ctx["world_size"]
+    local_rank   = runtime_ctx["local_rank"]
+    experts_name = runtime_ctx["experts_name"]
     experts_name_str = runtime_ctx["experts_name_str"]
 
-    # 将训练期的 config 字段回填到当前 config（保持一致）
+    # 回填训练时的 config 字段（保持一致）
     def _recursive_update(obj, payload):
         for k, v in payload.items():
             if isinstance(v, dict) and hasattr(obj, k):
@@ -1153,15 +1157,14 @@ def run_inference(n_args):
                 setattr(obj, k, v)
     _recursive_update(config, stored_config_dict)
 
-    # ===== 归一化统计 =====
+    # ===== 归一化统计（优先 --status_json；否则 checkpoint 内的 data_dict）=====
     checkpoint = None
     if experts_name_str != "all":
         model_path = Path(getattr(runtime_args, "model_path", ""))
         if not model_path.exists():
-            raise ValueError(f"模型文件不存在: {model_path}")
+            raise ValueError(f"[MoE] 常规推理需要提供模型文件 --model_path，未找到: {model_path}")
         checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
 
-    # 优先取 --status_json，其次 checkpoint.data_dict
     stats_dict = None
     status_json = getattr(runtime_args, "status_json", None)
     if status_json and Path(status_json).exists():
@@ -1171,13 +1174,13 @@ def run_inference(n_args):
             stats_dict = status_payload.get("overall")
         else:
             stats_dict = status_payload.get("per_type", {}).get(config.family)
+    if stats_dict is None and isinstance(checkpoint, dict):
+        stats_dict = checkpoint.get("data_dict")
     if stats_dict is None:
-        stats_dict = checkpoint.get("data_dict", None) if isinstance(checkpoint, dict) else None
-    if stats_dict is None:
-        hint = "（ALL 模式下通常无整体 checkpoint，请提供 --status_json）" if experts_name_str == "all" else ""
-        raise ValueError(f"无法获取归一化统计量，请确保提供 --status_json 或 checkpoint 中包含 data_dict。{hint}")
+        hint = "（ALL 模式下通常无整体 checkpoint，请通过 --status_json 提供归一化统计量）" if experts_name_str == "all" else ""
+        raise ValueError(f"无法获取归一化统计量，请提供 --status_json 或确保 checkpoint 中包含 data_dict。{hint}")
 
-    # ===== 变换 & DataLoader =====
+    # ===== 数据变换 & Zarr DataLoader（与训练相同的对数 + MinMax）=====
     k_value = float(getattr(runtime_args, "k", 1.0))
     input_transform = Compose([
         T.LogTransform(k=k_value),
@@ -1222,7 +1225,7 @@ def run_inference(n_args):
     )
     test_dataset_with_transform = TransformedSubset(test_dataset, data_processor)
 
-    # 分布式/单机
+    # 分布式/单机（与训练一致）
     if getattr(runtime_args, "distributed", False) and world_size > 1:
         test_sampler = DistributedSampler(
             test_dataset_with_transform,
@@ -1231,7 +1234,7 @@ def run_inference(n_args):
             shuffle=False,
             drop_last=False,
         )
-        num_workers = max(0, runtime_args.num_workers // 2)
+        num_workers = max(0, getattr(runtime_args, "num_workers", 0) // 2)
         test_loader = DataLoader(
             test_dataset_with_transform,
             sampler=test_sampler,
@@ -1256,46 +1259,45 @@ def run_inference(n_args):
     if len(test_loader) == 0:
         raise RuntimeError("测试数据加载器为空，请检查数据集配置。")
 
-    # ===== 构建 EMO（Encoder + MOE）=====
-    # 1) 探测 in_channels
+    # ===== 构建 EMO（Encoder + MOE），与训练完全一致的参数 =====
+    # 探测 in_channels
     sample_batch = next(iter(test_loader))
     config.in_channels = int(sample_batch["input"].shape[1])
 
-    # 2) Encoder
+    # --- Encoder ---
     encoder_model = None
     if getattr(config, "use_encoder", False):
         num_types = int(getattr(config, "v_type_num", 10) or 10)
-        type_act = "identity" if getattr(config, "train_encoder", False) else "softmax"
+        type_act  = "identity" if getattr(config, "train_encoder", False) else "softmax"
         encoder_model = get_encoder(
             in_channels=config.in_channels,
             out_channels=128,
             num_types=num_types,
             type_act=type_act,
             backbone=config.backbone,
-        )
-        encoder_model = encoder_model.to(device)
+        ).to(device)
         encoder_model.eval()
         for p in encoder_model.parameters():
             p.requires_grad_(False)
 
-        # 加载 encoder 权重：优先 --encoder_path；否则 checkpoint.encoder_state_dict
+        # Encoder 权重优先级：--encoder_path > checkpoint.encoder_state_dict > 随机
         if experts_name_str == "all":
             enc_ckpt = getattr(runtime_args, "encoder_path", None)
             if not enc_ckpt:
-                raise ValueError("[Encoder] experts_name_str='all' 模式下必须提供 --encoder_path。")
+                raise ValueError("[Encoder] experts_name_str='all' 模式下必须提供 --encoder_path")
             missing, unexpected = load_encoder_weights(encoder_model, enc_ckpt, map_location=device, strict=False)
             if is_logger:
-                print(f"[Encoder] (ALL 模式) 已从 {enc_ckpt} 加载推理权重。")
-                if missing:   print(f"[Encoder] 缺失参数: {missing}")
-                if unexpected:print(f"[Encoder] 未使用参数: {unexpected}")
+                print(f"[Encoder] (ALL) 已从 {enc_ckpt} 加载推理权重。")
+                if missing:    print(f"[Encoder] 缺失参数: {missing}")
+                if unexpected: print(f"[Encoder] 未使用参数: {unexpected}")
         else:
             enc_ckpt = getattr(runtime_args, "encoder_path", None)
             if enc_ckpt:
                 missing, unexpected = load_encoder_weights(encoder_model, enc_ckpt, map_location=device, strict=False)
                 if is_logger:
                     print(f"[Encoder] 已从 {enc_ckpt} 加载推理权重。")
-                    if missing:   print(f"[Encoder] 缺失参数: {missing}")
-                    if unexpected:print(f"[Encoder] 未使用参数: {unexpected}")
+                    if missing:    print(f"[Encoder] 缺失参数: {missing}")
+                    if unexpected: print(f"[Encoder] 未使用参数: {unexpected}")
             else:
                 encoder_state = checkpoint.get("encoder_state_dict") if isinstance(checkpoint, dict) else None
                 if encoder_state is not None:
@@ -1305,7 +1307,7 @@ def run_inference(n_args):
                 elif is_logger:
                     print("[Encoder] 未提供 encoder_path，且 checkpoint 中缺少 encoder_state_dict，将使用随机初始化的编码器。")
 
-        # 3) 决定 moe_in_channels
+        # 决定 moe_in_channels（用一次 probe）
         with torch.no_grad():
             probe_inputs = sample_batch["input"].to(device, non_blocking=True)
             encoder_probe, _, _ = encoder_model(probe_inputs)
@@ -1316,11 +1318,11 @@ def run_inference(n_args):
         if is_logger:
             print("[Encoder] use_encoder=False，推理阶段直接使用原始输入。")
 
-    # 4) Experts + MOE
+    # --- Experts ---
     if experts_name_str == "all":
         experts_dir = getattr(config, "use_experts_path", None) or getattr(runtime_args, "experts_path", None)
         if not experts_dir:
-            raise ValueError("[Experts] experts_name_str='all' 模式下必须提供专家权重目录（config.use_experts_path 或 --experts_path）。")
+            raise ValueError("[Experts] experts_name_str='all' 模式下必须提供专家权重目录（config.use_experts_path 或 --experts_path）")
         if not Path(experts_dir).exists():
             raise ValueError(f"[Experts] 专家权重目录不存在: {experts_dir}")
 
@@ -1336,7 +1338,7 @@ def run_inference(n_args):
             moe_mode=getattr(config, "moe_mode", "standard"),
         )
         if is_logger:
-            print(f"[Experts] (ALL 模式) 已从目录加载专家: {experts_dir}")
+            print(f"[Experts] (ALL) 已从目录加载专家: {experts_dir}")
     else:
         if getattr(config, "use_moe", False) and getattr(config, "use_experts_path", None):
             experts = load_moe_experts(
@@ -1358,6 +1360,7 @@ def run_inference(n_args):
                 hidden_channels=config.hidden_channels,
             )
 
+    # --- MoE ---
     moe = MOEOperator(
         experts=experts,
         in_channels=config.moe_in_channels,
@@ -1377,33 +1380,33 @@ def run_inference(n_args):
         is_classifier=config.is_classifier,
         batch_size=config.batch_size,
         v_type_num=config.v_type_num,
-        use_expert_memory_proxy=config.use_gpu_proxy,
+        use_expert_memory_proxy=config.use_gpu_proxy,   # 与训练一致
         use_encoder=getattr(config, "use_encoder", False),
+        device=device,                                  # 与训练保持同构
     )
 
-    # 5) EMO 封装与权重加载
+    # --- EMO 封装 ---
     emo = EMO(encoder_model, moe, pass_encoder_logits_as_weights=True).to(device)
     emo.eval()
 
+    # ===== 权重加载（严格对偶保存逻辑）=====
     if experts_name_str == "all":
         router_path = getattr(runtime_args, "router_path", None)
         if not router_path:
-            raise ValueError("[Router] experts_name_str='all' 模式下必须提供 --router_path。")
+            raise ValueError("[Router] experts_name_str='all' 模式下必须提供 --router_path")
         _load_router_weights(emo.moe, router_path, map_location=device, is_logger=is_logger)
     else:
-        # 常规：从 checkpoint 加载 MoE（state_dict 存的就是 MoE）
-        if "model_state_dict" in checkpoint:
-            missing, unexpected = emo.moe.load_state_dict(checkpoint["model_state_dict"], strict=False)
-            if is_logger and (missing or unexpected):
-                print(f"[MoE] 从 checkpoint 加载：缺失 {missing}, 多余 {unexpected}")
-        else:
-            # 兼容你训练逻辑中 router-only 的保存
-            if "router_state_dict" in checkpoint:
+        if isinstance(checkpoint, dict):
+            if "model_state_dict" in checkpoint:
+                missing, unexpected = emo.moe.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                if is_logger and (missing or unexpected):
+                    print(f"[MoE] 从 checkpoint 加载：缺失 {missing}, 多余 {unexpected}")
+            elif "router_state_dict" in checkpoint:
                 emo.moe.router.load_state_dict(checkpoint["router_state_dict"], strict=False)
             else:
                 raise ValueError("checkpoint 中既无 model_state_dict 也无 router_state_dict，无法恢复 MoE。")
 
-    # ===== 推理循环 =====
+    # ===== 推理循环（AMP bf16，与训练相同的 dtype 策略）=====
     amp_enabled = bool(getattr(config, "use_amp", False)) and device.type == "cuda"
 
     default_root = getattr(config, "experiment_dir", None) or getattr(config, "output_dir", None) or setting_dir
@@ -1415,7 +1418,6 @@ def run_inference(n_args):
     img_path.mkdir(parents=True, exist_ok=True)
 
     metrics_module = SeismicMetrics()
-
     with open(log_path, "w", encoding="utf-8") as f:
         f.write("    Epoch    |    Train Loss    |    Val Loss    |    MAE    |    MSE    |    PSNR    |    RMSE    |    SSIM    |\n")
 
@@ -1423,25 +1425,23 @@ def run_inference(n_args):
     batch_count = 0
     visual_payload = None
 
-    model_kwargs = {}
     with torch.no_grad():
         for batch in tqdm.tqdm(test_loader, desc=f"推理中({eval_split})", disable=not is_logger):
-            inputs = batch["input"].to(device, non_blocking=True)
+            inputs  = batch["input"].to(device, non_blocking=True)
             targets = batch.get("output")
             if targets is None:
                 continue
             targets = targets.to(device, non_blocking=True).to(dtype=torch.float32)
 
-            # 统一用 EMO.forward：preds, aux, enc_weights
             if amp_enabled:
                 with torch.amp.autocast(device_type=device.type, enabled=True, dtype=torch.bfloat16):
-                    preds, aux, enc_weights = emo(inputs, **model_kwargs)
+                    preds, aux, enc_weights = emo(inputs)
             else:
-                preds, aux, enc_weights = emo(inputs, **model_kwargs)
+                preds, aux, enc_weights = emo(inputs)
 
             preds = preds.to(dtype=torch.float32)
 
-            # 统计指标
+            # 指标累计（与训练的 metrics 模块一致）
             mse_sum  += metrics_module.calculate_mse(preds, targets)
             mae_sum  += metrics_module.calculate_mae(preds, targets)
             psnr_sum += metrics_module.calculate_psnr(preds, targets)
@@ -1449,7 +1449,7 @@ def run_inference(n_args):
             ssim_sum += metrics_module.calculate_ssim(preds, targets)
             batch_count += 1
 
-            # 仅采样一次可视化
+            # 仅采样一次可视化样本
             if visual_payload is None and is_logger:
                 inputs_cpu  = inputs.detach().cpu()
                 targets_cpu = targets.detach().cpu()
@@ -1460,7 +1460,8 @@ def run_inference(n_args):
                     preds_cpu   = output_inverse_transform(preds_cpu)
                     targets_cpu = output_inverse_transform(targets_cpu)
                 logits_cpu = enc_weights.detach().cpu() if enc_weights is not None else None
-                # 额外把 encoder 输出特征也保存（若启用 encoder）
+
+                # 若启用 encoder，额外导出中间编码特征
                 if encoder_model is not None:
                     if amp_enabled:
                         with torch.amp.autocast(device_type=device.type, enabled=True, dtype=torch.bfloat16):
@@ -1495,7 +1496,7 @@ def run_inference(n_args):
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"  Inference |        -        |        -        | {mae:.6f} | {mse:.6f} | {psnr:.4f} | {rmse:.6f} | {ssim:.6f} |\n")
 
-    # ===== 可视化输出 =====
+    # ===== 可视化输出（与训练日志一致）=====
     if visual_payload is not None:
         inputs_vis  = visual_payload["inputs"]
         targets_vis = visual_payload["targets"]
@@ -1532,14 +1533,19 @@ def run_inference(n_args):
             max_samples=num_samples,
         )
 
-        if encoded_vis is not None:
-            visualize_encoded(
-                encoded_vis,
-                save_dir=img_path,
-                max_samples=num_samples,
-                channels=config.moe_in_channels,
-                selection='l2',
-            )
+        # 若你在 utils.plot_fig 中实现了 visualize_encoded，可解注释
+        try:
+            from utils.plot_fig import visualize_encoded as _viz_enc  # 可选
+            if encoded_vis is not None:
+                _viz_enc(
+                    encoded_vis,
+                    save_dir=img_path,
+                    max_samples=num_samples,
+                    channels=config.moe_in_channels,
+                    selection='l2',
+                )
+        except Exception:
+            pass
 
     if test_sampler is not None and hasattr(test_sampler, "set_epoch"):
         test_sampler.set_epoch(0)
