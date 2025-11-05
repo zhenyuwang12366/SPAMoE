@@ -427,7 +427,7 @@ class SeismicMOEConfig(Default):
                 'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
                 'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
                 'conv_kind': 'dwt',
-                'wavelet': 'coif4',
+                'wavelet': 'db6',
                 'biort': 'near_sym_b',
                 'qshift': 'qshift_b',
                 'n_layers': 4,
@@ -441,7 +441,7 @@ class SeismicMOEConfig(Default):
                 'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
                 'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
                 'conv_kind': 'dwt',
-                'wavelet': 'coif4',
+                'wavelet': 'db6',
                 'biort': 'near_sym_b',
                 'qshift': 'qshift_b',
                 'n_layers': 4,
@@ -455,7 +455,7 @@ class SeismicMOEConfig(Default):
                 'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
                 'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
                 'conv_kind': 'dwt',
-                'wavelet': 'coif4',
+                'wavelet': 'db6',
                 'biort': 'near_sym_b',
                 'qshift': 'qshift_b',
                 'n_layers': 4,

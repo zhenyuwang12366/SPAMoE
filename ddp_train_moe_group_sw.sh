@@ -58,8 +58,8 @@ PY
 nohup bash scripts/run_distributed_seismic_moe.sh \
   --mode train \
   --model_name moe_sw \
-  --num_gpus 4 \
-  --num_workers 6 \
+  --num_gpus 8 \
+  --num_workers 4 \
   --zarr_path /root/autodl-tmp/all.zarr \
   --status_json ./dataset_status/dataset_status.json \
   --family all \
@@ -70,8 +70,8 @@ nohup bash scripts/run_distributed_seismic_moe.sh \
   --use_experts_path /root/autodl-tmp/other_experts \
   --top_k 2 \
   --moe_mode group \
-  --router_type swa \
-  --fusion_type basic \
+  --router_type basic \
+  --fusion_type swa \
   --s_processor_type sum \
   --w_processor_type sum \
   --beta 0.5 \
