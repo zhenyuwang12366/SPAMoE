@@ -38,7 +38,6 @@ class SWActMerge(nn.Module):
         
     def forward(self, merged_strong: torch.Tensor, merged_weak: torch.Tensor,):
         """
-
         Args:
             merged_strong (torch.Tensor[B,1,H,W]):强专家输出
             merged_weak (torch.Tensor[B,1,H,W]): 弱专家输出

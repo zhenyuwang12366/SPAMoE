@@ -445,8 +445,9 @@ class MOEOperator(BaseModel, name='MOE'):
             w_combined = torch.stack(w_outputs, dim=1)
 
         if self.fusion_type == 'swa':
-            s_combined = self.s_act(s_outputs)
-            w_combined = self.w_act(w_outputs)
+            # 这里传已经 stack 好的 Tensor（而不是 list）
+            s_combined = self.s_act(s_combined)
+            w_combined = self.w_act(w_combined)
             combined_output = self.sw_act(s_combined, w_combined)
         else:
             combined_output = self.fusion(s_combined)
