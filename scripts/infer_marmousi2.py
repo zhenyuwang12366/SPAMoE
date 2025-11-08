@@ -113,48 +113,6 @@ def infer_marmousi2(n_args):
     """
     对 Marmousi2 执行完整推理流程
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    is_logger = True
-
-    # -------------------------
-    # 加载数据
-    # -------------------------
-    seis = np.load(n_args.seis_path)  # [1,1,2721,701]
-    gt = np.load(n_args.gt_path)      # [1,1,13601,2801]
-    seis_t = torch.from_numpy(seis).float().to(device)
-    gt_t = torch.from_numpy(gt).float().to(device)
-
-    # -------------------------
-    # 计算数据统计量 + 变换
-    # -------------------------
-    data_dict = compute_data_stats(seis, gt)
-    k = getattr(n_args, "k", 1.0)
-
-    input_transform = Compose([
-        T.LogTransform(k=k),
-        T.MinMaxNormalize(
-            T.log_transform(data_dict["input_min"], k=k),
-            T.log_transform(data_dict["input_max"], k=k),
-        ),
-    ])
-    output_inverse_transform = Compose([
-        T.InverseMinMaxNormalize(
-            data_dict["output_min"], data_dict["output_max"]
-        )
-    ])
-    data_processor = SeismicDataProcessor(
-        input_transform=input_transform,
-        output_transform=None,
-        channel_dim=1,
-        config=None,
-    )
-
-    seis_t = input_transform(seis_t)
-    gt_t = output_inverse_transform(gt_t)
-
-    # -------------------------
-    # 构建模型（Encoder + MoE + EMO）
-    # -------------------------
     # ===== 读取训练期保存的 args/config，并被 CLI 覆盖 =====
     setting_dir = Path(getattr(n_args, "setting_path", ""))
     if not setting_dir:
@@ -199,7 +157,48 @@ def infer_marmousi2(n_args):
     _recursive_update(config, stored_config_dict)
     
     experts_name_str = runtime_ctx["experts_name_str"]
+    device = runtime_ctx["device"]
+    is_logger = runtime_ctx["is_logger"]
 
+    # -------------------------
+    # 加载数据
+    # -------------------------
+    seis = np.load(n_args.seis_path)  # [1,1,2721,701]
+    gt = np.load(n_args.gt_path)      # [1,1,13601,2801]
+    seis_t = torch.from_numpy(seis).float().to(device).unsqueeze(0)
+    gt_t = torch.from_numpy(gt).float().to(device).unsqueeze(0)
+
+    # -------------------------
+    # 计算数据统计量 + 变换
+    # -------------------------
+    data_dict = compute_data_stats(seis, gt)
+    k = getattr(n_args, "k", 1.0)
+
+    input_transform = Compose([
+        T.LogTransform(k=k),
+        T.MinMaxNormalize(
+            T.log_transform(data_dict["input_min"], k=k),
+            T.log_transform(data_dict["input_max"], k=k),
+        ),
+    ])
+    output_inverse_transform = Compose([
+        T.InverseMinMaxNormalize(
+            data_dict["output_min"], data_dict["output_max"]
+        )
+    ])
+    data_processor = SeismicDataProcessor(
+        input_transform=input_transform,
+        output_transform=None,
+        channel_dim=1,
+        config=config,
+    )
+
+    seis_t = input_transform(seis_t)
+    gt_t = output_inverse_transform(gt_t)
+
+    # -------------------------
+    # 构建模型（Encoder + MoE + EMO）
+    # -------------------------
     # --- Encoder ---
     encoder_model = None
     if getattr(config, "use_encoder", False):

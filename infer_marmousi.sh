@@ -21,7 +21,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 nohup python scripts/infer_marmousi2.py \
   --model_path ../best_model_all.pt \
   --use_moe \
-  --use_config \
+  --use_encoder \
   --setting_path ../setting \
   > "$LOGFILE" 2>&1 &
 echo "marmousi推理已启动，日志记录在：$LOGFILE"
