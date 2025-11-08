@@ -17,7 +17,7 @@ from pathlib import Path
 import torch.nn.functional as F
 from torchvision.transforms import Compose
 from tqdm import tqdm
-
+from argparse import Namespace
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -109,7 +109,7 @@ def stitch_patches(patches, coords, full_shape, patch_size=(1000, 350), halo=(20
 # 主推理流程
 # ===============================
 
-def infer_marmousi2(args):
+def infer_marmousi2(n_args):
     """
     对 Marmousi2 执行完整推理流程
     """
@@ -119,8 +119,8 @@ def infer_marmousi2(args):
     # -------------------------
     # 加载数据
     # -------------------------
-    seis = np.load(args.seis_path)  # [1,1,2721,701]
-    gt = np.load(args.gt_path)      # [1,1,13601,2801]
+    seis = np.load(n_args.seis_path)  # [1,1,2721,701]
+    gt = np.load(n_args.gt_path)      # [1,1,13601,2801]
     seis_t = torch.from_numpy(seis).float().to(device)
     gt_t = torch.from_numpy(gt).float().to(device)
 
@@ -128,7 +128,7 @@ def infer_marmousi2(args):
     # 计算数据统计量 + 变换
     # -------------------------
     data_dict = compute_data_stats(seis, gt)
-    k = getattr(args, "k", 1.0)
+    k = getattr(n_args, "k", 1.0)
 
     input_transform = Compose([
         T.LogTransform(k=k),
@@ -155,7 +155,49 @@ def infer_marmousi2(args):
     # -------------------------
     # 构建模型（Encoder + MoE + EMO）
     # -------------------------
-    config, runtime_ctx = get_seismic_config(args)
+    # ===== 读取训练期保存的 args/config，并被 CLI 覆盖 =====
+    setting_dir = Path(getattr(n_args, "setting_path", ""))
+    if not setting_dir:
+        raise ValueError("推理需要 --setting_path（包含训练时保存的 args.json 与 config.json）")
+    if not setting_dir.exists():
+        raise ValueError(f"--setting_path 不存在: {setting_dir}")
+
+    args_path   = setting_dir / "args.json"
+    config_path = setting_dir / "config.json"
+    if not args_path.exists():
+        raise ValueError(f"缺少训练时保存的参数文件: {args_path}")
+    if not config_path.exists():
+        raise ValueError(f"缺少训练时保存的配置文件: {config_path}")
+
+    with open(args_path, "r", encoding="utf-8") as f:
+        stored_args_dict = json.load(f)
+    with open(config_path, "r", encoding="utf-8") as f:
+        stored_config_dict = json.load(f)
+
+    # CLI 高优先级覆盖
+    runtime_args_dict = dict(stored_args_dict)
+    for key, value in vars(n_args).items():
+        if value is not None:
+            runtime_args_dict[key] = value
+    runtime_args_dict["mode"] = "inference"
+    runtime_args = Namespace(**runtime_args_dict)
+
+    # ===== 初始化 config / 运行环境（与训练一致） =====
+    config, runtime_ctx = get_seismic_config(runtime_args)
+    
+    # 回填训练时的 config 字段（保持一致）
+    def _recursive_update(obj, payload):
+        for k, v in payload.items():
+            if isinstance(v, dict) and hasattr(obj, k):
+                child = getattr(obj, k)
+                if hasattr(child, "__dict__"):
+                    _recursive_update(child, v)
+                else:
+                    setattr(obj, k, v)
+            else:
+                setattr(obj, k, v)
+    _recursive_update(config, stored_config_dict)
+    
     experts_name_str = runtime_ctx["experts_name_str"]
 
     # --- Encoder ---
@@ -291,7 +333,7 @@ if __name__ == "__main__":
     parser.add_argument("--k", type=float, default=1.0, help="LogTransform 参数")
     parser.add_argument("--use_moe", action="store_true", help="是否启用 MoE")
     parser.add_argument("--use_encoder", action="store_true", help="是否使用 encoder")
-    parser.add_argument("--config_path", type=str, default=None)
+    parser.add_argument("--setting_path", type=str, default=None)
     parser.add_argument("--use_experts_path", type=str, default="../other_experts")
     args = parser.parse_args()
 
