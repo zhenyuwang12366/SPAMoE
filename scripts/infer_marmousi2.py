@@ -283,8 +283,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Marmousi2 推理脚本")
-    parser.add_argument("--seis_path", type=str, required=True, help="地震波形 numpy 文件路径")
-    parser.add_argument("--gt_path", type=str, required=True, help="速度图 ground truth 文件路径")
+    parser.add_argument("--seis_path", type=str, default="./marmousi/marmousi_synthetic_seismic.npy", help="地震波形 numpy 文件路径")
+    parser.add_argument("--gt_path", type=str, default="./marmousi/marmousi_Ip_model.npy", help="速度图 ground truth 文件路径")
     parser.add_argument("--model_path", type=str, required=True, help="MoE 模型权重路径")
     parser.add_argument("--encoder_path", type=str, default=None, help="Encoder 权重路径（可选）")
     parser.add_argument("--output_dir", type=str, default="./marmousi_results", help="输出目录")
