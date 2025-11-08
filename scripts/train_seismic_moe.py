@@ -210,6 +210,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             config=config,
             train_dataset_with_transform=train_dataset_with_transform,
             val_dataset_with_transform=val_dataset_with_transform,
+            chunks=32,
             world_size=world_size,
             local_rank=local_rank,
         )
@@ -1317,7 +1318,7 @@ def run_inference(n_args):
         config.moe_in_channels = config.in_channels
         if is_logger:
             print("[Encoder] use_encoder=False，推理阶段直接使用原始输入。")
-
+    
     # --- Experts ---
     if experts_name_str == "all":
         experts_dir = getattr(config, "use_experts_path", None) or getattr(runtime_args, "experts_path", None)
@@ -1533,19 +1534,12 @@ def run_inference(n_args):
             max_samples=num_samples,
         )
 
-        # 若你在 utils.plot_fig 中实现了 visualize_encoded，可解注释
-        try:
-            from utils.plot_fig import visualize_encoded as _viz_enc  # 可选
-            if encoded_vis is not None:
-                _viz_enc(
-                    encoded_vis,
-                    save_dir=img_path,
-                    max_samples=num_samples,
-                    channels=config.moe_in_channels,
-                    selection='l2',
-                )
-        except Exception:
-            pass
+        visualize_encoded(
+            encoded_vis,
+            save_dir=img_path,
+            max_samples=num_samples,
+            selection='l2',
+        )
 
     if test_sampler is not None and hasattr(test_sampler, "set_epoch"):
         test_sampler.set_epoch(0)

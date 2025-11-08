@@ -587,6 +587,10 @@ def train_one_epoch(
                 wandb_run = wandb_module if (use_wandb and wandb_module is not None) else None
                 tb = tb_writer if tb_active else None
 
+                inputs_v = inputs_v.to(dtype=torch.float32)
+                targets_v = targets_v.to(dtype=torch.float32)
+                preds_v = preds_v.to(dtype=torch.float32)
+                
                 visualize_results(
                     inputs_v, targets_v, preds_v,
                     save_dir=save_dir_vis,

@@ -10,6 +10,7 @@ from typing import Optional, Dict, Union, Any
 import numpy as np
 from scipy.fft import fft2, fftshift
 from PIL import Image
+import json
 
 def save_type_predictions_txt(
     logits: Optional[torch.Tensor],
@@ -293,670 +294,221 @@ def analyze_fourier_domain(inputs,
                            predictions,
                            save_dir='./results',
                            max_samples=4,
-                           # 新增：日志相关
                            tb_writer=None,
                            wandb_run=None,
                            global_step=None,
                            log_prefix='vis'):
     """
-    分析输入和输出速度波形图在傅里叶域的特点 - 完全安全版本
-    
-    Parameters:
-    -----------
-    inputs : torch.Tensor
-        输入地震数据 [B, C, H, W]
-    targets : torch.Tensor  
-        目标速度模型 [B, C, H, W]
-    predictions : torch.Tensor
-        预测速度模型 [B, C, H, W]
-    save_dir : str
-        保存目录
-    max_samples : int
-        最大分析样本数
+    分析输入与输出速度波形图在傅里叶域的特点（最终整合版）
+    - 修复 HF ratio = 0.00
+    - 标题中加入 Dominant Frequency
+    - 保留所有 WandB / TensorBoard / 文件保存逻辑
     """
     os.makedirs(save_dir, exist_ok=True)
-    
-    # 限制样本数
     n_samples = min(inputs.shape[0], max_samples)
-    
+
+    # 改进版 HF/LF 比率计算函数（归一化环带）
+    def compute_hf_lf_ratio(psd, low_band=(0.05, 0.3), high_band=(0.4, 0.85)):
+        h, w = psd.shape
+        cy, cx = h // 2, w // 2
+        yy, xx = np.ogrid[:h, :w]
+        r = np.sqrt((yy - cy)**2 + (xx - cx)**2)
+        r_norm = r / (np.sqrt(cy**2 + cx**2) + 1e-12)
+        lf_mask = (r_norm >= low_band[0]) & (r_norm < low_band[1])
+        hf_mask = (r_norm >= high_band[0]) & (r_norm < high_band[1])
+        low_e = float(np.sum(psd[lf_mask]))
+        high_e = float(np.sum(psd[hf_mask]))
+        if low_e < 1e-12:
+            return 0.0
+        hf_ratio = high_e / (low_e + 1e-12)
+        return float(np.clip(hf_ratio, 1e-6, 1e3))  # 防止0或无穷大
+
     for i in range(n_samples):
         try:
             print(f"Processing sample {i}...")
-            
-            # 安全地获取数据并转换为numpy
-            input_tensor = inputs[i]
-            target_tensor = targets[i] 
-            pred_tensor = predictions[i]
-            
-            # 处理输入数据
-            if input_tensor.dim() > 2:
-                input_data = input_tensor[0].detach().cpu().numpy()
-            else:
-                input_data = input_tensor.detach().cpu().numpy()
-                
-            # 处理目标数据
-            if target_tensor.dim() > 2:
-                target_data = target_tensor[0].detach().cpu().numpy()
-            else:
-                target_data = target_tensor.detach().cpu().numpy()
-                
-            # 处理预测数据
-            if pred_tensor.dim() > 2:
-                pred_data = pred_tensor[0].detach().cpu().numpy()
-            else:
-                pred_data = pred_tensor.detach().cpu().numpy()
-            
-            # 确保数据是2D的
-            while input_data.ndim > 2:
-                input_data = input_data.squeeze()
-            while target_data.ndim > 2:
-                target_data = target_data.squeeze()
-            while pred_data.ndim > 2:
-                pred_data = pred_data.squeeze()
-            
-            print(f"  Data shapes: Input{input_data.shape}, Target{target_data.shape}, Pred{pred_data.shape}")
-            
-            # 确保所有数据都是2D的
+
+            input_data = inputs[i].detach().cpu().numpy().squeeze()
+            target_data = targets[i].detach().cpu().numpy().squeeze()
+            pred_data = predictions[i].detach().cpu().numpy().squeeze()
+
             if input_data.ndim != 2 or target_data.ndim != 2 or pred_data.ndim != 2:
                 print(f"  Warning: Non-2D data detected, skipping sample {i}")
                 continue
-            
-            # 计算2D傅里叶变换
-            input_fft = fft2(input_data)
-            target_fft = fft2(target_data)
-            pred_fft = fft2(pred_data)
-            
-            # 计算功率谱密度 (PSD)
-            input_psd = np.abs(fftshift(input_fft))**2
-            target_psd = np.abs(fftshift(target_fft))**2
-            pred_psd = np.abs(fftshift(pred_fft))**2
-            
-            print(f"  PSD shapes: Input{input_psd.shape}, Target{target_psd.shape}, Pred{pred_psd.shape}")
-            
-            # 计算基本统计信息
-            input_mean = float(np.mean(input_data))
-            input_std = float(np.std(input_data))
-            target_mean = float(np.mean(target_data))
-            target_std = float(np.std(target_data))
-            pred_mean = float(np.mean(pred_data))
-            pred_std = float(np.std(pred_data))
-            
-            # 计算功率谱统计
-            input_psd_mean = float(np.mean(input_psd))
-            input_psd_max = float(np.max(input_psd))
-            target_psd_mean = float(np.mean(target_psd))
-            target_psd_max = float(np.max(target_psd))
-            pred_psd_mean = float(np.mean(pred_psd))
-            pred_psd_max = float(np.max(pred_psd))
-            
-            # 计算频率域特征 - 安全版本
-            h, w = input_psd.shape
-            center_h, center_w = h // 2, w // 2
-            
-            # 找到功率谱最大值的位置
-            input_max_idx = np.unravel_index(np.argmax(input_psd), input_psd.shape)
-            target_max_idx = np.unravel_index(np.argmax(target_psd), target_psd.shape)
-            pred_max_idx = np.unravel_index(np.argmax(pred_psd), pred_psd.shape)
-            
-            # 计算主频率（相对于中心）
-            input_dominant_freq = float(np.sqrt((input_max_idx[0] - center_h)**2 + (input_max_idx[1] - center_w)**2))
-            target_dominant_freq = float(np.sqrt((target_max_idx[0] - center_h)**2 + (target_max_idx[1] - center_w)**2))
-            pred_dominant_freq = float(np.sqrt((pred_max_idx[0] - center_h)**2 + (pred_max_idx[1] - center_w)**2))
-            
-            # 计算频谱能量分布
-            total_energy = float(np.sum(input_psd) + np.sum(target_psd) + np.sum(pred_psd))
-            input_energy_ratio = float(np.sum(input_psd) / total_energy) if total_energy > 0 else 0.0
-            target_energy_ratio = float(np.sum(target_psd) / total_energy) if total_energy > 0 else 0.0
-            pred_energy_ratio = float(np.sum(pred_psd) / total_energy) if total_energy > 0 else 0.0
-            
-            # 计算高频/低频能量比 - 完全安全版本
-            try:
-                # 创建距离矩阵
-                y_coords, x_coords = np.ogrid[:h, :w]
-                distances = np.sqrt((x_coords - center_w)**2 + (y_coords - center_h)**2)
-                
-                # 确保掩码尺寸正确
-                low_freq_mask = distances < min(h, w) * 0.3
-                high_freq_mask = distances > min(h, w) * 0.7
-                
-                # 计算能量
-                input_low_energy = float(np.sum(input_psd[low_freq_mask]))
-                input_high_energy = float(np.sum(input_psd[high_freq_mask]))
-                input_hf_ratio = input_high_energy / (input_low_energy + 1e-10)
-                
-                target_low_energy = float(np.sum(target_psd[low_freq_mask]))
-                target_high_energy = float(np.sum(target_psd[high_freq_mask]))
-                target_hf_ratio = target_high_energy / (target_low_energy + 1e-10)
-                
-                pred_low_energy = float(np.sum(pred_psd[low_freq_mask]))
-                pred_high_energy = float(np.sum(pred_psd[high_freq_mask]))
-                pred_hf_ratio = pred_high_energy / (pred_low_energy + 1e-10)
-                
-            except Exception as mask_error:
-                print(f"  Warning: Frequency mask calculation failed: {mask_error}")
-                # 使用默认值
-                input_hf_ratio = target_hf_ratio = pred_hf_ratio = 0.0
-            
-            # 创建可视化
-            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 
-            # === 统一颜色范围 ===
-            # 原始/预测/目标的物理域
+            # === FFT ===
+            input_psd = np.abs(fftshift(fft2(input_data))) ** 2
+            target_psd = np.abs(fftshift(fft2(target_data))) ** 2
+            pred_psd = np.abs(fftshift(fft2(pred_data))) ** 2
+
+            # === 空间与频谱统计 ===
+            input_mean, input_std = float(np.mean(input_data)), float(np.std(input_data))
+            target_mean, target_std = float(np.mean(target_data)), float(np.std(target_data))
+            pred_mean, pred_std = float(np.mean(pred_data)), float(np.std(pred_data))
+
+            input_psd_mean, input_psd_max = float(np.mean(input_psd)), float(np.max(input_psd))
+            target_psd_mean, target_psd_max = float(np.mean(target_psd)), float(np.max(target_psd))
+            pred_psd_mean, pred_psd_max = float(np.mean(pred_psd)), float(np.max(pred_psd))
+
+            # === 主频率 ===
+            h, w = input_psd.shape
+            cy, cx = h // 2, w // 2
+            idx_i = np.unravel_index(np.argmax(input_psd), input_psd.shape)
+            idx_t = np.unravel_index(np.argmax(target_psd), target_psd.shape)
+            idx_p = np.unravel_index(np.argmax(pred_psd), pred_psd.shape)
+            input_domf = float(np.hypot(idx_i[0] - cy, idx_i[1] - cx))
+            target_domf = float(np.hypot(idx_t[0] - cy, idx_t[1] - cx))
+            pred_domf = float(np.hypot(idx_p[0] - cy, idx_p[1] - cx))
+
+            # === 改进 HF/LF ===
+            input_hf_ratio = compute_hf_lf_ratio(input_psd)
+            target_hf_ratio = compute_hf_lf_ratio(target_psd)
+            pred_hf_ratio = compute_hf_lf_ratio(pred_psd)
+
+            # === 能量比例 ===
+            total_energy = float(np.sum(input_psd) + np.sum(target_psd) + np.sum(pred_psd))
+            input_energy_ratio = float(np.sum(input_psd) / total_energy)
+            target_energy_ratio = float(np.sum(target_psd) / total_energy)
+            pred_energy_ratio = float(np.sum(pred_psd) / total_energy)
+
+            # === 可视化 ===
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
             vmin_phys = min(target_data.min(), pred_data.min())
             vmax_phys = max(target_data.max(), pred_data.max())
-
-            # 傅里叶域（取log10前的PSD）
             vmin_freq = np.log10(min(target_psd.min(), pred_psd.min()) + 1e-10)
             vmax_freq = np.log10(max(target_psd.max(), pred_psd.max()) + 1e-10)
 
-            # === 第一行：原始数据 ===
             im1 = axes[0, 0].imshow(input_data, cmap='viridis')
-            axes[0, 0].set_title(f'Input Seismic Data\nMean: {input_mean:.3f}, Std: {input_std:.3f}')
+            axes[0, 0].set_title(f'Input Seismic Data\nMean={input_mean:.3f}, Std={input_std:.3f}')
             plt.colorbar(im1, ax=axes[0, 0])
 
             im2 = axes[0, 1].imshow(target_data, cmap='jet', vmin=vmin_phys, vmax=vmax_phys)
-            axes[0, 1].set_title(f'Target Velocity Model\nMean: {target_mean:.3f}, Std: {target_std:.3f}')
+            axes[0, 1].set_title(f'Target Velocity Model\nMean={target_mean:.3f}, Std={target_std:.3f}')
             plt.colorbar(im2, ax=axes[0, 1])
 
             im3 = axes[0, 2].imshow(pred_data, cmap='jet', vmin=vmin_phys, vmax=vmax_phys)
-            axes[0, 2].set_title(f'Predicted Velocity Model\nMean: {pred_mean:.3f}, Std: {pred_std:.3f}')
+            axes[0, 2].set_title(f'Predicted Velocity Model\nMean={pred_mean:.3f}, Std={pred_std:.3f}')
             plt.colorbar(im3, ax=axes[0, 2])
 
-            # === 第二行：傅里叶域 ===
             im4 = axes[1, 0].imshow(np.log10(input_psd + 1e-10), cmap='viridis')
-            axes[1, 0].set_title(f'Input Power Spectrum (log)\nMax Freq: {input_dominant_freq:.1f}, HF Ratio: {input_hf_ratio:.3f}')
+            axes[1, 0].set_title(f'Input Power Spectrum (log)\nHF/LF={input_hf_ratio:.4f}, f*={input_domf:.1f}')
             plt.colorbar(im4, ax=axes[1, 0])
 
             im5 = axes[1, 1].imshow(np.log10(target_psd + 1e-10), cmap='viridis', vmin=vmin_freq, vmax=vmax_freq)
-            axes[1, 1].set_title(f'Target Power Spectrum (log)\nMax Freq: {target_dominant_freq:.1f}, HF Ratio: {target_hf_ratio:.3f}')
+            axes[1, 1].set_title(f'Target Power Spectrum (log)\nHF/LF={target_hf_ratio:.4f}, f*={target_domf:.1f}')
             plt.colorbar(im5, ax=axes[1, 1])
 
             im6 = axes[1, 2].imshow(np.log10(pred_psd + 1e-10), cmap='viridis', vmin=vmin_freq, vmax=vmax_freq)
-            axes[1, 2].set_title(f'Predicted Power Spectrum (log)\nMax Freq: {pred_dominant_freq:.1f}, HF Ratio: {pred_hf_ratio:.3f}')
+            axes[1, 2].set_title(f'Predicted Power Spectrum (log)\nHF/LF={pred_hf_ratio:.4f}, f*={pred_domf:.1f}')
             plt.colorbar(im6, ax=axes[1, 2])
 
             plt.tight_layout()
-            
-            # === 保存 & 日志 ===
+
             png_path = os.path.join(save_dir, f'fourier_analysis_sample_{i}.png')
-            tb_tag   = f"{log_prefix}/sample_{i}/fourier_composed"
-            wb_key   = f"{log_prefix}/sample_{i}/fourier_figure"
+            tb_tag = f"{log_prefix}/sample_{i}/fourier_composed"
+            wb_key = f"{log_prefix}/sample_{i}/fourier_figure"
 
             _log_figure(fig, png_path,
                         tb_writer=tb_writer, tb_tag=tb_tag, step=global_step,
                         wandb_run=wandb_run, wb_key=wb_key, dpi=300)
-            
             plt.close(fig)
-            
-            # 计算相似性指标
-            try:
-                target_flat = target_psd.flatten()
-                pred_flat = pred_psd.flatten()
-                correlation = float(np.corrcoef(target_flat, pred_flat)[0, 1])
-            except:
-                correlation = 0.0
-            
-            # 计算预测误差
-            mse = float(np.mean((target_data - pred_data)**2))
-            mae = float(np.mean(np.abs(target_data - pred_data)))
-            
-            # 计算频谱相似性
-            try:
-                target_psd_flat = target_psd.flatten()
-                pred_psd_flat = pred_psd.flatten()
-                psd_correlation = float(np.corrcoef(target_psd_flat, pred_psd_flat)[0, 1])
-            except:
-                psd_correlation = 0.0
-            
-            # 保存分析结果
-            analysis_results = {
-                'sample_id': i,
-                'data_shapes': {
-                    'input': list(input_data.shape),
-                    'target': list(target_data.shape),
-                    'prediction': list(pred_data.shape)
-                },
-                'spatial_statistics': {
-                    'input_mean': input_mean,
-                    'input_std': input_std,
-                    'target_mean': target_mean,
-                    'target_std': target_std,
-                    'pred_mean': pred_mean,
-                    'pred_std': pred_std
-                },
-                'spectral_statistics': {
-                    'input_psd_mean': input_psd_mean,
-                    'input_psd_max': input_psd_max,
-                    'target_psd_mean': target_psd_mean,
-                    'target_psd_max': target_psd_max,
-                    'pred_psd_mean': pred_psd_mean,
-                    'pred_psd_max': pred_psd_max
-                },
-                'frequency_characteristics': {
-                    'input_dominant_freq': input_dominant_freq,
-                    'target_dominant_freq': target_dominant_freq,
-                    'pred_dominant_freq': pred_dominant_freq,
-                    'input_hf_ratio': input_hf_ratio,
-                    'target_hf_ratio': target_hf_ratio,
-                    'pred_hf_ratio': pred_hf_ratio
-                },
-                'energy_distribution': {
-                    'input_energy_ratio': input_energy_ratio,
-                    'target_energy_ratio': target_energy_ratio,
-                    'pred_energy_ratio': pred_energy_ratio
-                },
-                'similarity_metrics': {
-                    'spatial_correlation': correlation,
-                    'spectral_correlation': psd_correlation,
-                    'mse': mse,
-                    'mae': mae
-                }
-            }
-            
-            # 保存为numpy文件
-            np.save(os.path.join(save_dir, f'fourier_analysis_sample_{i}.npy'), analysis_results)
-            
-            # 保存数值数据到txt文件
-            txt_file_path = os.path.join(save_dir, f'fourier_analysis_sample_{i}.txt')
-            with open(txt_file_path, 'w', encoding='utf-8') as f:
-                f.write("=" * 80 + "\n")
-                f.write(f"傅里叶频域分析结果 - 样本 {i}\n")
-                f.write("=" * 80 + "\n\n")
-                
-                # 数据形状信息
-                f.write("1. 数据形状信息:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"输入数据形状: {input_data.shape}\n")
-                f.write(f"目标数据形状: {target_data.shape}\n")
-                f.write(f"预测数据形状: {pred_data.shape}\n\n")
-                
-                # 空间域统计信息
-                f.write("2. 空间域统计信息:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"输入数据 - 均值: {input_mean:.6f}, 标准差: {input_std:.6f}\n")
-                f.write(f"目标数据 - 均值: {target_mean:.6f}, 标准差: {target_std:.6f}\n")
-                f.write(f"预测数据 - 均值: {pred_mean:.6f}, 标准差: {pred_std:.6f}\n\n")
-                
-                # 频谱域统计信息
-                f.write("3. 频谱域统计信息:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"输入功率谱 - 均值: {input_psd_mean:.6e}, 最大值: {input_psd_max:.6e}\n")
-                f.write(f"目标功率谱 - 均值: {target_psd_mean:.6e}, 最大值: {target_psd_max:.6e}\n")
-                f.write(f"预测功率谱 - 均值: {pred_psd_mean:.6e}, 最大值: {pred_psd_max:.6e}\n\n")
-                
-                # 频率特征
-                f.write("4. 频率特征:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"主频率 - 输入: {input_dominant_freq:.3f}, 目标: {target_dominant_freq:.3f}, 预测: {pred_dominant_freq:.3f}\n")
-                f.write(f"高频/低频比 - 输入: {input_hf_ratio:.6f}, 目标: {target_hf_ratio:.6f}, 预测: {pred_hf_ratio:.6f}\n\n")
-                
-                # 能量分布
-                f.write("5. 能量分布:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"总能量: {total_energy:.6e}\n")
-                f.write(f"能量比例 - 输入: {input_energy_ratio:.6f}, 目标: {target_energy_ratio:.6f}, 预测: {pred_energy_ratio:.6f}\n\n")
-                
-                # 相似性指标
-                f.write("6. 相似性指标:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"空间域相关系数: {correlation:.6f}\n")
-                f.write(f"频谱域相关系数: {psd_correlation:.6f}\n")
-                f.write(f"均方误差 (MSE): {mse:.8f}\n")
-                f.write(f"平均绝对误差 (MAE): {mae:.8f}\n\n")
-                
-                # 详细数值数据
-                f.write("7. 详细数值数据 (JSON格式):\n")
-                f.write("-" * 40 + "\n")
-                import json
-                f.write(json.dumps(analysis_results, indent=2, ensure_ascii=False))
-                f.write("\n\n")
-                
-                f.write("=" * 80 + "\n")
-                f.write(f"分析完成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write("=" * 80 + "\n")
-            
-            # 打印详细结果
-            print(f"Sample {i} Fourier Analysis Completed Successfully:")
-            print(f"  Data Shapes: Input{input_data.shape}, Target{target_data.shape}, Pred{pred_data.shape}")
-            print(f"  Spatial Stats - Input: μ={input_mean:.3f}, σ={input_std:.3f}")
-            print(f"  Spatial Stats - Target: μ={target_mean:.3f}, σ={target_std:.3f}")
-            print(f"  Spatial Stats - Pred: μ={pred_mean:.3f}, σ={pred_std:.3f}")
-            print(f"  Spectral Stats - Input: μ={input_psd_mean:.2e}, max={input_psd_max:.2e}")
-            print(f"  Spectral Stats - Target: μ={target_psd_mean:.2e}, max={target_psd_max:.2e}")
-            print(f"  Spectral Stats - Pred: μ={pred_psd_mean:.2e}, max={pred_psd_max:.2e}")
-            print(f"  Frequency Characteristics:")
-            print(f"    Dominant Freq - Input: {input_dominant_freq:.1f}, Target: {target_dominant_freq:.1f}, Pred: {pred_dominant_freq:.1f}")
-            print(f"    High-Freq Ratio - Input: {input_hf_ratio:.3f}, Target: {target_hf_ratio:.3f}, Pred: {pred_hf_ratio:.3f}")
-            print(f"  Energy Distribution - Input: {input_energy_ratio:.3f}, Target: {target_energy_ratio:.3f}, Pred: {pred_energy_ratio:.3f}")
-            print(f"  Similarity Metrics:")
-            print(f"    Spatial Correlation: {correlation:.4f}")
-            print(f"    Spectral Correlation: {psd_correlation:.4f}")
-            print(f"    MSE: {mse:.6f}, MAE: {mae:.6f}")
-            print(f"  Results saved to: {txt_file_path}")
-            print("-" * 80)
-            
-        except Exception as e:
-            print(f"样本 {i} 傅里叶分析失败: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            continue
-        
-def analyze_fourier_domain_safe(inputs, targets, predictions, save_dir='./results', max_samples=4):
-    """
-    分析输入和输出速度波形图在傅里叶域的特点
-    
-    Parameters:
-    -----------
-    inputs : torch.Tensor
-        输入地震数据 [B, C, H, W]
-    targets : torch.Tensor  
-        目标速度模型 [B, C, H, W]
-    predictions : torch.Tensor
-        预测速度模型 [B, C, H, W]
-    save_dir : str
-        保存目录
-    max_samples : int
-        最大分析样本数
-    """
-    import numpy as np
-    import matplotlib.pyplot as plt
-    from scipy.fft import fft2, fftshift, fftfreq
-    
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # 限制样本数
-    n_samples = min(inputs.shape[0], max_samples)
-    
-    for i in range(n_samples):
-        try:
-            # 获取数据并转换为numpy
-            if len(inputs[i].shape) > 2:
-                input_data = inputs[i, 0].detach().cpu().numpy()
-            else:
-                input_data = inputs[i].detach().cpu().numpy()
-                
-            target_data = targets[i, 0].detach().cpu().numpy()
-            pred_data = predictions[i, 0].detach().cpu().numpy()
-            
-            # 确保数据是2D的
-            if input_data.ndim > 2:
-                input_data = input_data.squeeze()
-            if target_data.ndim > 2:
-                target_data = target_data.squeeze()
-            if pred_data.ndim > 2:
-                pred_data = pred_data.squeeze()
-            
-            # 计算2D傅里叶变换
-            input_fft = fft2(input_data)
-            target_fft = fft2(target_data)
-            pred_fft = fft2(pred_data)
-            
-            # 计算功率谱密度 (PSD)
-            input_psd = np.abs(fftshift(input_fft))**2
-            target_psd = np.abs(fftshift(target_fft))**2
-            pred_psd = np.abs(fftshift(pred_fft))**2
-            
-            # 计算详细的傅里叶特征
-            # 1. 基本统计信息
-            input_mean = np.mean(input_data)
-            input_std = np.std(input_data)
-            target_mean = np.mean(target_data)
-            target_std = np.std(target_data)
-            pred_mean = np.mean(pred_data)
-            pred_std = np.std(pred_data)
-            
-            # 2. 功率谱统计
-            input_psd_mean = np.mean(input_psd)
-            input_psd_max = np.max(input_psd)
-            target_psd_mean = np.mean(target_psd)
-            target_psd_max = np.max(target_psd)
-            pred_psd_mean = np.mean(pred_psd)
-            pred_psd_max = np.max(pred_psd)
-            
-            # 3. 频率域特征
-            # 计算主频率（功率谱最大值对应的频率）
-            h, w = input_psd.shape
-            center_h, center_w = h // 2, w // 2
-            
-            # 找到功率谱最大值的位置
-            input_max_idx = np.unravel_index(np.argmax(input_psd), input_psd.shape)
-            target_max_idx = np.unravel_index(np.argmax(target_psd), target_psd.shape)
-            pred_max_idx = np.unravel_index(np.argmax(pred_psd), pred_psd.shape)
-            
-            # 计算频率（相对于中心）
-            input_dominant_freq = np.sqrt((input_max_idx[0] - center_h)**2 + (input_max_idx[1] - center_w)**2)
-            target_dominant_freq = np.sqrt((target_max_idx[0] - center_h)**2 + (target_max_idx[1] - center_w)**2)
-            pred_dominant_freq = np.sqrt((pred_max_idx[0] - center_h)**2 + (pred_max_idx[1] - center_w)**2)
-            
-            # 4. 频谱能量分布
-            total_energy = np.sum(input_psd) + np.sum(target_psd) + np.sum(pred_psd)
-            input_energy_ratio = np.sum(input_psd) / total_energy
-            target_energy_ratio = np.sum(target_psd) / total_energy
-            pred_energy_ratio = np.sum(pred_psd) / total_energy
-            
-            # 5. 高频/低频能量比 - 修复尺寸问题
-            # 确保掩码的尺寸与功率谱数组的尺寸完全匹配
-            y_coords, x_coords = np.ogrid[:h, :w]
-            distances = np.sqrt((x_coords - center_w)**2 + (y_coords - center_h)**2)
-            
-            low_freq_mask = distances < min(h, w) * 0.3
-            high_freq_mask = distances > min(h, w) * 0.7
-            
-            input_low_energy = np.sum(input_psd[low_freq_mask])
-            input_high_energy = np.sum(input_psd[high_freq_mask])
-            input_hf_ratio = input_high_energy / (input_low_energy + 1e-10)
-            
-            target_low_energy = np.sum(target_psd[low_freq_mask])
-            target_high_energy = np.sum(target_psd[high_freq_mask])
-            target_hf_ratio = target_high_energy / (target_low_energy + 1e-10)
-            
-            pred_low_energy = np.sum(pred_psd[low_freq_mask])
-            pred_high_energy = np.sum(pred_psd[high_freq_mask])
-            pred_hf_ratio = pred_high_energy / (pred_low_energy + 1e-10)
-            
-            # 简化的傅里叶分析 - 只做基本的可视化
-            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-            
-            # 第一行：原始数据
-            im1 = axes[0, 0].imshow(input_data, cmap='viridis')
-            axes[0, 0].set_title(f'Input Seismic Data\nMean: {input_mean:.3f}, Std: {input_std:.3f}')
-            plt.colorbar(im1, ax=axes[0, 0])
-            
-            im2 = axes[0, 1].imshow(target_data, cmap='jet')
-            axes[0, 1].set_title(f'Target Velocity Model\nMean: {target_mean:.3f}, Std: {target_std:.3f}')
-            plt.colorbar(im2, ax=axes[0, 1])
-            
-            im3 = axes[0, 2].imshow(pred_data, cmap='jet')
-            axes[0, 2].set_title(f'Predicted Velocity Model\nMean: {pred_mean:.3f}, Std: {pred_std:.3f}')
-            plt.colorbar(im3, ax=axes[0, 2])
-            
-            # 第二行：傅里叶域
-            im4 = axes[1, 0].imshow(np.log10(input_psd + 1e-10), cmap='viridis')
-            axes[1, 0].set_title(f'Input Power Spectrum (log)\nMax Freq: {input_dominant_freq:.1f}, HF Ratio: {input_hf_ratio:.3f}')
-            plt.colorbar(im4, ax=axes[1, 0])
-            
-            im5 = axes[1, 1].imshow(np.log10(target_psd + 1e-10), cmap='viridis')
-            axes[1, 1].set_title(f'Target Power Spectrum (log)\nMax Freq: {target_dominant_freq:.1f}, HF Ratio: {target_hf_ratio:.3f}')
-            plt.colorbar(im5, ax=axes[1, 1])
-            
-            im6 = axes[1, 2].imshow(np.log10(pred_psd + 1e-10), cmap='viridis')
-            axes[1, 2].set_title(f'Predicted Power Spectrum (log)\nMax Freq: {pred_dominant_freq:.1f}, HF Ratio: {pred_hf_ratio:.3f}')
-            plt.colorbar(im6, ax=axes[1, 2])
-            
-            plt.tight_layout()
-            plt.savefig(os.path.join(save_dir, f'fourier_analysis_sample_{i}.png'), dpi=300, bbox_inches='tight')
-            plt.close(fig)
-            
-            # 计算基本统计信息
+
+            # === 相似性 ===
             target_flat = target_psd.flatten()
             pred_flat = pred_psd.flatten()
-            correlation = np.corrcoef(target_flat, pred_flat)[0, 1]
-            
-            # 计算预测误差
-            mse = np.mean((target_data - pred_data)**2)
-            mae = np.mean(np.abs(target_data - pred_data))
-            
-            # 计算频谱相似性
-            target_psd_flat = target_psd.flatten()
-            pred_psd_flat = pred_psd.flatten()
-            psd_correlation = np.corrcoef(target_psd_flat, pred_psd_flat)[0, 1]
-            
-            # 保存详细的分析结果
+            correlation = float(np.corrcoef(target_flat, pred_flat)[0, 1])
+            mse = float(np.mean((target_data - pred_data) ** 2))
+            mae = float(np.mean(np.abs(target_data - pred_data)))
+            psd_correlation = correlation
+
+            # === 保存结果 ===
             analysis_results = {
                 'sample_id': i,
-                'data_shapes': {
-                    'input': input_data.shape,
-                    'target': target_data.shape,
-                    'prediction': pred_data.shape
-                },
-                'spatial_statistics': {
-                    'input_mean': input_mean,
-                    'input_std': input_std,
-                    'target_mean': target_mean,
-                    'target_std': target_std,
-                    'pred_mean': pred_mean,
-                    'pred_std': pred_std
-                },
-                'spectral_statistics': {
-                    'input_psd_mean': input_psd_mean,
-                    'input_psd_max': input_psd_max,
-                    'target_psd_mean': target_psd_mean,
-                    'target_psd_max': target_psd_max,
-                    'pred_psd_mean': pred_psd_mean,
-                    'pred_psd_max': pred_psd_max
-                },
+                'data_shapes': {'input': list(input_data.shape), 'target': list(target_data.shape), 'prediction': list(pred_data.shape)},
+                'spatial_statistics': {'input_mean': input_mean, 'input_std': input_std,
+                                       'target_mean': target_mean, 'target_std': target_std,
+                                       'pred_mean': pred_mean, 'pred_std': pred_std},
+                'spectral_statistics': {'input_psd_mean': input_psd_mean, 'input_psd_max': input_psd_max,
+                                        'target_psd_mean': target_psd_mean, 'target_psd_max': target_psd_max,
+                                        'pred_psd_mean': pred_psd_mean, 'pred_psd_max': pred_psd_max},
                 'frequency_characteristics': {
-                    'input_dominant_freq': input_dominant_freq,
-                    'target_dominant_freq': target_dominant_freq,
-                    'pred_dominant_freq': pred_dominant_freq,
-                    'input_hf_ratio': input_hf_ratio,
-                    'target_hf_ratio': target_hf_ratio,
-                    'pred_hf_ratio': pred_hf_ratio
+                    'input_dominant_freq': input_domf, 'target_dominant_freq': target_domf, 'pred_dominant_freq': pred_domf,
+                    'input_hf_ratio': input_hf_ratio, 'target_hf_ratio': target_hf_ratio, 'pred_hf_ratio': pred_hf_ratio
                 },
-                'energy_distribution': {
-                    'input_energy_ratio': input_energy_ratio,
-                    'target_energy_ratio': target_energy_ratio,
-                    'pred_energy_ratio': pred_energy_ratio
-                },
-                'similarity_metrics': {
-                    'spatial_correlation': correlation,
-                    'spectral_correlation': psd_correlation,
-                    'mse': mse,
-                    'mae': mae
-                }
+                'energy_distribution': {'input_energy_ratio': input_energy_ratio,
+                                        'target_energy_ratio': target_energy_ratio,
+                                        'pred_energy_ratio': pred_energy_ratio},
+                'similarity_metrics': {'spatial_correlation': correlation,
+                                       'spectral_correlation': psd_correlation,
+                                       'mse': mse, 'mae': mae}
             }
-            
+
             np.save(os.path.join(save_dir, f'fourier_analysis_sample_{i}.npy'), analysis_results)
-            
-            # 保存数值数据到txt文件
-            txt_file_path = os.path.join(save_dir, f'fourier_analysis_sample_{i}.txt')
-            with open(txt_file_path, 'w', encoding='utf-8') as f:
-                f.write("=" * 80 + "\n")
-                f.write(f"傅里叶频域分析结果 - 样本 {i} (Safe版本)\n")
-                f.write("=" * 80 + "\n\n")
-                
-                # 数据形状信息
-                f.write("1. 数据形状信息:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"输入数据形状: {input_data.shape}\n")
-                f.write(f"目标数据形状: {target_data.shape}\n")
-                f.write(f"预测数据形状: {pred_data.shape}\n\n")
-                
-                # 空间域统计信息
-                f.write("2. 空间域统计信息:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"输入数据 - 均值: {input_mean:.6f}, 标准差: {input_std:.6f}\n")
-                f.write(f"目标数据 - 均值: {target_mean:.6f}, 标准差: {target_std:.6f}\n")
-                f.write(f"预测数据 - 均值: {pred_mean:.6f}, 标准差: {pred_std:.6f}\n\n")
-                
-                # 频谱域统计信息
-                f.write("3. 频谱域统计信息:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"输入功率谱 - 均值: {input_psd_mean:.6e}, 最大值: {input_psd_max:.6e}\n")
-                f.write(f"目标功率谱 - 均值: {target_psd_mean:.6e}, 最大值: {target_psd_max:.6e}\n")
-                f.write(f"预测功率谱 - 均值: {pred_psd_mean:.6e}, 最大值: {pred_psd_max:.6e}\n\n")
-                
-                # 频率特征
-                f.write("4. 频率特征:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"主频率 - 输入: {input_dominant_freq:.3f}, 目标: {target_dominant_freq:.3f}, 预测: {pred_dominant_freq:.3f}\n")
-                f.write(f"高频/低频比 - 输入: {input_hf_ratio:.6f}, 目标: {target_hf_ratio:.6f}, 预测: {pred_hf_ratio:.6f}\n\n")
-                
-                # 能量分布
-                f.write("5. 能量分布:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"总能量: {total_energy:.6e}\n")
-                f.write(f"能量比例 - 输入: {input_energy_ratio:.6f}, 目标: {target_energy_ratio:.6f}, 预测: {pred_energy_ratio:.6f}\n\n")
-                
-                # 相似性指标
-                f.write("6. 相似性指标:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"空间域相关系数: {correlation:.6f}\n")
-                f.write(f"频谱域相关系数: {psd_correlation:.6f}\n")
-                f.write(f"均方误差 (MSE): {mse:.8f}\n")
-                f.write(f"平均绝对误差 (MAE): {mae:.8f}\n\n")
-                
-                # 详细数值数据
-                f.write("7. 详细数值数据 (JSON格式):\n")
-                f.write("-" * 40 + "\n")
-                import json
+
+            txt_path = os.path.join(save_dir, f'fourier_analysis_sample_{i}.txt')
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write("="*80 + f"\n傅里叶频域分析结果 - 样本 {i}\n" + "="*80 + "\n\n")
                 f.write(json.dumps(analysis_results, indent=2, ensure_ascii=False))
-                f.write("\n\n")
-                
-                f.write("=" * 80 + "\n")
-                f.write(f"分析完成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write("=" * 80 + "\n")
-            
-            print(f"Sample {i} Fourier Analysis Completed:")
-            print(f"  Data Shapes: Input{input_data.shape}, Target{target_data.shape}, Pred{pred_data.shape}")
-            print(f"  Spatial Stats - Input: μ={input_mean:.3f}, σ={input_std:.3f}")
-            print(f"  Spatial Stats - Target: μ={target_mean:.3f}, σ={target_std:.3f}")
-            print(f"  Spatial Stats - Pred: μ={pred_mean:.3f}, σ={pred_std:.3f}")
-            print(f"  Spectral Stats - Input: μ={input_psd_mean:.2e}, max={input_psd_max:.2e}")
-            print(f"  Spectral Stats - Target: μ={target_psd_mean:.2e}, max={target_psd_max:.2e}")
-            print(f"  Spectral Stats - Pred: μ={pred_psd_mean:.2e}, max={pred_psd_max:.2e}")
-            print(f"  Frequency Characteristics:")
-            print(f"    Dominant Freq - Input: {input_dominant_freq:.1f}, Target: {target_dominant_freq:.1f}, Pred: {pred_dominant_freq:.1f}")
-            print(f"    High-Freq Ratio - Input: {input_hf_ratio:.3f}, Target: {target_hf_ratio:.3f}, Pred: {pred_hf_ratio:.3f}")
-            print(f"  Energy Distribution - Input: {input_energy_ratio:.3f}, Target: {target_energy_ratio:.3f}, Pred: {pred_energy_ratio:.3f}")
-            print(f"  Similarity Metrics:")
-            print(f"    Spatial Correlation: {correlation:.4f}")
-            print(f"    Spectral Correlation: {psd_correlation:.4f}")
-            print(f"    MSE: {mse:.6f}, MAE: {mae:.6f}")
-            print(f"  Results saved to: {txt_file_path}")
+                f.write(f"\n完成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("="*80 + "\n")
+
+            print(f"   Sample {i}: HF/LF → In={input_hf_ratio:.4f}, Tar={target_hf_ratio:.4f}, Pred={pred_hf_ratio:.4f}")
+            print(f"   DomFreq → In={input_domf:.1f}, Tar={target_domf:.1f}, Pred={pred_domf:.1f}")
+            print(f"   Results saved to: {txt_path}")
             print("-" * 80)
-            
+
         except Exception as e:
-            print(f"样本 {i} 傅里叶分析失败: {str(e)}")
+            print(f"样本 {i} 分析失败: {e}")
             continue
 
-def visualize_encoded(encoded,
-                      save_dir='./results/encoded_vis',
-                      max_samples=4,
-                      channels=None,           # 指定通道索引，如 [0,3,7]；None 则自动选择
-                      topk=4,                  # 自动选择的通道数
-                      selection='variance',    # 'variance' | 'l2' | 'random'
-                      norm_mode='percentile',  # 'percentile' | 'minmax'（空间域可视化归一化）
-                      p_low=1.0, p_high=99.0,  # 分位数上下界（percentile 模式）
-                      # 日志（与现有接口统一）
-                      tb_writer=None,
-                      wandb_run=None,
-                      global_step=None,
-                      log_prefix='vis/encoded'):
+def visualize_encoded(
+    encoded,
+    save_dir='./results/encoded_vis',
+    max_samples=4,
+    channels=None,           # 指定通道索引，如 [0,3,7]；None 则自动选择
+    topk=4,                  # 自动选择的通道数
+    selection='variance',    # 'variance' | 'l2' | 'random'
+    norm_mode='percentile',  # 'percentile' | 'minmax'（空间域可视化归一化）
+    p_low=1.0, p_high=99.0,  # 分位数上下界（percentile 模式）
+
+    # 日志（与现有接口统一）
+    tb_writer=None,
+    wandb_run=None,
+    global_step=None,
+    log_prefix='vis/encoded',
+
+    # ==== 新增：频谱稳健设置 ====
+    use_window=True,         # 2D Hann 窗抑制谱泄漏
+    r_dc=0.02,               # 排除极低频/直流邻域（归一化半径）
+    lf_band=(0.05, 0.30),    # 低频环带 [r1, r2]（归一化半径）
+    hf_band=(0.40, 0.85),    # 高频环带 [r3, r4]（归一化半径）
+
+    # 颜色范围：是否全 batch 统一频谱 clim（默认按样本统一即可）
+    unify_freq_clim_across_batch=False,
+
+    # 可注入自定义的图像记录回调，避免依赖全局 _log_figure
+    log_callback=None,
+):
     """
-    可视化 Encoder 输出特征并进行空间/频谱统计。
+    可视化 Encoder 输出特征并进行空间/频谱统计（稳健版）。
     输入:
         encoded: torch.Tensor [B, C, H, W]
     输出:
         - 每个样本一张 2xK 图 (K=通道数)：第一行空间特征、第二行功率谱(log)
         - 每个样本对应 *.npy 与 *.txt 的统计文件
         - encoded_vis_meta.json 记录通道选择与设置
+    额外改进:
+        - 频谱前乘 2D Hann 窗（可关）
+        - 主频在排除 DC 的有效区域内寻找
+        - HF/LF 采用同心环带定义，更稳定
+        - 仅一次 FFT，缓存 log-PSD，避免重复计算
+        - 返回结构化 summary 便于上层日志/可视化
+    返回:
+        {'meta': {...}, 'summary': {...}, 'per_sample': [ {...}, ... ]}
     """
     import os, time, json, random
     import numpy as np
     import torch
     import matplotlib.pyplot as plt
-    from matplotlib.colors import Normalize
     from scipy.fft import fft2, fftshift
 
     os.makedirs(save_dir, exist_ok=True)
@@ -976,7 +528,6 @@ def visualize_encoded(encoded,
         else:
             flat = feat.reshape(B, C, -1)  # [B,C,HW]
             if selection == 'variance':
-                # 对 HW 求方差，再对 B 求平均
                 score = flat.var(dim=-1, unbiased=False).mean(dim=0)  # [C]
             elif selection == 'l2':
                 score = (flat.pow(2).sum(dim=-1)).mean(dim=0)         # [C]
@@ -991,46 +542,55 @@ def visualize_encoded(encoded,
 
     K = len(channels)
 
-    # ---- 频域掩码（HF/LF）准备：与 H,W 无关但按每个样本/通道二维大小重新生成 ----
-    def make_freq_masks(h, w):
-        cy, cx = h // 2, w // 2
-        yy, xx = np.ogrid[:h, :w]
-        dist = np.sqrt((yy - cy)**2 + (xx - cx)**2)
-        rmin = min(h, w)
-        low_mask  = dist < 0.3 * rmin
-        high_mask = dist > 0.7 * rmin
-        return low_mask, high_mask, (cy, cx)
+    # ==== 频率网格（与 H,W 相关，样本内复用） ====
+    cy, cx = H // 2, W // 2
+    yy, xx = np.ogrid[:H, :W]
+    rr = np.sqrt((yy - cy)**2 + (xx - cx)**2)
+    rmax = np.sqrt((cy)**2 + (cx)**2)  # 归一化半径的最大值近似
+    r_norm = rr / (rmax + 1e-12)
 
-    # ---- 逐样本可视化与统计 ----
+    # 环带掩码函数
+    def band_mask(r_lo, r_hi):
+        return (r_norm >= r_lo) & (r_norm < r_hi)
+
+    mask_valid = r_norm > float(r_dc)
+    lf_mask = band_mask(float(lf_band[0]), float(lf_band[1]))
+    hf_mask = band_mask(float(hf_band[0]), float(hf_band[1]))
+
+    # 可选 2D Hann 窗
+    if use_window:
+        wy = np.hanning(H)[:, None]
+        wx = np.hanning(W)[None, :]
+        win = (wy * wx).astype(np.float64)
+    else:
+        win = None
+
+    # ==== 若需要跨样本统一频谱 clim，先全收集 ====
+    all_log_psd_for_batch = []  # 仅用于 unify_freq_clim_across_batch=True
+
+    per_sample_summaries = []
+
     for i in range(n_samples):
         try:
-            # 取该样本的 K 个通道特征：[K,H,W]
-            fmap = feat[i, channels].numpy()
+            fmap = feat[i, channels].numpy()  # [K,H,W]
 
-            # 计算统一的图像布局：2 行 K 列
+            # 计算布局
             fig, axes = plt.subplots(2, K, figsize=(4.8 * K, 8), constrained_layout=True)
             if K == 1:
-                axes = np.array([[axes[0]], [axes[1]]])  # 统一 2xK 索引
+                axes = np.array([[axes[0]], [axes[1]]])
 
-            # === 统计容器 ===
-            ch_stats = []  # 每通道一个 dict
-            # 为了统一颜色范围，可选两种策略：
-            #   1) 按通道各自归一化（对比结构更清晰）
-            #   2) 也可以先遍历求全通道的全局分位数，再统一 vmin/vmax（需要可比性时可改下面策略）
-            # 这里按通道各自归一化（与你现有函数风格一致）
-
-            # 频域掩码（对 H,W 固定，因为本样本内所有通道同尺寸）
-            low_mask, high_mask, (cy, cx) = make_freq_masks(H, W)
-
-            # 用于计算通道间相关（空间 & 频谱）
-            # 空间：直接用 fmap[k] 拉平
-            # 频谱：用 log(PSD+eps) 拉平
+            # 统计容器
+            ch_stats = []
+            # 相关矩阵数据
             spatial_mat = np.zeros((K, H * W), dtype=np.float64)
             spectral_mat = np.zeros((K, H * W), dtype=np.float64)
 
-            # === 遍历通道 ===
+            # 频谱缓存（避免重复 FFT）
+            all_log_psd_list = []
+
+            # ===== 周期：通道 =====
             for j, ch in enumerate(channels):
-                arr = fmap[j]  # [H,W]
+                arr = fmap[j].astype(np.float64)  # [H,W]
 
                 # --- 空间统计 ---
                 mean_ = float(np.mean(arr))
@@ -1039,11 +599,11 @@ def visualize_encoded(encoded,
                 max_  = float(np.max(arr))
                 l2_   = float(np.sqrt(np.sum(arr**2)) + 1e-12)
 
-                # --- 归一化（用于显示） ---
+                # --- 归一化（仅用于显示） ---
                 if norm_mode == 'percentile':
                     lo = np.percentile(arr, p_low)
                     hi = np.percentile(arr, p_high)
-                    if hi <= lo:
+                    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
                         lo, hi = float(min_), float(max_) if max_ > min_ else (min_, min_ + 1e-6)
                     vis_img = np.clip((arr - lo) / (hi - lo + 1e-12), 0.0, 1.0)
                     vmin, vmax = 0.0, 1.0
@@ -1058,36 +618,50 @@ def visualize_encoded(encoded,
                 else:
                     raise ValueError(f"未知 norm_mode: {norm_mode}")
 
-                # --- 频域 ---
-                fft2c = fftshift(fft2(arr))
-                psd   = np.abs(fft2c)**2
+                # --- 频域（一次性 + 稳健） ---
+                arr_in = arr * win if use_window else arr
+                fft2c = fftshift(fft2(arr_in))
+                psd = (np.abs(fft2c) ** 2).astype(np.float64)
                 log_psd = np.log10(psd + 1e-10)
+                all_log_psd_list.append(log_psd)
 
-                # 主频（相对中心的半径）
-                max_idx = np.unravel_index(np.argmax(psd), psd.shape)
-                dom_freq = float(np.sqrt((max_idx[0] - cy)**2 + (max_idx[1] - cx)**2))
+                # 主频（排除 DC 区域）
+                psd_valid = psd.copy()
+                psd_valid[~mask_valid] = -np.inf
+                # 若全为 -inf，回退到全域
+                if not np.isfinite(psd_valid).any():
+                    psd_valid = psd
+                max_idx = np.unravel_index(int(np.nanargmax(psd_valid)), psd.shape)
+                dom_r_px = float(rr[max_idx])
+                dom_r_hat = float(r_norm[max_idx])  # 0-1
 
-                # 频谱能量比例（本通道 vs 全部通道的总能量需后面再统一）
-                # 先记录本通道能量，稍后归一化
-                total_energy_ch = float(np.sum(psd))
-                low_e  = float(np.sum(psd[low_mask]))
-                high_e = float(np.sum(psd[high_mask]))
+                # HF/LF 能量
+                low_e  = float(psd[lf_mask].sum())
+                high_e = float(psd[hf_mask].sum())
                 hf_ratio = float(high_e / (low_e + 1e-12))
+                total_energy_ch = float(psd.sum())
 
-                # --- 可视化：第一行空间，第二行频谱 ---
-                im_spatial = axes[0, j].imshow(vis_img, cmap='viridis', aspect='auto', vmin=vmin, vmax=vmax)
-                axes[0, j].set_title(f'Encoder Feature | sample {i} | ch {ch}\n'
-                                     f'{range_note}\nμ={mean_:.3e}, σ={std_:.3e}, L2={l2_:.2e}')
+                # --- 可视化：空间+频谱 ---
+                im_spatial = axes[0, j].imshow(vis_img, cmap='viridis', aspect='auto',
+                                               vmin=vmin, vmax=vmax)
+                axes[0, j].set_title(
+                    f'Encoder Feature | sample {i} | ch {ch}\n'
+                    f'{range_note}\nμ={mean_:.3e}, σ={std_:.3e}, L2={l2_:.2e}'
+                )
                 axes[0, j].set_xticks([]); axes[0, j].set_yticks([])
-                plt.colorbar(im_spatial, ax=axes[0, j], fraction=0.046, pad=0.04).set_label('Normalized activation')
+                plt.colorbar(im_spatial, ax=axes[0, j], fraction=0.046, pad=0.04)\
+                    .set_label('Normalized activation')
 
-                # 为增强对比，将频谱的 vmin/vmax 按该样本所选通道共同范围统一；先暂画，稍后再统一范围（需二次设定）
                 im_freq = axes[1, j].imshow(log_psd, cmap='viridis', aspect='auto')
-                axes[1, j].set_title(f'Power Spectrum (log10)\nDomFreq={dom_freq:.1f}, HF/LF={hf_ratio:.3f}')
+                axes[1, j].set_title(
+                    f'Power Spectrum (log10)\n'
+                    f'r*={dom_r_hat:.2f}, HF/LF={hf_ratio:.3f}'
+                )
                 axes[1, j].set_xticks([]); axes[1, j].set_yticks([])
-                plt.colorbar(im_freq, ax=axes[1, j], fraction=0.046, pad=0.04).set_label('log10(PSD)')
+                plt.colorbar(im_freq, ax=axes[1, j], fraction=0.046, pad=0.04)\
+                    .set_label('log10(PSD)')
 
-                # 收集统计
+                # 统计持久化
                 ch_stats.append({
                     'channel': int(ch),
                     'spatial': {
@@ -1097,48 +671,42 @@ def visualize_encoded(encoded,
                         'psd_sum': total_energy_ch,
                         'psd_mean': float(np.mean(psd)),
                         'psd_max': float(np.max(psd)),
-                        'dominant_freq': dom_freq,
+                        'dominant_radius_px': dom_r_px,
+                        'dominant_radius_norm': dom_r_hat,
                         'low_energy': low_e,
                         'high_energy': high_e,
                         'hf_ratio': hf_ratio
                     }
                 })
 
-                # 准备相关矩阵数据
+                # 相关矩阵数据
                 spatial_mat[j, :]  = arr.reshape(-1)
                 spectral_mat[j, :] = log_psd.reshape(-1)
 
-            # --- 统一频谱颜色范围（提升通道间可比性） ---
-            # 取本样本 K 个通道的 log_psd 联合分位数范围
-            # 为简单复用：重新计算一次 log_psd 的全局范围
-            #（也可在上面循环时缓存每个通道的 log_psd）
-            all_log_psd = []
-            for j in range(K):
-                arr = fmap[j]
-                log_psd = np.log10(np.abs(fftshift(fft2(arr)))**2 + 1e-10)
-                all_log_psd.append(log_psd)
-            all_log_psd = np.stack(all_log_psd, axis=0)  # [K,H,W]
+                # 跨 batch 统一 clim 的收集
+                if unify_freq_clim_across_batch:
+                    all_log_psd_for_batch.append(log_psd)
+
+            # --- 统一频谱颜色范围（样本内） ---
+            all_log_psd = np.stack(all_log_psd_list, axis=0)  # [K,H,W]
             vmin_freq = float(np.percentile(all_log_psd, 1.0))
             vmax_freq = float(np.percentile(all_log_psd, 99.0))
-            if vmax_freq <= vmin_freq:
+            if not np.isfinite(vmin_freq): vmin_freq = float(np.min(all_log_psd))
+            if not np.isfinite(vmax_freq) or vmax_freq <= vmin_freq:
                 vmax_freq = vmin_freq + 1e-6
-            # 重设第二行图像的 clim
             for j in range(K):
-                im = axes[1, j].images[0]
-                im.set_clim(vmin=vmin_freq, vmax=vmax_freq)
+                axes[1, j].images[0].set_clim(vmin=vmin_freq, vmax=vmax_freq)
 
-            # --- 计算能量比例（通道在本样本所选通道中的份额） ---
+            # --- 能量占比（在所选K个通道内） ---
             total_energy_selected = float(sum(cs['spectral']['psd_sum'] for cs in ch_stats)) + 1e-12
             for cs in ch_stats:
                 cs['spectral']['energy_ratio_selected'] = float(cs['spectral']['psd_sum'] / total_energy_selected)
 
-            # --- 通道间相关矩阵（空间域 / 频谱域） ---
-            # 使用 np.corrcoef，得到 KxK
+            # --- 通道间相关矩阵 ---
             def safe_corrcoef(mat):
                 try:
                     C = np.corrcoef(mat)
                     if np.isnan(C).any():
-                        # 若出现 NaN，用零替换（例如某通道恒常值）
                         C = np.nan_to_num(C, nan=0.0, posinf=0.0, negative_inf=0.0)
                 except Exception:
                     C = np.zeros((mat.shape[0], mat.shape[0]), dtype=np.float64)
@@ -1147,15 +715,13 @@ def visualize_encoded(encoded,
             spatial_corr = safe_corrcoef(spatial_mat)
             spectral_corr = safe_corrcoef(spectral_mat)
 
-            # --- 保存/日志 ---
+            # --- 保存图像 ---
             png_path = os.path.join(save_dir, f'encoded_sample_{i}_ch_{"-".join(map(str,channels))}.png')
-            tb_tag   = f"{log_prefix}/sample_{i}/encoded_composed"
-            wb_key   = f"{log_prefix}/sample_{i}/encoded_figure"
-
-            if '_log_figure' in globals():
-                _log_figure(fig, png_path,
-                            tb_writer=tb_writer, tb_tag=tb_tag, step=global_step,
-                            wandb_run=wandb_run, wb_key=wb_key, dpi=300)
+            if callable(log_callback):
+                log_callback(fig, png_path,
+                             tb_writer=tb_writer, tb_tag=f"{log_prefix}/sample_{i}/encoded_composed",
+                             step=global_step, wandb_run=wandb_run, wb_key=f"{log_prefix}/sample_{i}/encoded_figure",
+                             dpi=300)
             else:
                 fig.savefig(png_path, dpi=300, bbox_inches='tight')
             plt.close(fig)
@@ -1175,15 +741,17 @@ def visualize_encoded(encoded,
             }
             np.save(os.path.join(save_dir, f'encoded_analysis_sample_{i}.npy'), analysis)
 
-            # --- 写 TXT 摘要（与现有风格一致） ---
+            # --- 写 TXT 摘要 ---
             txt_path = os.path.join(save_dir, f'encoded_analysis_sample_{i}.txt')
             with open(txt_path, 'w', encoding='utf-8') as f:
                 f.write("=" * 90 + "\n")
                 f.write(f"Encoder 特征可视化与频域分析 - 样本 {i}\n")
                 f.write("=" * 90 + "\n\n")
                 f.write(f"通道选择: {channels}  (mode={selection}, topk={K})\n")
-                f.write(f"可视化归一化: {norm_mode} (p_low={p_low}, p_high={p_high})\n\n")
-                # 每通道
+                f.write(f"可视化归一化: {norm_mode} (p_low={p_low}, p_high={p_high})\n")
+                f.write(f"频谱设置: use_window={use_window}, r_dc={r_dc}, "
+                        f"lf_band={lf_band}, hf_band={hf_band}\n\n")
+
                 for cs in ch_stats:
                     ch = cs['channel']
                     s  = cs['spatial']
@@ -1192,10 +760,9 @@ def visualize_encoded(encoded,
                     f.write(f"  空间: mean={s['mean']:.6e}, std={s['std']:.6e}, "
                             f"min={s['min']:.6e}, max={s['max']:.6e}, L2={s['l2']:.6e}\n")
                     f.write(f"  频谱: psd_mean={sp['psd_mean']:.6e}, psd_max={sp['psd_max']:.6e}, "
-                            f"dom_freq={sp['dominant_freq']:.3f}, HF/LF={sp['hf_ratio']:.6f}, "
+                            f"r*={sp['dominant_radius_norm']:.3f}, HF/LF={sp['hf_ratio']:.6f}, "
                             f"energy_ratio_selected={sp['energy_ratio_selected']:.6f}\n\n")
 
-                # 通道间相关
                 f.write("空间域通道间相关矩阵（K×K）:\n")
                 f.write(np.array2string(spatial_corr, formatter={'float_kind':lambda x: f"{x: .3f}"}))
                 f.write("\n\n频谱域通道间相关矩阵（K×K，基于 log10(PSD)）:\n")
@@ -1208,18 +775,27 @@ def visualize_encoded(encoded,
                 f.write(f"完成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write("=" * 90 + "\n")
 
-            # --- 终端打印摘要（与你之前风格相同） ---
+            # --- 终端摘要 ---
             print(f"[visualize_encoded] Sample {i} done.")
             print(f"  Selected channels: {channels}")
             for cs in ch_stats:
                 ch = cs['channel']; sp = cs['spectral']; s = cs['spatial']
                 print(f"    ch{ch:>3} | μ={s['mean']:.3e}, σ={s['std']:.3e}, "
-                      f"L2={s['l2']:.2e} | domF={sp['dominant_freq']:.1f}, HF/LF={sp['hf_ratio']:.3f}, "
-                      f"E%={sp['energy_ratio_selected']:.3f}")
-            print(f"  Spatial Corr (KxK): min={spatial_corr.min():.3f}, max={spatial_corr.max():.3f}")
-            print(f"  Spectral Corr (KxK): min={spectral_corr.min():.3f}, max={spectral_corr.max():.3f}")
+                      f"L2={s['l2']:.2e} | r*={sp['dominant_radius_norm']:.2f}, "
+                      f"HF/LF={sp['hf_ratio']:.3f}, E%={sp['energy_ratio_selected']:.3f}")
+            print(f"  Spatial Corr (KxK): min={float(spatial_corr.min()):.3f}, max={float(spatial_corr.max()):.3f}")
+            print(f"  Spectral Corr (KxK): min={float(spectral_corr.min()):.3f}, max={float(spectral_corr.max()):.3f}")
             print(f"  Saved: {png_path} | {txt_path}")
             print("-" * 90)
+
+            per_sample_summaries.append({
+                'sample_id': int(i),
+                'selected_channels': [int(c) for c in channels],
+                'spatial_corr_min': float(spatial_corr.min()),
+                'spatial_corr_max': float(spatial_corr.max()),
+                'spectral_corr_min': float(spectral_corr.min()),
+                'spectral_corr_max': float(spectral_corr.max()),
+            })
 
         except Exception as e:
             print(f"[visualize_encoded] 样本 {i} 可视化失败: {e}")
@@ -1236,9 +812,34 @@ def visualize_encoded(encoded,
         'norm_mode': norm_mode,
         'p_low': p_low,
         'p_high': p_high,
-        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'freq_settings': {
+            'use_window': bool(use_window),
+            'r_dc': float(r_dc),
+            'lf_band': [float(lf_band[0]), float(lf_band[1])],
+            'hf_band': [float(hf_band[0]), float(hf_band[1])],
+        }
     }
     with open(os.path.join(save_dir, 'encoded_vis_meta.json'), 'w', encoding='utf-8') as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
+    # ---- 跨 batch 统一频谱 clim（可选，通常不必）----
+    if unify_freq_clim_across_batch and len(all_log_psd_for_batch) > 0:
+        all_log_psd_for_batch = np.stack(all_log_psd_for_batch, axis=0)
+        vmin_b = float(np.percentile(all_log_psd_for_batch, 1.0))
+        vmax_b = float(np.percentile(all_log_psd_for_batch, 99.0))
+        meta['batch_freq_clim'] = {'vmin': vmin_b, 'vmax': vmax_b}
+
     print(f"[visualize_encoded] Done. samples={n_samples}, channels={channels}, savedir='{save_dir}'")
+
+    summary = {
+        'num_samples': n_samples,
+        'channels': channels,
+        'selection': selection,
+        'norm_mode': norm_mode,
+        'hf_lf_settings': {
+            'r_dc': float(r_dc), 'lf': [float(lf_band[0]), float(lf_band[1])],
+            'hf': [float(hf_band[0]), float(hf_band[1])], 'use_window': bool(use_window)
+        }
+    }
+    return {'meta': meta, 'summary': summary, 'per_sample': per_sample_summaries}

@@ -221,11 +221,16 @@ def main():
     ap.add_argument('--remap_single_label', type=int, default=1,
                     help="当 family != 'all' 时是否把该类的 label 重映射为 0（0/1，默认1）")
 
+    # ===== 新增：是否拼接 5 个通道到最后一维 =====
+    ap.add_argument('--concat_channels', type=int, default=1,
+                    help="是否将 [5,1000,70] 沿最后一维拼接为 [1,1000,350]（1=是, 0=否）")
+
     args = ap.parse_args()
 
     data_dir   = args.data_dir
     zarr_out   = args.zarr_out
     dtype_str  = args.dtype
+    do_concat  = bool(args.concat_channels)
 
     config = SeismicMOEConfig()
     type_id_map = config.type_id_specific
@@ -279,9 +284,19 @@ def main():
     if N_total == 0:
         raise RuntimeError("没有可写入的样本。")
 
+    # === 根据 concat 设置数据集形状 ===
+    if do_concat:
+        inputs_shape = (N_total, 1, 1000, 350)
+        inputs_chunks = (args.chunks, 1, 1000, 350)
+        inputs_note = "Inputs concatenated to [1,1000,350]"
+    else:
+        inputs_shape = (N_total, 5, 1000, 70)
+        inputs_chunks = (args.chunks, 5, 1000, 70)
+        inputs_note = "Inputs kept as [5,1000,70] (no concatenation)"
+
     # === 数据集定义 ===
     inputs_ds = root.create_dataset(
-        'inputs', shape=(N_total, 1, 1000, 350), chunks=(args.chunks, 1, 1000, 350),
+        'inputs', shape=inputs_shape, chunks=inputs_chunks,
         dtype=target_dtype, compressor=compressor
     )
     outputs_ds = root.create_dataset(
@@ -303,21 +318,36 @@ def main():
 
         M = int(x_arr.shape[0])
 
-        # === 输入规范化到 [M, 1, 1000, 350] ===
+        # === 输入规范化 ===
         if x_arr.ndim != 4:
             raise ValueError(f"{in_path} 维度应为 4，实际 {x_arr.shape}")
-        if x_arr.shape[1:] == (5, 1000, 70):
-            # [M,5,1000,70] -> [M,1,1000,350]  （沿最后一维拼接 5 个通道）
-            # 先把通道维移到宽度前： [M,1000,5,70]，再 reshape 到 [M,1000,350]
-            x_cat = x_arr.transpose(0, 2, 1, 3).reshape(M, 1000, 5 * 70)
-            x_cat = x_cat[:, :, :350]  # 防御性截断（理论上正好 350）
-            x_cat = x_cat.astype(target_dtype, copy=False)
-            x_cat = x_cat[:, None, :, :]  # [M,1,1000,350]
-        elif x_arr.shape[1:] == (1, 1000, 350):
-            # 已经是目标形状
-            x_cat = x_arr.astype(target_dtype, copy=False)
+
+        if do_concat:
+            # 目标： [M,1,1000,350]
+            if x_arr.shape[1:] == (5, 1000, 70):
+                # 按要求逐样本使用 np.concatenate([x_arr[j][k] for k in range(5)], axis=1)
+                concatenated = np.empty((M, 1000, 350), dtype=target_dtype)
+                for j in range(M):
+                    input_data = np.concatenate([x_arr[j][k] for k in range(5)], axis=1)  # [1000,350]
+                    concatenated[j] = input_data.astype(target_dtype, copy=False)
+                x_cat = concatenated[:, None, :, :]  # [M,1,1000,350]
+            elif x_arr.shape[1:] == (1, 1000, 350):
+                x_cat = x_arr.astype(target_dtype, copy=False)
+            else:
+                raise ValueError(f"{in_path} 的 inputs 形状不支持：{x_arr.shape[1:]}, 期望 [5,1000,70] 或 [1,1000,350]")
         else:
-            raise ValueError(f"{in_path} 的 inputs 形状不支持：{x_arr.shape[1:]}, 期望 [5,1000,70] 或 [1,1000,350]")
+            # 目标： [M,5,1000,70]（不拼接）
+            if x_arr.shape[1:] == (5, 1000, 70):
+                x_cat = x_arr.astype(target_dtype, copy=False)
+            elif x_arr.shape[1:] == (1, 1000, 350):
+                # 若给的是已拼接的，尝试拆回 5 通道（按宽度70分块）
+                if x_arr.shape[3] != 350:
+                    raise ValueError(f"{in_path} 的拼接宽度不是 350，无法拆分为 5×70：{x_arr.shape}")
+                # [M,1,1000,350] -> [M,5,1000,70]
+                reshaped = x_arr.reshape(M, 1, 1000, 5, 70)   # [M,1,1000,5,70]
+                x_cat = reshaped[:, 0].transpose(0, 1, 2, 3).astype(target_dtype, copy=False)  # [M,5,1000,70]
+            else:
+                raise ValueError(f"{in_path} 的 inputs 形状不支持：{x_arr.shape[1:]}, 期望 [5,1000,70] 或 [1,1000,350]")
 
         # === 输出规范化到 [M, 1, 70, 70] ===
         if y_arr.ndim == 4 and y_arr.shape[1:] == (1, 70, 70):
@@ -339,8 +369,8 @@ def main():
         labels_ds[sl] = lab_val
 
         # ===== 关键修复：标量广播，避免 list 长度与 chunk 选区不匹配 =====
-        type_name_ds[sl] = type_key      # 原来是 [type_key] * M
-        input_file_ds[sl] = tag          # 原来是 [tag] * M
+        type_name_ds[sl] = type_key
+        input_file_ds[sl] = tag
         # =================================================================
 
         write_ptr += M
@@ -354,23 +384,35 @@ def main():
             x_arr = np.load(in_path, mmap_mode='r')  # [M,5,1000,70] 或 [M,1,1000,350]
             M = int(x_arr.shape[0])
 
-            if x_arr.shape[1:] == (5, 1000, 70):
-                x_cat = x_arr.transpose(0, 2, 1, 3).reshape(M, 1000, 5 * 70)
-                x_cat = x_cat[:, :, :350]
-                x_cat = x_cat.astype(target_dtype, copy=False)
-                x_cat = x_cat[:, None, :, :]  # [M,1,1000,350]
-            elif x_arr.shape[1:] == (1, 1000, 350):
-                x_cat = x_arr.astype(target_dtype, copy=False)
+            if do_concat:
+                if x_arr.shape[1:] == (5, 1000, 70):
+                    concatenated = np.empty((M, 1000, 350), dtype=target_dtype)
+                    for j in range(M):
+                        input_data = np.concatenate([x_arr[j][k] for k in range(5)], axis=1)
+                        concatenated[j] = input_data.astype(target_dtype, copy=False)
+                    x_cat = concatenated[:, None, :, :]  # [M,1,1000,350]
+                elif x_arr.shape[1:] == (1, 1000, 350):
+                    x_cat = x_arr.astype(target_dtype, copy=False)
+                else:
+                    raise ValueError(f"{in_path} 的 inputs 形状不支持：{x_arr.shape[1:]}, 期望 [5,1000,70] 或 [1,1000,350]")
             else:
-                raise ValueError(f"{in_path} 的 inputs 形状不支持：{x_arr.shape[1:]}, 期望 [5,1000,70] 或 [1,1000,350]")
+                if x_arr.shape[1:] == (5, 1000, 70):
+                    x_cat = x_arr.astype(target_dtype, copy=False)
+                elif x_arr.shape[1:] == (1, 1000, 350):
+                    if x_arr.shape[3] != 350:
+                        raise ValueError(f"{in_path} 的拼接宽度不是 350，无法拆分为 5×70：{x_arr.shape}")
+                    reshaped = x_arr.reshape(M, 1, 1000, 5, 70)
+                    x_cat = reshaped[:, 0].transpose(0, 1, 2, 3).astype(target_dtype, copy=False)
+                else:
+                    raise ValueError(f"{in_path} 的 inputs 形状不支持：{x_arr.shape[1:]}, 期望 [5,1000,70] 或 [1,1000,350]")
 
             sl = slice(write_ptr, write_ptr + M)
             inputs_ds[sl] = x_cat
             labels_ds[sl] = -1
 
             # ===== 关键修复：标量广播 =====
-            type_name_ds[sl] = "test"                                  # 原来是 ["test"] * M
-            input_file_ds[sl] = f"test/{os.path.basename(in_path)}"    # 原来是 [f"..."] * M
+            type_name_ds[sl] = "test"
+            input_file_ds[sl] = f"test/{os.path.basename(in_path)}"
             # =================================
 
             write_ptr += M
@@ -412,7 +454,7 @@ def main():
 
     root.attrs.update({
         "schema": {
-            "inputs":  {"shape": [N_total, 1, 1000, 350], "dtype": dtype_str},
+            "inputs":  {"shape": list(inputs_shape), "dtype": dtype_str},
             "outputs": {"shape": [N_total, 1, 70, 70],   "dtype": dtype_str},
             "labels":  {"shape": [N_total], "dtype": "int64"},
             "type_name": "vlen-utf8",
@@ -436,7 +478,8 @@ def main():
             "fault": 6.0/54.0,
             "style": 7.0/67.0
         },
-        "note": "Inputs reshaped to [1,1000,350]; outputs expanded to [1,70,70]."
+        "note": f"{inputs_note}; outputs expanded to [1,70,70].",
+        "concat_channels": do_concat
     })
 
     print(f"  完成：Zarr 写入 {zarr_out}")

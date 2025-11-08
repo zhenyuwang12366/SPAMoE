@@ -75,7 +75,6 @@ def _naive_resize_pos_embed(src: torch.Tensor,
     hsrc = int(round(gsrc ** 0.5))
     wsrc = gsrc // hsrc
     if hsrc * wsrc != gsrc:
-        # 退化：直接线性插值到目标长度（无网格），影响较小
         grid_dst = F.interpolate(
             grid_src.transpose(1, 2), size=grid_dst_len, mode='linear', align_corners=False
         ).transpose(1, 2)
@@ -84,7 +83,6 @@ def _naive_resize_pos_embed(src: torch.Tensor,
         hdst = int(round(grid_dst_len ** 0.5))
         wdst = grid_dst_len // hdst
         if hdst * wdst != grid_dst_len:
-            # 同上兜底
             grid_dst = F.interpolate(
                 grid_src.transpose(1, 2), size=grid_dst_len, mode='linear', align_corners=False
             ).transpose(1, 2)
@@ -95,7 +93,6 @@ def _naive_resize_pos_embed(src: torch.Tensor,
             grid_dst = grid_dst_2d.permute(0, 2, 3, 1).contiguous().view(1, hdst * wdst, D)
 
     if num_tokens > 0:
-        # 若 tok_dst 未知，直接复制或截断/补齐
         if tok_src is not None:
             tok_dst = tok_src[:, :num_tokens]
         out = torch.cat([tok_dst, grid_dst], dim=1)
@@ -139,6 +136,29 @@ def _unfreeze_last_n_layers(module: nn.Module, n: int = 2) -> None:
         return
     for child in children[-n:]:
         child.requires_grad_(True)
+
+
+# =========================
+# 轻量稳定层：通道 RMS 归一化（用于 ConvNeXt→MoE 对接）
+# =========================
+
+class ChannelRMSNorm2d(nn.Module):
+    """
+    对 [B, C, H, W] 做每通道 RMSNorm：y = x / sqrt(mean(x^2)+eps)
+    不含仿射参数；可选 clamp 限幅，防止进入 MoE 时数值过大。
+    """
+    def __init__(self, eps: float = 1e-6, clamp_value: Optional[float] = None):
+        super().__init__()
+        self.eps = eps
+        self.clamp_value = clamp_value
+
+    def forward(self, x: torch.Tensor):
+        # x: [B, C, H, W]
+        rms = (x.pow(2).mean(dim=(2, 3), keepdim=True) + self.eps).sqrt()
+        y = x / rms
+        if self.clamp_value is not None:
+            y = torch.clamp(y, -self.clamp_value, self.clamp_value)
+        return y
 
 
 # =========================
@@ -275,7 +295,6 @@ def _adapt_stem_in_chans_convnext(model: nn.Module, in_chans: int):
                          conv.stride, conv.padding, bias=False)
     with torch.no_grad():
         w = conv.weight  # [out, Cin_old, kh, kw]
-        # 将已加载到模型里的权重再做一次通道适配（安全兜底）
         w1 = w.mean(dim=1, keepdim=True)
         if in_chans == 1:
             w_new = w1
@@ -335,7 +354,6 @@ def _load_local_weights_into_timm_convnext(model_name: str, ckpt_path: str, in_c
             global_pool='',
             in_chans=3,
         )
-        # 这里用“原始”sd（未改 stem）更保险；若没有原始可用已改 sd 也行
         missing, unexpected = model.load_state_dict(_drop_head(_strip_prefix(raw)), strict=False)
         _adapt_stem_in_chans_convnext(model, in_chans=in_chans)
         print(f"[Encoder_ConvNeXt] loaded with fallback and adapted stem to in_chans={in_chans} | missing={len(missing)}, unexpected={len(unexpected)}")
@@ -343,7 +361,7 @@ def _load_local_weights_into_timm_convnext(model_name: str, ckpt_path: str, in_c
 
 
 # =========================
-# 编码器实现
+# 编码器实现（ViT / ConvNeXt）
 # =========================
 
 class Encoder_Dino(nn.Module):
@@ -406,6 +424,8 @@ class Encoder_Dino(nn.Module):
             self.type_act = nn.Identity()
         else:
             raise ValueError(f"Unsupported type_act: {type_act}")
+        
+        self.cast_to_fp32_for_moe = False
 
     @torch.no_grad()
     def _preprocess(self, x: torch.Tensor) -> tuple[torch.Tensor, int, int]:
@@ -476,7 +496,6 @@ class Encoder_Dino(nn.Module):
 
         # 3) 还原 patch 网格 → [B, D, Ht, Wt]
         if N != HgWg:
-            # 兜底（几乎不会触发）：尝试近似网格
             W_try = int(round(N / Hg))
             if Hg * W_try == N:
                 Hg_eff, Wg_eff = Hg, W_try
@@ -532,11 +551,9 @@ class Encoder_ConvNeXt(nn.Module):
 
         # 1) backbone：若要用 timm 的 head，就让 timm 知道 num_classes & global_pool
         if checkpoint_path:
-            # 本地权重加载函数里请确保 stem 的通道适配（RGB→in_chans）已做
             self.backbone = _load_local_weights_into_timm_convnext(
                 model_name, checkpoint_path, in_chans
             )
-            # 若本地权重来自自监督（无分类头），timm 的 head 会是随机初始化；可接受
         else:
             self.backbone = timm.create_model(
                 model_name=model_name,
@@ -566,6 +583,14 @@ class Encoder_ConvNeXt(nn.Module):
         else:
             raise ValueError(f"Unsupported type_act: {type_act}")
 
+        # ========== 新增：稳定对接 MoE 的关键模块 ==========
+        # 对投影后的 [B,C,H,W] 做通道 RMS 归一化 + 限幅（避免频域/小波算子被大幅值击穿）
+        self.post_norm = ChannelRMSNorm2d(eps=1e-5, clamp_value=5.0)
+        # 路由温度缩放（降低/提升 logits 尖锐度；<1 更尖锐，>1 更平坦）
+        self.router_temp = nn.Parameter(torch.tensor(0.7), requires_grad=False)
+        # 在 AMP 下把进入 MoE 的 latent_map 铸为 fp32，避免 BF16/FP16 造成的路由/算子数值不稳
+        self.cast_to_fp32_for_moe = True
+
         # 如果你不走 timm 头，也给一个无参 GAP 以便导出 global_repr
         self._gap = nn.AdaptiveAvgPool2d((1, 1))
 
@@ -577,20 +602,23 @@ class Encoder_ConvNeXt(nn.Module):
         assert feat.dim() == 4
 
         # B) 分类分支：走 timm 的 forward_head
-        #   - pre_logits=True：返回 GAP 后向量（global_repr）
-        #   - pre_logits=False：返回分类 logits（经过 head）
         if self.use_timm_head:
-            # timm 的 convnext.forward_head 支持从 feat 进入
             global_repr = self.backbone.forward_head(feat, pre_logits=True)     # [B, D]
             logits = self.backbone.forward_head(feat, pre_logits=False)         # [B, num_types]
+            # === 温度缩放（数值稳定&可控尖锐度） ===
+            temp = torch.clamp(self.router_temp, min=0.25, max=4.0)
+            logits = logits / temp
             type_weight = self.type_act(logits)
         else:
-            # 不启用 timm 头：自己做 GAP，并不产生分类
             global_repr = self._gap(feat).flatten(1)                            # [B, D]
             type_weight = None
 
-        # C) 特征 → latent_map（投影 + 插值到 70×70）
-        feat_proj = self.proj(feat)  # [B, out_channels, H32, W32]
+        # C) 特征 → latent_map（投影 + 归一化 + 插值到 70×70）
+        feat_proj = self.proj(feat)                                # [B, out_channels, H32, W32]
+        feat_proj = self.post_norm(feat_proj)                      # ★ 关键：RMSNorm + clamp
+        # 可选：再乘一个缩放系数（遇到极端不稳时可打开）
+        # feat_proj = feat_proj * 0.7
+
         if (feat_proj.shape[-2], feat_proj.shape[-1]) != (self.target_h, self.target_w):
             latent_map = F.interpolate(
                 feat_proj, size=(self.target_h, self.target_w),
@@ -598,6 +626,10 @@ class Encoder_ConvNeXt(nn.Module):
             )
         else:
             latent_map = feat_proj
+
+        # === AMP 安全铸型：只把进 MoE 的 latent_map 转为 fp32 ===
+        if self.cast_to_fp32_for_moe and latent_map.dtype != torch.float32:
+            latent_map = latent_map.float()
 
         return latent_map, type_weight, global_repr
 
@@ -625,7 +657,7 @@ def get_encoder(
         model_name = 'vit_small_patch16_dinov3.lvd1689m'
         local_ckpt_path = "pretrain_weight/vit_small_patch16_dinov3.lvd1689m.safetensors"
         use_local = (local_ckpt_path is not None) and os.path.isfile(local_ckpt_path)
-        return Encoder_Dino(
+        enc = Encoder_Dino(
             model_name=model_name,
             pretrained=not use_local,
             checkpoint_path=local_ckpt_path if use_local else None,
@@ -637,12 +669,15 @@ def get_encoder(
             mode="pad_then_interp",
             type_act=type_act,
         )
+        # 需要微调时可解开：
+        # _unfreeze_last_n_layers(enc.backbone, n=2)
+        return enc
 
     elif backbone == 'convnext_tiny':
         model_name = 'convnext_tiny.dinov3_lvd1689m'
         local_ckpt_path = "pretrain_weight/convnext_tiny.dinov3_lvd1689m.safetensors"
         use_local = (local_ckpt_path is not None) and os.path.isfile(local_ckpt_path)
-        return Encoder_ConvNeXt(
+        enc = Encoder_ConvNeXt(
             model_name=model_name,
             pretrained=not use_local,
             checkpoint_path=local_ckpt_path if use_local else None,
@@ -653,5 +688,12 @@ def get_encoder(
             type_act=type_act,
             use_timm_head=True,
         )
+        # 根据需要微调稳定参数
+        enc.router_temp.data.fill_(0.7)   
+        enc.post_norm.clamp_value = 5.0   
+        enc.cast_to_fp32_for_moe = False
+        # 如果想轻微微调最后 stage：
+        # for p in enc.backbone.stages[-1].parameters(): p.requires_grad_(True)
+        return enc
     else:
         raise ValueError(f"Unsupported backbone: {backbone}")

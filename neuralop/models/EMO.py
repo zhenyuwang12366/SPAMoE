@@ -30,6 +30,10 @@ class EMO(nn.Module):
         self.encoder = encoder
         self.moe = moe
         self._pass_encoder_logits_as_weights = bool(pass_encoder_logits_as_weights)
+        if encoder is None:
+            self.moe_amp = True
+        else:
+            self.moe_amp = False if encoder.cast_to_fp32_for_moe == True else True
 
     # ---------------------------
     # 读写代理（保持原训练流程可见性）
@@ -95,11 +99,11 @@ class EMO(nn.Module):
             weights = enc_weights if self._pass_encoder_logits_as_weights else None
 
         if use_amp:
-            with torch.amp.autocast(device_type=encoded.device.type, enabled=True, dtype=amp_dtype):
+            with torch.amp.autocast(device_type=encoded.device.type, enabled=self.moe_amp, dtype=amp_dtype):
                 preds, aux = self.moe(encoded, weights, **moe_kwargs)
         else:
             preds, aux = self.moe(encoded, weights, **moe_kwargs)
-        return preds, aux, enc_weights
+        return preds, aux, weights
 
     # ---------------------------
     # Checkpoint 兼容性：与原流程一致

@@ -238,6 +238,7 @@ def run_training_deepspeed(args):
             args=args, config=config,
             train_dataset_with_transform=train_dataset_with_transform,
             val_dataset_with_transform=val_dataset_with_transform,
+            chunks=32,
             world_size=world_size, local_rank=local_rank
         )
     else:

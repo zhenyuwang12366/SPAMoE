@@ -16,6 +16,7 @@ def build_loaders(
     args, config,
     train_dataset_with_transform,
     val_dataset_with_transform,
+    chunks,
     world_size=1, local_rank=0
 ):
     is_dist = bool(getattr(args, "distributed", False))
@@ -27,7 +28,7 @@ def build_loaders(
             train_num_workers = max(0, args.num_workers // 2)
 
             # —— 训练：按块的分布式采样器（批内不跨块）
-            train_chunk = 32
+            train_chunk = chunks
             print(f"[DEBUG] zarr use chunk: {train_chunk}")
             train_sampler = ChunkDistributedSampler(
                 train_dataset_with_transform,
@@ -78,7 +79,7 @@ def build_loaders(
     else:
         # —— 单机：也用 chunk 采样（更省 I/O），保持训练随机性
         train_num_workers = max(0, args.num_workers)
-        train_chunk = 32
+        train_chunk = chunks
 
         if train_dataset_with_transform is not None:
             train_sampler = ChunkDistributedSampler(
