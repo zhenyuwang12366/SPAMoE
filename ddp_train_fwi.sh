@@ -1,18 +1,16 @@
 #!/bin/bash
-#SBATCH --job-name=Openfwi_wzy
-#SBATCH --partition=gpu-4090-2
-#SBATCH --gres=gpu:2                 # 2 张 GPU
-#SBATCH --ntasks=1                   # 由 torchrun 管理多进程
-#SBATCH --cpus-per-task=10
-#SBATCH --output=../results/output%j.txt
-#SBATCH --no-requeue
 
-# ==== 进入工作目录 ====
-cd /data1/home/teacher/teacher_s/t108790/FWINO_wzy || exit 1
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+LOGDIR=logs
+mkdir -p $LOGDIR
+LOGFILE=$LOGDIR/seismic_moe_${TIMESTAMP}.log
 
-# ==== 激活 Conda ====
-. "/data1/apps/anaconda3/etc/profile.d/conda.sh"
-conda activate FWINO
+# === 进入工作目录（如果未用 sbatch --chdir） ===
+#cd /data1/home/teacher/teacher_s/t108790/FWINO_wzy || exit
+
+# === 激活 Conda 虚拟环境 ===
+. "/root/miniconda3/etc/profile.d/conda.sh"
+conda activate seismic_moe
 
 # ==== 打印环境信息 ====
 echo "当前 Python: $(which python)"
@@ -33,25 +31,28 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ==== 选择一个不冲突的端口 ====
 MASTER_ADDR=127.0.0.1
-MASTER_PORT=$((29000 + SLURM_JOB_ID % 1000))
+MASTER_PORT=$((29000 + 1234 % 1000))
 
-# ==== 启动训练（单机 2 进程）====
+# === 启动训练 ===
 CUDA_VISIBLE_DEVICES=0,1 \
-torchrun --standalone \
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+nohup torchrun --standalone \
   --nproc-per-node=2 \
   --master-addr="${MASTER_ADDR}" \
   --master-port="${MASTER_PORT}" \
-  /data1/home/teacher/teacher_s/t108790/FWINO_wzy/openfwi/train.py \
+  /root/autodl-tmp/FWINO_wzy/openfwi/train.py \
   --mode train \
   --distributed \
-  --zarr_path /data1/home/teacher/teacher_s/t108790/curve_vel_b.zarr \
+  --zarr_path /root/autodl-tmp/all.zarr \
   --status_json ./dataset_status/dataset_status.json \
-  --family curve_vel_b \
+  --family all \
   --generator InversionNet \
-  --epochs 120 \
+  --epochs 100 \
   --batch_size 32 \
   --learning_rate 1e-4 \
   --weight_decay 1e-2 \
   --use_amp \
   --output_dir ../results/openfwi \
-  --log_root ./runs/plain
+  --log_root ./runs/plain \
+  > "$LOGFILE" 2>&1 &
+echo "openfwi训练已启动，日志记录在：$LOGFILE"

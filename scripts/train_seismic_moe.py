@@ -1392,20 +1392,63 @@ def run_inference(n_args):
 
     # ===== 权重加载（严格对偶保存逻辑）=====
     if experts_name_str == "all":
+        # ALL 模式：专家已经从目录加载，这里只需要加载 router 权重
         router_path = getattr(runtime_args, "router_path", None)
         if not router_path:
             raise ValueError("[Router] experts_name_str='all' 模式下必须提供 --router_path")
         _load_router_weights(emo.moe, router_path, map_location=device, is_logger=is_logger)
     else:
-        if isinstance(checkpoint, dict):
-            if "model_state_dict" in checkpoint:
-                missing, unexpected = emo.moe.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        if not isinstance(checkpoint, dict):
+            raise ValueError("checkpoint 不是字典，无法解析 state_dict。")
+
+        # 解析 checkpoint 中的各个部分
+        model_check   = checkpoint.get("model_state_dict", None)
+        router_check  = checkpoint.get("router_state_dict", None)
+        expert_check  = checkpoint.get("expert_state_dict", None)
+
+        # 1) 优先尝试整模恢复（model_state_dict）
+        if model_check is not None:
+            missing, unexpected = emo.moe.load_state_dict(model_check, strict=False)
+            if is_logger and (missing or unexpected):
+                print(f"[MoE][generic][model] 缺失参数: {missing}, 多余参数: {unexpected}")
+            elif is_logger:
+                print(f"[MoE][generic][model] 已从 checkpoint 加载 model_state_dict")
+        elif router_check is not None:
+            # 2) 如果没有整模，只能加载 router_state_dict
+            if hasattr(emo.moe, "router") and emo.moe.router is not None:
+                missing, unexpected = emo.moe.router.load_state_dict(router_check, strict=False)
                 if is_logger and (missing or unexpected):
-                    print(f"[MoE] 从 checkpoint 加载：缺失 {missing}, 多余 {unexpected}")
-            elif "router_state_dict" in checkpoint:
-                emo.moe.router.load_state_dict(checkpoint["router_state_dict"], strict=False)
+                    print(f"[MoE][generic][router-only] 缺失参数: {missing}, 多余参数: {unexpected}")
+                elif is_logger:
+                    print(f"[MoE][generic][router-only] 已从 checkpoint 加载 router_state_dict")
             else:
-                raise ValueError("checkpoint 中既无 model_state_dict 也无 router_state_dict，无法恢复 MoE。")
+                raise ValueError("[MoE][generic] checkpoint 仅包含 router_state_dict，但模型中不存在 moe.router")
+        else:
+            raise ValueError("checkpoint 中既无 model_state_dict 也无 router_state_dict，无法恢复 MoE。")
+
+        # 3) 单专家模式：若 ckpt 带 expert_state_dict，可进一步覆盖 experts[0]
+        if experts_name is not None and isinstance(experts_name, (list, tuple)) \
+                and len(experts_name) == 1 and experts_name[0] != "all":
+            if expert_check is not None and hasattr(emo.moe, "experts") and len(emo.moe.experts) > 0:
+                missing, unexpected = emo.moe.experts[0].load_state_dict(expert_check, strict=False)
+                if is_logger and (missing or unexpected):
+                    print(f"[MoE][single-expert][experts[0]] 缺失参数: {missing}, 多余参数: {unexpected}")
+                elif is_logger:
+                    print(f"[MoE][single-expert] 已从 checkpoint 覆盖 experts[0]")
+            elif expert_check is not None and is_logger:
+                print("[MoE][single-expert] checkpoint 带 expert_state_dict 但模型无 experts[0]，跳过")
+
+        # 4) 如果 checkpoint 同时有 model_state_dict 和 router_state_dict，可以选择性再覆盖一次 router
+        if router_check is not None and hasattr(emo.moe, "router") and emo.moe.router is not None:
+            try:
+                missing, unexpected = emo.moe.router.load_state_dict(router_check, strict=False)
+                if is_logger and (missing or unexpected):
+                    print(f"[MoE][generic][router] 额外覆盖 router：缺失参数: {missing}, 多余参数: {unexpected}")
+                elif is_logger:
+                    print(f"[MoE][generic][router] 已从 checkpoint 覆盖 router_state_dict")
+            except Exception as e:
+                if is_logger:
+                    print(f"[MoE][generic][router] 覆盖 router_state_dict 失败：{e}")
 
     # ===== 推理循环（AMP bf16，与训练相同的 dtype 策略）=====
     amp_enabled = bool(getattr(config, "use_amp", False)) and device.type == "cuda"
