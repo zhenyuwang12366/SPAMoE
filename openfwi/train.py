@@ -45,15 +45,6 @@ try:
 except Exception:
     pass
 
-# -------- apex for GAN + WGAN-GP --------
-try:
-    import apex.parallel as apex_parallel
-except Exception:
-    apex_parallel = None
-
-from types import SimpleNamespace
-import random
-
 
 # ------------------------------
 # Config helper
@@ -425,24 +416,29 @@ def run_training(args):
     else:
         discriminator = None
 
-    # ========= 分布式封装：非 GAN 用 torch DDP，GAN 用 apex DDP =========
+    # ========= 分布式封装：全部使用 PyTorch DDP =========
     ddp_use = bool(config.distributed.use_distributed) and (world_size > 1)
 
     if use_gan:
-        # GAN + WGAN-GP：推荐用 apex DDP，避免 torch DDP + GP + BN 的 bug
-        if ddp_use and apex_parallel is not None:
+        # GAN + WGAN-GP：这里也使用 PyTorch 自带 DDP
+        if ddp_use:
             if is_logger:
-                print("[GAN] 使用 apex.parallel.DistributedDataParallel 封装 G 和 D")
-            model = apex_parallel.DistributedDataParallel(model_core.to(device))
-            discriminator = apex_parallel.DistributedDataParallel(discriminator.to(device))
+                print("[GAN] 使用 torch.nn.parallel.DistributedDataParallel 封装 G 和 D")
+            model = torch.nn.parallel.DistributedDataParallel(
+                model_core.to(device),
+                device_ids=[device.index],
+                output_device=device.index,
+                find_unused_parameters=False,
+            )
+            discriminator = torch.nn.parallel.DistributedDataParallel(
+                discriminator.to(device),
+                device_ids=[device.index],
+                output_device=device.index,
+                find_unused_parameters=False,
+            )
         else:
-            # 单机/单卡 或 没有 apex：不包 DDP，仍能训练（只是每个进程一份模型）
-            if ddp_use and apex_parallel is None and is_logger:
-                print(
-                    "[GAN][警告] world_size>1 但未安装 apex，G/D 不使用 DDP，每个 rank 独立训练一份模型"
-                )
             model = model_core.to(device)
-            # discriminator 已经在上面 .to(device)
+            # discriminator 已经 to(device)
     else:
         # 非 GAN：沿用 torch DDP
         if ddp_use:
@@ -609,7 +605,7 @@ def run_training(args):
 
             model.train()
             if use_gan and discriminator is not None:
-                if isinstance(discriminator, (nn.parallel.DistributedDataParallel, apex_parallel.DistributedDataParallel)):
+                if isinstance(discriminator, nn.parallel.DistributedDataParallel):
                     discriminator.module.train()
                 else:
                     discriminator.train()
