@@ -43,7 +43,8 @@ class Conv2DwithBN(nn.Module):
         layers = [nn.Conv2d(in_channels=in_fea, out_channels=out_fea, kernel_size=kernel_size, stride=stride, padding=padding)]
         if bn:
             layers.append(nn.BatchNorm2d(num_features=out_fea))
-        layers.append(nn.LeakyReLU(relu_slop, inplace=True))
+        # inplace=True -> inplace=False，避免与 WGAN-GP 的二阶梯度冲突
+        layers.append(nn.LeakyReLU(relu_slop, inplace=False))
         if dropout:
             layers.append(nn.Dropout2d(0.8))
         self.Conv2DwithBN = nn.Sequential(*layers)
@@ -57,7 +58,8 @@ class ResizeConv2DwithBN(nn.Module):
         layers = [nn.Upsample(scale_factor=scale_factor, mode=mode)]
         layers.append(nn.Conv2d(in_channels=in_fea, out_channels=out_fea, kernel_size=3, stride=1, padding=1))
         layers.append(nn.BatchNorm2d(num_features=out_fea))
-        layers.append(nn.LeakyReLU(0.2, inplace=True))
+        # inplace=True -> inplace=False
+        layers.append(nn.LeakyReLU(0.2, inplace=False))
         self.ResizeConv2DwithBN = nn.Sequential(*layers)
 
     def forward(self, x):
@@ -80,7 +82,8 @@ class ConvBlock(nn.Module):
         layers = [nn.Conv2d(in_channels=in_fea, out_channels=out_fea, kernel_size=kernel_size, stride=stride, padding=padding)]
         if norm in NORM_LAYERS:
             layers.append(NORM_LAYERS[norm](out_fea))
-        layers.append(nn.LeakyReLU(relu_slop, inplace=True))
+        # inplace=True -> inplace=False
+        layers.append(nn.LeakyReLU(relu_slop, inplace=False))
         if dropout:
             layers.append(nn.Dropout2d(0.8))
         self.layers = nn.Sequential(*layers)
@@ -108,7 +111,8 @@ class DeconvBlock(nn.Module):
         layers = [nn.ConvTranspose2d(in_channels=in_fea, out_channels=out_fea, kernel_size=kernel_size, stride=stride, padding=padding, output_padding=output_padding)]
         if norm in NORM_LAYERS:
             layers.append(NORM_LAYERS[norm](out_fea))
-        layers.append(nn.LeakyReLU(0.2, inplace=True))
+        # inplace=True -> inplace=False
+        layers.append(nn.LeakyReLU(0.2, inplace=False))
         self.layers = nn.Sequential(*layers)
 
     def forward(self, x):
@@ -122,7 +126,8 @@ class ResizeBlock(nn.Module):
         layers.append(nn.Conv2d(in_channels=in_fea, out_channels=out_fea, kernel_size=3, stride=1, padding=1))
         if norm in NORM_LAYERS:
             layers.append(NORM_LAYERS[norm](out_fea))
-        layers.append(nn.LeakyReLU(0.2, inplace=True))
+        # inplace=True -> inplace=False
+        layers.append(nn.LeakyReLU(0.2, inplace=False))
         self.layers = nn.Sequential(*layers)
 
     def forward(self, x):
@@ -318,4 +323,3 @@ model_dict = {
     'Discriminator': Discriminator,
     'UPFWI': FCN4_Deep_Resize_2
 }
-

@@ -8,5 +8,6 @@ python load_to_zarr.py \
   --zarr_out /root/autodl-tmp/all.zarr \
   --family all \
   --remap_single_label 0 \
-  --include_test 0
+  --include_test 0 \
+  --concat_channels 0
 
