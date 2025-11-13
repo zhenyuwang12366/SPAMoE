@@ -136,7 +136,7 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='WNO块的数量，控制模型深度')
     parser.add_argument('--WNO_dropout_rate', type=float, default=0.1,
                         help='WNO块中的dropout比例，提高泛化能力')
-    parser.add_argument('--wavelet_type', type=str, default='db4', choices=['coif4','db4','db8','sym4','coif5','sym8','db6'],
+    parser.add_argument('--wavelet_type', type=str, default='db4', choices=['coif4','db4','db8','sym4','coif5','sym8','db6','sym6'],
                         help='小波类型')
     parser.add_argument('--dtcwt_type', nargs=2, type=str, default=None,
                         help='双树复小波类型')
@@ -154,6 +154,7 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
                         help='每个尺度使用的神经网络层数')
     
     # MoE融合参数配置
+    parser.add_argument('--moe_method', type=str, default="basic", choices=["basic", "afmoe"])
     parser.add_argument('--use_experts_path', type=str, default=None,
                         help='moe使用的专家模型存放路径')
     parser.add_argument('--use_moe', action='store_true',

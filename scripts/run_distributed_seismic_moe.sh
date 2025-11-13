@@ -73,6 +73,7 @@ LNO_MODES=(16 16)
 LNO_LAYERS=3
 
 # 模型结构 / MoE 融合相关
+MOEMETHOD="basic"                    # basic/afmoe
 HIDDEN_CHANNELS=64
 USE_EXPERTS_PATH=""
 USE_MOE=0                       # flag -> --use_moe
@@ -189,7 +190,8 @@ while [[ $# -gt 0 ]]; do
     --MNO_n_layers) MNO_LAYERS="$2"; shift 2 ;;
     --LNO_n_modes) shift; LNO_MODES=(); while [[ $# -gt 0 && $1 != --* ]]; do LNO_MODES+=("$1"); shift; done ;;
     --LNO_n_layers) LNO_LAYERS="$2"; shift 2 ;;
-
+    
+    --moe_method) MOEMETHOD="$2"; shift 2 ;;
     --hidden_channels) HIDDEN_CHANNELS="$2"; shift 2 ;;
     --use_experts_path) USE_EXPERTS_PATH="$2"; shift 2 ;;
     --use_moe) USE_MOE=1; shift ;;
@@ -377,6 +379,7 @@ echo "WNO channel MLP expansion: ${WNO_CHANNEL_MLP_EXPANSION:-<default>}"
 echo "DTCWT type: ${DTCWT_TYPE[*]:-<None>}"
 echo "MNO(scales,layers,factors): ($MNO_SCALES, $MNO_LAYERS, ${MNO_FACTORS[*]})"
 echo "LNO(modes H W, layers): (${LNO_MODES[*]}, $LNO_LAYERS)"
+echo "MoE Method: $MOEMETHOD"
 echo "Hidden Channels: $HIDDEN_CHANNELS"
 echo "Use Experts Path: ${USE_EXPERTS_PATH:-<None>}"
 echo "Use MoE: $USE_MOE"
@@ -438,6 +441,7 @@ ARGS=(
   --k "$K"
   --H_size "$H_SIZE"
   --W_size "$W_SIZE"
+  --moe_method "$MOEMETHOD"
   --hidden_channels "$HIDDEN_CHANNELS"
   --backbone "$BACKBONE"
   --learning_rate "$LEARNING_RATE"

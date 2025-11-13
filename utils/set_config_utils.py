@@ -305,6 +305,8 @@ def get_seismic_config(args: argparse.Namespace):
         config.H_size = args.H_size
         config.W_size = args.W_size
     
+    config.moe_method = args.moe_method
+    
     #-------------- 设置完毕 -----------#
     runtime_ctx = _build_runtime_context(
         device=device,

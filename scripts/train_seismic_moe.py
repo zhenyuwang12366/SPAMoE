@@ -35,6 +35,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import scripts.transforms as T
 from neuralop.models import MOEOperator, ExpertFactory
+from neuralop.models.afreqmoe import AdaptiveFreqMoE
 from neuralop.models.encoder import get_encoder
 from neuralop.models.EMO import EMO
 from neuralop.layers.spectral_convolution import SpectralConv
@@ -464,29 +465,37 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             hidden_channels=config.hidden_channels
         )
 
-    moe_model = MOEOperator(
-        experts=experts,
-        in_channels=moe_in_channels,
-        out_channels=config.out_channels,
-        hidden_channels=config.hidden_channels,
-        top_k=config.top_k,
-        noisy_gating=config.noisy_gating,
-        fusion_type=config.fusion_type,
-        router_hidden_dim=config.router_hidden_dim,
-        moe_mode=getattr(config, "moe_mode", "standard"),
-        is_logger=is_logger,
-        router_type=config.router_type,
-        s_processor_type=config.s_processor_type,
-        w_processor_type=config.w_processor_type,
-        beta=config.beta,
-        is_specific=config.is_specific,
-        is_classifier=config.is_classifier,
-        batch_size=config.batch_size,
-        v_type_num=config.v_type_num,
-        use_expert_memory_proxy=config.use_gpu_proxy,
-        use_encoder=config.use_encoder,
-        device=device,
-    )
+    if config.moe_method == "basic":
+        moe_model = MOEOperator(
+            experts=experts,
+            in_channels=moe_in_channels,
+            out_channels=config.out_channels,
+            hidden_channels=config.hidden_channels,
+            top_k=config.top_k,
+            noisy_gating=config.noisy_gating,
+            fusion_type=config.fusion_type,
+            router_hidden_dim=config.router_hidden_dim,
+            moe_mode=getattr(config, "moe_mode", "standard"),
+            is_logger=is_logger,
+            router_type=config.router_type,
+            s_processor_type=config.s_processor_type,
+            w_processor_type=config.w_processor_type,
+            beta=config.beta,
+            is_specific=config.is_specific,
+            is_classifier=config.is_classifier,
+            batch_size=config.batch_size,
+            v_type_num=config.v_type_num,
+            use_expert_memory_proxy=config.use_gpu_proxy,
+            use_encoder=config.use_encoder,
+            device=device,
+        )
+    elif config.moe_method == "afmoe":
+        moe_model = AdaptiveFreqMoE(
+            experts=experts,
+            in_channels=moe_in_channels,
+            topk=config.top_k,
+            alpha=0.1,
+        )
 
     # ======================
     # EMO + DDP / DeepSpeed
