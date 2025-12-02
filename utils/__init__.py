@@ -1,5 +1,5 @@
 from .train_utils import safe_random_split, EarlyStopping
-from .plot_fig import plot_loss_curve, analyze_fourier_domain, visualize_results, save_type_predictions_txt, visualize_encoded
+from .plot_fig import plot_loss_curve, analyze_fourier_domain, visualize_results, save_type_predictions_txt, visualize_encoded, visualize_routed_bands, visualize_router_selection_from_stats, visualize_router_selection, visualize_error_heatmap, visualize_pde_style
 from .calculate import SeismicMetrics
 from .load_utils import load_moe_experts, load_encoder_weights
 from .parser_utils import build_argparser_and_parse
@@ -22,4 +22,9 @@ __all__ = [
     "build_argparser_and_parse",
     "get_seismic_config",
     "patch_spectral_conv_forward",
+    "visualize_routed_bands",
+    "visualize_router_selection_from_stats",
+    "visualize_router_selection",
+    "visualize_error_heatmap",
+    "visualize_pde_style",
 ]

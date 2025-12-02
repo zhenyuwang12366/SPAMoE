@@ -8,83 +8,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 __all__ = [
-    "CombinedLoss",
     "L1L2Loss",
     "GradL1",
     "FourierMagL1",
     "SobelLoss",
     "FourierMag_L1",
+    "RelativeL2",
+    "PDECombinedLoss",
 ]
-
-
-class CombinedLoss(nn.Module):
-    """Combine L1/L2 with optional SSIM, gradient, and Fourier penalties."""
-
-    def __init__(
-        self,
-        lambda_l1: float = 0.3,
-        lambda_l2: float = 0.3,
-        lambda_ssim: float = 0.0,
-        lambda_grad: float = 0.0,
-        lambda_fourier: float = 0.0,
-        grad_kernel: str = "sobel",
-        grad_reduction: str = "mean",
-        fourier_dims: Sequence[int] = (-2, -1),
-        fourier_reduction: str = "mean",
-    ):
-        super().__init__()
-        self.lambda_l1 = lambda_l1
-        self.lambda_l2 = lambda_l2
-        self.lambda_ssim = lambda_ssim
-        self.lambda_grad = lambda_grad
-        self.lambda_fourier = lambda_fourier
-
-        self.l1_loss = nn.L1Loss()
-        self.l2_loss = nn.MSELoss()
-        self.grad_loss = (
-            SobelLoss(kernel=grad_kernel, reduction=grad_reduction)
-            if lambda_grad > 0
-            else None
-        )
-        self.fourier_loss = (
-            FourierMag_L1(dims=fourier_dims, reduction=fourier_reduction)
-            if lambda_fourier > 0
-            else None
-        )
-
-    def forward(self, pred: torch.Tensor, gt: torch.Tensor):
-        l1_val = self.l1_loss(pred, gt)
-        l2_val = self.l2_loss(pred, gt)
-        total = self.lambda_l1 * l1_val + self.lambda_l2 * l2_val
-
-        if self.lambda_ssim > 0:
-            ssim_loss = 1.0 - ssim(pred, gt, data_range=1.0, size_average=True)
-            total = total + self.lambda_ssim * ssim_loss
-        else:
-            ssim_loss = pred.new_zeros(())
-
-        if self.grad_loss is not None:
-            grad_dict = self.grad_loss(pred, gt)
-            grad_val = grad_dict["loss"]
-            total = total + self.lambda_grad * grad_val
-        else:
-            grad_val = pred.new_zeros(())
-
-        if self.fourier_loss is not None:
-            fourier_dict = self.fourier_loss(pred, gt)
-            fourier_val = fourier_dict["loss"]
-            total = total + self.lambda_fourier * fourier_val
-        else:
-            fourier_val = pred.new_zeros(())
-
-        return {
-            "loss": total,
-            "l1": l1_val.detach(),
-            "l2": l2_val.detach(),
-            "ssim": ssim_loss.detach(),
-            "grad": grad_val.detach(),
-            "fourier": fourier_val.detach(),
-        }
 
 
 class L1L2Loss(nn.Module):
@@ -268,3 +199,133 @@ class FourierMag_L1(nn.Module):
     def forward(self, pred: torch.Tensor, gt: torch.Tensor):
         loss_val = self.impl(pred, gt)
         return {"loss": loss_val}
+
+class RelativeL2(nn.Module):
+    """
+    Relative L2 loss:
+        rel_L2 = ||pred - gt||_2 / (||gt||_2 + eps)
+
+    - 默认对 batch 求 mean，适合作为 PDEBench / Neural Operator 的主损失。
+    """
+
+    def __init__(self, eps: float = 1e-8, reduction: str = "mean"):
+        super().__init__()
+        if reduction not in {"mean", "sum", "none"}:
+            raise ValueError("reduction must be 'mean', 'sum', or 'none'")
+        self.eps = float(eps)
+        self.reduction = reduction
+
+    def forward(self, pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+        if pred.shape != gt.shape:
+            raise ValueError("pred and gt must have identical shapes")
+
+        B = pred.size(0)
+        pred_flat = pred.reshape(B, -1).float()
+        gt_flat = gt.reshape(B, -1).float()
+
+        diff = pred_flat - gt_flat
+        diff_norm = torch.norm(diff, p=2, dim=1)
+        gt_norm = torch.norm(gt_flat, p=2, dim=1)
+
+        rel = diff_norm / (gt_norm + self.eps)
+
+        if self.reduction == "mean":
+            return rel.mean()
+        if self.reduction == "sum":
+            return rel.sum()
+        return rel  # shape [B]
+
+class PDECombinedLoss(nn.Module):
+    """
+    专为 PDE / Neural Operator 设计的组合损失：
+
+        loss = λ_rel * RelativeL2
+             + λ_grad * GradL1(∇pred, ∇gt)         (可选)
+             + λ_fourier * FourierMagL1(|F(pred)|, |F(gt)|) (可选)
+
+    返回字典，方便训练脚本做日志记录：
+        {
+            "loss":    total_loss,
+            "rel":     rel_l2.detach(),
+            "grad":    grad_val.detach(),     # 若未启用为 0 标量
+            "fourier": fourier_val.detach(),  # 若未启用为 0 标量
+        }
+    """
+
+    def __init__(
+        self,
+        lambda_rel: float = 1.0,
+        lambda_grad: float = 0.0,
+        lambda_fourier: float = 0.0,
+        # grad 配置
+        grad_kernel: str = "sobel",
+        grad_reduction: str = "mean",
+        grad_padding_mode: str = "replicate",
+        grad_spacing: Optional[Sequence[float]] = None,
+        # fourier 配置
+        fourier_dims: Sequence[int] = (-2, -1),
+        fourier_reduction: str = "mean",
+        fourier_fft_norm: Optional[str] = "ortho",
+        fourier_use_window: bool = True,
+        fourier_highfreq_gamma: float = 0.0,
+    ):
+        super().__init__()
+        self.lambda_rel = float(lambda_rel)
+        self.lambda_grad = float(lambda_grad)
+        self.lambda_fourier = float(lambda_fourier)
+
+        # 主损失：Relative L2
+        self.rel_loss = RelativeL2(reduction="mean")
+
+        # 可选梯度损失
+        self.grad_loss = (
+            SobelLoss(
+                kernel=grad_kernel,
+                spacing=grad_spacing,
+                reduction=grad_reduction,
+                padding_mode=grad_padding_mode,
+            )
+            if self.lambda_grad > 0.0
+            else None
+        )
+
+        # 可选频域损失
+        self.fourier_loss = (
+            FourierMag_L1(
+                dims=fourier_dims,
+                reduction=fourier_reduction,
+                fft_norm=fourier_fft_norm,
+                use_window=fourier_use_window,
+                highfreq_gamma=fourier_highfreq_gamma,
+            )
+            if self.lambda_fourier > 0.0
+            else None
+        )
+
+    def forward(self, pred: torch.Tensor, gt: torch.Tensor):
+        # 主损失：Relative L2
+        rel_val = self.rel_loss(pred, gt)
+        total = self.lambda_rel * rel_val
+
+        # 梯度损失
+        if self.grad_loss is not None:
+            grad_dict = self.grad_loss(pred, gt)
+            grad_val = grad_dict["loss"]
+            total = total + self.lambda_grad * grad_val
+        else:
+            grad_val = pred.new_zeros(())
+
+        # 频域损失
+        if self.fourier_loss is not None:
+            fourier_dict = self.fourier_loss(pred, gt)
+            fourier_val = fourier_dict["loss"]
+            total = total + self.lambda_fourier * fourier_val
+        else:
+            fourier_val = pred.new_zeros(())
+
+        return {
+            "loss":    total,
+            "rel":     float(rel_val.detach().item()),
+            "grad":    float(grad_val.detach().item()),
+            "fourier": float(fourier_val.detach().item()),
+        }

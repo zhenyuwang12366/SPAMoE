@@ -166,23 +166,23 @@ def get_seismic_config(args: argparse.Namespace):
     config.expert_configs[0]['n_modes_height'] = args.FNO_n_modes_height
     config.expert_configs[0]['n_modes_width'] = args.FNO_n_modes_width
     config.expert_configs[0]['n_layers'] = args.FNO_n_layers
-    # WNO config setting
-    config.expert_configs[1]['n_levels_height'] = args.WNO_n_levels_height
-    config.expert_configs[1]['n_levels_width'] = args.WNO_n_levels_width
-    config.expert_configs[1]['n_layers'] = args.WNO_n_layers
-    config.expert_configs[1]['dropout_rate'] = args.WNO_dropout_rate
-    config.expert_configs[1]['wavelet'] = args.wavelet_type
-    if(args.dtcwt_type): 
-        config.expert_configs[1]['biort'], config.expert_configs[1]['qshift'] = args.dtcwt_type
-        config.expert_configs[1]['conv_kind'] = "dtcwt" 
+    # # WNO config setting
+    # config.expert_configs[1]['n_levels_height'] = args.WNO_n_levels_height
+    # config.expert_configs[1]['n_levels_width'] = args.WNO_n_levels_width
+    # config.expert_configs[1]['n_layers'] = args.WNO_n_layers
+    # config.expert_configs[1]['dropout_rate'] = args.WNO_dropout_rate
+    # config.expert_configs[1]['wavelet'] = args.wavelet_type
+    # if(args.dtcwt_type): 
+    #     config.expert_configs[1]['biort'], config.expert_configs[1]['qshift'] = args.dtcwt_type
+    #     config.expert_configs[1]['conv_kind'] = "dtcwt" 
     
     # MNO config setting
-    config.expert_configs[2]['n_scales'] = args.MNO_n_scales
-    config.expert_configs[2]['scale_factors'] = args.MNO_scale_factors
-    config.expert_configs[2]['n_layers'] = args.MNO_n_layers
+    config.expert_configs[1]['n_scales'] = args.MNO_n_scales
+    config.expert_configs[1]['scale_factors'] = args.MNO_scale_factors
+    config.expert_configs[1]['n_layers'] = args.MNO_n_layers
     # LNO config setting
-    config.expert_configs[3]['n_modes'] = tuple(args.LNO_n_modes)
-    config.expert_configs[3]['n_layers'] = args.LNO_n_layers
+    config.expert_configs[2]['n_modes'] = tuple(args.LNO_n_modes)
+    config.expert_configs[2]['n_layers'] = args.LNO_n_layers
     
     print(f'FNO:n_modes_height:{config.expert_configs[0]["n_modes_height"]}')
     print(f'FNO:n_modes_width:{config.expert_configs[0]["n_modes_width"]}')
@@ -193,7 +193,10 @@ def get_seismic_config(args: argparse.Namespace):
     # 选择专家，这里后面的config.expert_configs就是config文件中所创建的字典列表，
     # 当你从命令行输入choose——experts之后，这里的for循环会根据你给定的序号找到对应的专家的字典，并将这个字典放入
     #config.expert_configs列表中
-    config.expert_configs = [config.expert_configs[i] for i in args.choose_experts]
+    if args.choose_experts is not None and len(args.choose_experts) > 0:
+        config.expert_configs = [config.expert_configs[i] for i in args.choose_experts]
+    else:
+        args.choose_experts = list(range(len(config.expert_configs)))
     #这里的config.expert_configs就是seismic_moe_config中的“字典列表”，关于“字典列表”结构的解释详见OneNote3
     
     # 训练moe架构
@@ -254,6 +257,16 @@ def get_seismic_config(args: argparse.Namespace):
         config.router_type = args.router_type
     if hasattr(args, "router_hidden_dim") and args.router_hidden_dim is not None:
         config.router_hidden_dim = args.router_hidden_dim
+    if hasattr(args, "band_sharpness"):
+        config.band_sharpness = args.band_sharpness
+    if hasattr(args, "freq_affinity_sharpness"):
+        config.freq_affinity_sharpness = args.freq_affinity_sharpness
+    if hasattr(args, "disable_soft_bands"):
+        config.use_soft_bands = not args.disable_soft_bands
+    if hasattr(args, "disable_freq_attn"):
+        config.enable_freq_attn = not args.disable_freq_attn
+    if hasattr(args, "disable_band_mixing"):
+        config.enable_band_mixing = not args.disable_band_mixing
     if hasattr(args, "noisy_gating") and args.noisy_gating is not None:
         config.noisy_gating = args.noisy_gating
     

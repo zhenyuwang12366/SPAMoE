@@ -132,6 +132,8 @@ class WaveConv2d(nn.Module):
             if x.dtype != torch.float32:
                 x = x.to(torch.float32)
 
+            H_in, W_in = x.shape[-2], x.shape[-1]
+            
             W = x.shape[-1]
             if W > self.size[-1]:
                 factor = int(np.log2(W // self.size[-1]))
@@ -156,6 +158,8 @@ class WaveConv2d(nn.Module):
 
             idwt = IDWT(mode=self.mode, wave=self.wavelet).to(x.device)
             x = idwt((out_ft, out_coeff))
+            if x.shape[-2] != H_in or x.shape[-1] != W_in:
+                x = x[..., :H_in, :W_in]
             return x
 
 
@@ -211,6 +215,8 @@ class WaveConv2dCwt(nn.Module):
             if x.dtype != torch.float32:
                 x = x.to(torch.float32)
 
+            H_in, W_in = x.shape[-2], x.shape[-1]
+            
             W = x.shape[-1]
             if W > self.size[-1]:
                 factor = int(np.log2(W // self.size[-1]))
@@ -246,6 +252,8 @@ class WaveConv2dCwt(nn.Module):
 
             icwt = DTCWTInverse(biort=self.wavelet_level1, qshift=self.wavelet_level2).to(x.device)
             x = icwt((out_ft, out_coeff))
+            if x.shape[-2] != H_in or x.shape[-1] != W_in:
+                x = x[..., :H_in, :W_in]
             return x
 
 
@@ -293,6 +301,8 @@ class WaveConv3d(nn.Module):
             if x.dtype != torch.float32:
                 x = x.to(torch.float32)
 
+            D_in, H_in, W_in = x.shape[-3], x.shape[-2], x.shape[-1]
+            
             xr = torch.zeros_like(x, device=x.device)
             B = x.shape[0]
             for i in range(B):
@@ -324,4 +334,6 @@ class WaveConv3d(nn.Module):
 
                 xr[i, ...] = waverec3(x_coeff, pywt.Wavelet(self.wavelet))
 
+            if (xr.shape[-3] != D_in) or (xr.shape[-2] != H_in) or (xr.shape[-1] != W_in):
+                xr = xr[..., :D_in, :H_in, :W_in]
             return xr

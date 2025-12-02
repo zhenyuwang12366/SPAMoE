@@ -112,8 +112,10 @@ class ExpertFactory:
                 if 'n_levels_width' not in kwargs:
                     levels_kwargs['n_levels_width'] = 4  # 默认参数
                 
+                base_size = kwargs.pop("base_size", (79, 70))
+                
                 return WNO2d(
-                    base_size=(70, 70),
+                    base_size=base_size,
                     hidden_channels=hidden_channels,
                     in_channels=in_channels,
                     out_channels=out_channels,
@@ -297,10 +299,6 @@ class ExpertFactory:
                 **kwargs
             )
         elif geometry_type in ('geo', 'geofno'):
-            # GeoFNO 专家，默认处理单通道 (B,1,H,W) 输入
-            if in_channels != 1:
-                raise ValueError(f"GeoFNO 目前仅支持单通道输入，收到 in_channels={in_channels}")
-
             modes1 = kwargs.pop('modes1', kwargs.pop('n_modes_height', 12))
             modes2 = kwargs.pop('modes2', kwargs.pop('n_modes_width', 12))
             code_dim = kwargs.pop('code_dim', 42)

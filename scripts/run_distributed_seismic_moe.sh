@@ -50,7 +50,7 @@ LAMBDA_CE=0.2
 # 预处理与路由/MoE
 K=1
 TOP_K=1
-CHOOSE_EXPERTS=(0)
+CHOOSE_EXPERTS=()
 MOE_MODE=""
 
 # FNO/WNO/MNO/LNO/GeoFNO
@@ -83,6 +83,12 @@ S_PROCESSOR_TYPE="linear"       # 'linear' / 'atten' / 'mean' / 'sum'
 W_PROCESSOR_TYPE="linear"       # 'linear' / 'atten' / 'mean' / 'sum'
 BETA=0.5
 ROUTER_HIDDEN_DIM=""
+ROUTER_ALPHA=""
+BAND_SHARPNESS=20.0
+FREQ_AFFINITY_SHARPNESS=10.0
+DISABLE_SOFT_BANDS=0
+DISABLE_FREQ_ATTN=0
+DISABLE_BAND_MIXING=0
 NOISY_GATING=""
 IS_SPECIFIC=0                   # flag -> --is_specific
 IS_CLASSIFIER=0                   # flag -> --is_classifier
@@ -91,6 +97,8 @@ USE_GPU_PROXY=0
 USE_ENCODER=""
 BACKBONE="vit"
 ENCODER_PATH=""
+TARGET_SIZE=70
+ENC_C=128
 
 # 推理/恢复
 MODEL_PATH=""                   # inference 时常用
@@ -198,6 +206,12 @@ while [[ $# -gt 0 ]]; do
     --moe_mode) MOE_MODE="$2"; shift 2 ;;
     --router_type) ROUTER_TYPE="$2"; shift 2 ;;
     --router_hidden_dim) ROUTER_HIDDEN_DIM="$2"; shift 2 ;;
+    --router_alpha) ROUTER_ALPHA="$2"; shift 2 ;;
+    --band_sharpness) BAND_SHARPNESS="$2"; shift 2 ;;
+    --freq_affinity_sharpness) FREQ_AFFINITY_SHARPNESS="$2"; shift 2 ;;
+    --disable_soft_bands) DISABLE_SOFT_BANDS=1; shift ;;
+    --disable_freq_attn) DISABLE_FREQ_ATTN=1; shift ;;
+    --disable_band_mixing) DISABLE_BAND_MIXING=1; shift ;;
     --fusion_type) FUSION_TYPE="$2"; shift 2 ;;
     --s_processor_type) S_PROCESSOR_TYPE="$2"; shift 2 ;;
     --w_processor_type) W_PROCESSOR_TYPE="$2"; shift 2 ;;
@@ -211,6 +225,8 @@ while [[ $# -gt 0 ]]; do
     --use_encoder) USE_ENCODER=1; shift ;;
     --disable_encoder) USE_ENCODER=0; shift ;;
     --backbone) BACKBONE="$2"; shift 2 ;;
+    --target_size) TARGET_SIZE="$2"; shift 2 ;;
+    --enc_channels) ENC_C="$2"; shift 2 ;;
 
     --model_path) MODEL_PATH="$2"; shift 2 ;;
     --resume_path) RESUME_PATH="$2"; shift 2 ;;
@@ -386,6 +402,8 @@ echo "Use MoE: $USE_MOE"
 echo "MoE 模式: $MOE_MODE_DISPLAY"
 echo "Router Type: $ROUTER_TYPE"
 echo "Router Hidden Dim: ${ROUTER_HIDDEN_DIM:-<config>}"
+echo "Router Alpha (afmoe): ${ROUTER_ALPHA:-<config>}"
+echo "AFreqMoE: band_sharpness=$BAND_SHARPNESS, freq_affinity_sharpness=$FREQ_AFFINITY_SHARPNESS, soft_bands=$((1-DISABLE_SOFT_BANDS)), freq_attn=$((1-DISABLE_FREQ_ATTN)), band_mixing=$((1-DISABLE_BAND_MIXING))"
 echo "Fusion Type: $FUSION_TYPE"
 echo "Strong-Group Processor: $S_PROCESSOR_TYPE"
 echo "Weak-Group Processor: $W_PROCESSOR_TYPE"
@@ -394,6 +412,8 @@ echo "Noisy gating: $NOISY_GATING_DISPLAY"
 echo "GPU proxy: $GPU_PROXY_DISPLAY"
 echo "Encoder: $USE_ENCODER_DISPLAY"
 echo "Encoder Backbone: $BACKBONE"
+echo "Enc target size: $TARGET_SIZE"
+echo "Enc channels: $ENC_C"
 echo "Encoder Checkpoint: ${ENCODER_PATH:-<None>}"
 echo "is_specific: $IS_SPECIFIC, is_classifier: $IS_CLASSIFIER"
 echo "v_type_num: ${V_TYPE_NUM:-<auto>}"
@@ -444,6 +464,8 @@ ARGS=(
   --moe_method "$MOEMETHOD"
   --hidden_channels "$HIDDEN_CHANNELS"
   --backbone "$BACKBONE"
+  --target_size "$TARGET_SIZE"
+  --enc_channels "$ENC_C"
   --learning_rate "$LEARNING_RATE"
   --resume_path "$RESUME_PATH"
   --weight_decay "$WEIGHT_DECAY"
@@ -459,6 +481,8 @@ ARGS=(
   --lr_cosine_eta_min "$LR_COSINE_ETA_MIN"
   --accum_steps "$ACCUM_STEPS"
   --router_type "$ROUTER_TYPE"
+  --band_sharpness "$BAND_SHARPNESS"
+  --freq_affinity_sharpness "$FREQ_AFFINITY_SHARPNESS"
   --fusion_type "$FUSION_TYPE"
   --s_processor_type "$S_PROCESSOR_TYPE"
   --w_processor_type "$W_PROCESSOR_TYPE"
@@ -504,6 +528,7 @@ elif [[ "$VERBOSE" == "0" ]]; then
 fi
 [[ -n "$MOE_MODE" ]] && ARGS+=( --moe_mode "$MOE_MODE" )
 [[ -n "$ROUTER_HIDDEN_DIM" ]] && ARGS+=( --router_hidden_dim "$ROUTER_HIDDEN_DIM" )
+[[ -n "$ROUTER_ALPHA" ]] && ARGS+=( --router_alpha "$ROUTER_ALPHA" )
 if [[ "$NOISY_GATING" == "1" ]]; then
   ARGS+=( --enable_noisy_gating )
 elif [[ "$NOISY_GATING" == "0" ]]; then
@@ -538,6 +563,9 @@ fi
 [[ -n "$ENCODER_PATH" ]]     && ARGS+=( --encoder_path "$ENCODER_PATH" )
 [[ -n "$LOG_ROOT" ]]         && ARGS+=( --log_root "$LOG_ROOT" )
 [[ -n "$V_TYPE_NUM" ]]       && ARGS+=( --v_type_num "$V_TYPE_NUM" )
+[[ $DISABLE_SOFT_BANDS -eq 1 ]] && ARGS+=( --disable_soft_bands )
+[[ $DISABLE_FREQ_ATTN -eq 1 ]] && ARGS+=( --disable_freq_attn )
+[[ $DISABLE_BAND_MIXING -eq 1 ]] && ARGS+=( --disable_band_mixing )
 
 torchrun "${ARGS[@]}"
 

@@ -381,7 +381,7 @@ class Encoder_Dino(nn.Module):
         in_chans: int = 1,
         out_channels: int = 64,
         num_types: int = 3,
-        img_size: int = 70,
+        img_size: tuple = (70,70),
         patch_size: int = 16,
         mode: str = "pad_then_interp",  # "pad_then_interp" | "resize1120"
         type_act: str = "softmax"       # "softmax" | "sigmoid" | "identity"
@@ -389,7 +389,7 @@ class Encoder_Dino(nn.Module):
         super().__init__()
         self.out_channels = out_channels
         self.num_types = num_types
-        self.target_h = self.target_w = int(img_size)
+        self.target_h, self.target_w = img_size
         self.patch_size = patch_size
         self.mode = mode
 
@@ -644,6 +644,7 @@ def get_encoder(
     num_types: int = 3,
     type_act: str = 'softmax',
     backbone: str = 'vit',   # 'vit' | 'convnext_tiny'
+    img_size: tuple = (70,70),
 ) -> nn.Module:
     """
     统一工厂：
@@ -664,7 +665,7 @@ def get_encoder(
             in_chans=in_channels,
             out_channels=out_channels,
             num_types=num_types,
-            img_size=70,
+            img_size=img_size,
             patch_size=16,
             mode="pad_then_interp",
             type_act=type_act,
@@ -684,7 +685,7 @@ def get_encoder(
             in_chans=in_channels,
             out_channels=out_channels,
             num_types=num_types,
-            img_size=70,
+            img_size=img_size,
             type_act=type_act,
             use_timm_head=True,
         )

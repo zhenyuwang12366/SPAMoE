@@ -4,10 +4,7 @@
 			"path": "."
 		},
 		{
-			"path": "../results"
-		},
-		{
-			"path": "../FWINO"
+			"path": "../LaMO"
 		}
 	],
 	"settings": {}

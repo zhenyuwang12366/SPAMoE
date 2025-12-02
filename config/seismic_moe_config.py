@@ -28,11 +28,10 @@ class SeismicMOEConfig(Default):
     W_size = 256
     concat_channels = True
     moe_mode = "standard"    # standard: 直接专家模式, group: 分组模式, velocity_type: 速度图类型模式
-    moe_method = "basic"
+    moe_method = "afmoe"
     use_gpu_proxy = False
     train_encoder = False
-    use_encoder = False
-    draw_enc_pic = False
+    use_encoder = True
     backbone = 'vit'
     # v_type_id dict
     type_id_specific = {
@@ -68,17 +67,24 @@ class SeismicMOEConfig(Default):
     # MOE配置
     use_moe = False
     use_experts_path = None
-    top_k = 1  # 选择前k个专家
+    top_k = 2  # 选择前k个专家
     noisy_gating = True  # 是否使用噪声门控
     fusion_type = 'linear'  # 专家输出融合方式
     router_hidden_dim = 256  # 路由器隐藏层维度
     router_type = 'basic' # 路由形式 basic,adamv
+    # AFreqMoE 路由配置 / 消融开关
+    band_sharpness = 20.0
+    freq_affinity_sharpness = 10.0
+    use_soft_bands = True
+    enable_freq_attn = True
+    enable_band_mixing = True
     s_processor_type = 'linear'
     w_processor_type = 'linear'
     beta = 0.5
     is_specific = False
     is_classifier = False
     v_type_num = 0
+    router_alpha = 0.1
     
     # 专家配置
     expert_configs = [
@@ -93,27 +99,27 @@ class SeismicMOEConfig(Default):
             'projection_channel_ratio': 2,
             'n_layers': 4,
         },
-        # 小波域专家 - 适合处理局部特征和多尺度结构 WNO
-        {
-            'type': 'domain',
-            'domain_type': 'wavelet',
-            'n_dim': 2,
-            'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-            'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
-            'conv_kind': 'dwt',
-            'wavelet': 'db6',
-            'biort': 'near_sym_b',
-            'qshift': 'qshift_b',
-            'n_layers': 4,
-            'dropout_rate': 0.10,
-        },
+        # # 小波域专家 - 适合处理局部特征和多尺度结构 WNO
+        # {
+        #     'type': 'domain',
+        #     'domain_type': 'wavelet',
+        #     'n_dim': 2,
+        #     'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
+        #     'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+        #     'conv_kind': 'dwt',
+        #     'wavelet': 'db6',
+        #     'biort': 'near_sym_b',
+        #     'qshift': 'qshift_b',
+        #     'n_layers': 4,
+        #     'dropout_rate': 0.10,
+        # },
         # 原生多尺度神经算子专家 - 专门处理多尺度地质结构 MNO
         {
             'type': 'scale',
             'scale_expert_type': 'native',  # 更新为scale_expert_type
             'n_dim': 2,
             'n_scales': 3,
-            'scale_factors': [1.0, 0.5, 0.25],
+            'scale_factors': [1.0, 0.6, 0.3],
             'fusion_mode': 'hierarchical',
             'n_layers': 4,
         },
@@ -126,20 +132,20 @@ class SeismicMOEConfig(Default):
             'disco_layers': True,  # 启用DISCO层
             'diff_layers': True,   # 启用差分层
             'n_layers': 3,         # 设置层数
-            'default_in_shape': (256, 256),  # 基于输入张量形状设置
+            'default_in_shape': (70, 70),  # 基于输入张量形状设置
         },
-        # 几何感知专家 - GeoFNO
-        {
-            'type': 'geometry',
-            'geometry_type': 'geofno',
-            'modes1': 32,
-            'modes2': 32,
-            'n_fourier_layers': 5,
-            'code_dim': 42,
-            's1': 1000,
-            's2': 350,
-            'is_mesh': True,
-        }
+        # # 几何感知专家 - GeoFNO
+        # {
+        #     'type': 'geometry',
+        #     'geometry_type': 'geofno',
+        #     'modes1': 32,
+        #     'modes2': 32,
+        #     'n_fourier_layers': 5,
+        #     'code_dim': 42,
+        #     's1': 1000,
+        #     's2': 350,
+        #     'is_mesh': True,
+        # }
     ]
     
     # 训练配置

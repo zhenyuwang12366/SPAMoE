@@ -1112,7 +1112,7 @@ def run_inference(n_args):
       4) 权重加载：
          - 'all'：仅加载 router（以及必须提供 encoder_path）；专家从目录 load
          - 其他：从 checkpoint 加载 MoE（model_state_dict 或 router_state_dict），Encoder 优先 encoder_path
-      5) AMP(bf16) 推理、指标统计、可视化/类型预测保存/频域分析
+      5) AMP(bf16) 推理、指标统计、可视化/类型预测保存/频域分析 + afmoe 路由可视化
     """
     import tqdm
     from argparse import Namespace
@@ -1371,29 +1371,65 @@ def run_inference(n_args):
             )
 
     # --- MoE ---
-    moe = MOEOperator(
-        experts=experts,
-        in_channels=config.moe_in_channels,
-        out_channels=config.out_channels,
-        hidden_channels=config.hidden_channels,
-        top_k=config.top_k,
-        noisy_gating=config.noisy_gating,
-        fusion_type=config.fusion_type,
-        router_hidden_dim=config.router_hidden_dim,
-        moe_mode=getattr(config, "moe_mode", "standard"),
-        is_logger=is_logger,
-        router_type=config.router_type,
-        s_processor_type=config.s_processor_type,
-        w_processor_type=config.w_processor_type,
-        beta=config.beta,
-        is_specific=config.is_specific,
-        is_classifier=config.is_classifier,
-        batch_size=config.batch_size,
-        v_type_num=config.v_type_num,
-        use_expert_memory_proxy=config.use_gpu_proxy,   # 与训练一致
-        use_encoder=getattr(config, "use_encoder", False),
-        device=device,                                  # 与训练保持同构
-    )
+    moe_method = getattr(config, "moe_method", "basic")
+
+    # === 新增/修改: AFMOE 分支 ===
+    if moe_method == "afmoe":
+        # router 正则强度 / 频带尖锐度，从 config 中取，不存在则给默认值
+        router_alpha    = float(getattr(config, "router_alpha", 0.0))
+        band_sharpness  = float(getattr(config, "band_sharpness", 20.0))
+        freq_affinity_sharpness = float(getattr(config, "freq_affinity_sharpness", 10.0))
+        use_soft_bands = bool(getattr(config, "use_soft_bands", True))
+        enable_freq_attn = bool(getattr(config, "enable_freq_attn", True))
+        enable_band_mixing = bool(getattr(config, "enable_band_mixing", True))
+
+        if is_logger:
+            print(
+                "[MoE] 使用 AdaptiveFreqMoE (afmoe)，"
+                f"alpha={router_alpha}, band_sharpness={band_sharpness}, "
+                f"freq_affinity_sharpness={freq_affinity_sharpness}, "
+                f"use_soft_bands={use_soft_bands}, "
+                f"enable_freq_attn={enable_freq_attn}, "
+                f"enable_band_mixing={enable_band_mixing}"
+            )
+
+        moe = AdaptiveFreqMoE(
+            experts=experts,
+            in_channels=config.moe_in_channels,
+            topk=config.top_k,
+            alpha=router_alpha,
+            band_sharpness=band_sharpness,
+            freq_affinity_sharpness=freq_affinity_sharpness,
+            use_soft_bands=use_soft_bands,
+            enable_freq_attn=enable_freq_attn,
+            enable_band_mixing=enable_band_mixing,
+        ).to(device)
+    else:
+        if is_logger:
+            print(f"[MoE] 使用普通 MoEOperator (moe_method={moe_method})")
+        moe = MOEOperator(
+            experts=experts,
+            in_channels=config.moe_in_channels,
+            out_channels=config.out_channels,
+            hidden_channels=config.hidden_channels,
+            top_k=config.top_k,
+            noisy_gating=config.noisy_gating,
+            fusion_type=config.fusion_type,
+            router_hidden_dim=config.router_hidden_dim,
+            moe_mode=getattr(config, "moe_mode", "standard"),
+            is_logger=is_logger,
+            router_type=config.router_type,
+            s_processor_type=config.s_processor_type,
+            w_processor_type=config.w_processor_type,
+            beta=config.beta,
+            is_specific=config.is_specific,
+            is_classifier=config.is_classifier,
+            batch_size=config.batch_size,
+            v_type_num=config.v_type_num,
+            use_expert_memory_proxy=config.use_gpu_proxy,   # 与训练一致
+            use_encoder=getattr(config, "use_encoder", False),
+            device=device,                                  # 与训练保持同构
+        )
 
     # --- EMO 封装 ---
     emo = EMO(encoder_model, moe, pass_encoder_logits_as_weights=True).to(device)
@@ -1549,7 +1585,7 @@ def run_inference(n_args):
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"  Inference |        -        |        -        | {mae:.6f} | {mse:.6f} | {psnr:.4f} | {rmse:.6f} | {ssim:.6f} |\n")
 
-    # ===== 可视化输出（与训练日志一致）=====
+    # ===== 可视化输出（与训练日志一致）+ AFMOE 路由可视化 =====
     if visual_payload is not None:
         inputs_vis  = visual_payload["inputs"]
         targets_vis = visual_payload["targets"]
@@ -1592,6 +1628,48 @@ def run_inference(n_args):
             max_samples=num_samples,
             selection='l2',
         )
+
+        # === 新增: AFMOE 路由统计 & routed_bands 可视化 ===
+        if isinstance(emo.moe, AdaptiveFreqMoE):
+            router_vis_dir = img_path / "router"
+            router_vis_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                router_stats = emo.moe.get_router_stats()
+                visualize_router_selection_from_stats(
+                    router_stats,
+                    save_dir=router_vis_dir,
+                    epoch=0,
+                    router_name=getattr(config, "router_type", "sar"),
+                    tb_writer=None,
+                    wandb_run=None,
+                    global_step=None,
+                )
+                if is_logger:
+                    print(f"[RouterVis] 频段/专家选择统计已保存到 {router_vis_dir}")
+            except Exception as e:
+                if is_logger:
+                    print(f"[RouterVis] 频段/专家选择可视化失败: {e}")
+
+            try:
+                routed_bands = emo.moe.get_last_routed_bands()
+                if routed_bands is not None:
+                    band_centers = router_stats.get("band_centers", None) if 'router_stats' in locals() else None
+                    visualize_routed_bands(
+                        routed_bands,
+                        save_dir=router_vis_dir,
+                        sample_idx=0,
+                        max_channels=4,
+                        band_centers=band_centers,
+                        tb_writer=None,
+                        wandb_run=None,
+                        global_step=None,
+                    )
+                    if is_logger:
+                        print(f"[RouterVis] routed_bands 可视化已保存到 {router_vis_dir}")
+            except Exception as e:
+                if is_logger:
+                    print(f"[RouterVis] routed_bands 可视化失败: {e}")
 
     if test_sampler is not None and hasattr(test_sampler, "set_epoch"):
         test_sampler.set_epoch(0)
