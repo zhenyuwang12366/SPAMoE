@@ -4,10 +4,9 @@
 conda activate seismic_moe
 
 python load_to_zarr.py \
-  --data_dir /root/autodl-tmp/All \
-  --zarr_out /root/autodl-tmp/all.zarr \
+  --data_dir /root/autodl-tmp/FWINO/FWINO_data/ \
+  --zarr_out /root/autodl-tmp/.zarr \
   --family all \
   --remap_single_label 0 \
-  --include_test 0 \
-  --concat_channels 0
+  --include_test 0
 
