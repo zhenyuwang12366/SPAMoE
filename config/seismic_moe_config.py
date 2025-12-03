@@ -81,7 +81,7 @@ class SeismicMOEConfig(Default):
     s_processor_type = 'linear'
     w_processor_type = 'linear'
     beta = 0.5
-    is_specific = False
+    is_specific = True
     is_classifier = False
     v_type_num = 0
     router_alpha = 0.1
