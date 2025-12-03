@@ -196,7 +196,7 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
     # 学习率调度器选择
     parser.add_argument(
         '--lr_scheduler_type', type=str,
-        default='cos_restart', choices=['cos_restart', 'cos', 'multistep'],
+        default='cos', choices=['cos_restart', 'cos', 'multistep'],
         help='学习率调度器类型'
     )
 

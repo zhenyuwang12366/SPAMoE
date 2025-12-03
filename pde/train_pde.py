@@ -232,7 +232,7 @@ def build_argparser():
                         help="消融：禁用频带混合输入，专家仅接收对应频带。")
     parser.add_argument("--resume_path", type=str, default=None,
                         help="Checkpoint path to resume training from.")
-    parser.add_argument("--lr_scheduler_type", type=str, default="cos_restart",
+    parser.add_argument("--lr_scheduler_type", type=str, default="cos",
                         choices=["multistep", "cos", "cos_restart", "none"])
     parser.add_argument("--milestones", type=int, nargs="+", default=[60, 90, 110])
     parser.add_argument("--scheduler_gamma", type=float, default=0.3)
