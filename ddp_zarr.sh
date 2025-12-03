@@ -23,7 +23,8 @@ nohup bash scripts/run_distributed_seismic_moe.sh \
   --model_name afreqmoe \
   --num_gpus 2 \
   --num_workers 16 \
-  --data_dir /root/autodl-tmp/FWINO/FWINO_data \
+  --zarr_path /root/autodl-tmp/curve_vel_a.zarr \
+  --status_json ./dataset_status/dataset_status.json \
   --family curve_vel_a \
   --batch_size 32 \
   --epochs 200 \
