@@ -33,3 +33,4 @@ nohup bash scripts/run_distributed_seismic_moe.sh \
   --use_amp \
   > "$LOGFILE" 2>&1 &
 echo "ddp训练已启动，日志记录在：$LOGFILE"
+# moe_method basic/afreqmoe
