@@ -1,40 +1,28 @@
 #!/bin/bash
 
-srun --partition=gpu-4090-2 --gres=gpu:1 --cpus-per-task=10 --pty bash
+# srun --partition=gpu-4090-2 --gres=gpu:1 --cpus-per-task=10 --pty bash
+# === Conda 环境 ===
+. "/data1/apps/anaconda3/etc/profile.d/conda.sh"
+conda activate FWINO
 
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m pdb scripts/train_seismic_moe.py \
-  --mode train \
-  --model_name FNO_no_enocder_70 \
-  --concat_channels \
-  --is_resize \
-  --H_size 70 \
-  --W_size 70 \
-  --is_specific \
-  --num_workers 10 \
-  --zarr_path /data1/home/teacher/teacher_s/t108790/curve_vel_b.zarr \
-  --status_json ./dataset_status/dataset_status.json \
-  --family curve_vel_b \
-  --is_specific \
-  --batch_size 4 \
-  --accum_steps 8\
-  --epochs 100 \
-  --output_dir ../results \
-  --top_k 1 \
-  --choose_experts 0 \
-  --hidden_channels 128 \
-  --learning_rate 0.00026711555047527854 \
-  --weight_decay 0.08952068376871994 \
-  --scheduler_gamma 0.2966237496749535 \
-  --FNO_n_layers 6 \
-  --FNO_n_modes_height 64 \
-  --FNO_n_modes_width 64 \
-  --lambda_g1v 0.43947650935102966 \
-  --lambda_g2v 0.35339805101397564 \
-  --lambda_grad_l1 0.15 \
-  --lambda_fourier_mag_l1 0.05 \
-  --wavelet_type db6 \
-  --WNO_n_levels_height 3 \
-  --WNO_n_levels_width 2 \
-  --WNO_n_layers 4 \
-  --WNO_dropout_rate 0.10 \
-  --use_amp
+# === 与 run_pde.sh 保持一致的默认配置 ===
+MODE=TRAIN   # TRAIN / TEST
+TASK=pipe    # pipe/darcy/navier/plasticity/airfoil
+
+LAMO_DATA=${LAMO_DATA:-../LaMO/data/$TASK}
+PDE_DATA=${PDE_DATA:-../pdebench_data/$TASK}
+STATUS_JSON=${STATUS_JSON:-$PDE_DATA/${TASK}_train_stats.json}
+SAVE_DIR=${SAVE_DIR:-../results_pde/$TASK}
+CKPT=${CKPT:-$SAVE_DIR/checkpoint_best.pt}
+NUM_GPUS=${NUM_GPUS:-2}
+
+# === GPU & 运行目录 ===
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-${SLURM_JOB_GPUS:-0,1}}
+
+echo "Using GPUs: $CUDA_VISIBLE_DEVICES"
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m pdb pde/train_pde.py \
+  --task "$TASK" \
+  --data_root "$PDE_DATA" \
+  --status_json "$STATUS_JSON" \
+  --save_dir "$SAVE_DIR"

@@ -277,6 +277,9 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     ckpt_cfg = ckpt.get("config", {}) or {}
 
+    print(f"Loaded ckpt from {args.checkpoint}, epoch={ckpt.get('epoch')}, "
+      f"best_mse={ckpt.get('best_mse')}, best_l2r={ckpt.get('best_l2r')}")
+    
     # 1) 先用默认值实例化，再用 ckpt 中的字段覆盖，避免 distributed 变为 dict
     cfg = PDEBenchConfig()
     for k, v in ckpt_cfg.items():
@@ -326,13 +329,6 @@ def main():
     args.world_size = comm.get_world_size()
     args.local_rank = comm.get_local_rank()
 
-    # 每个 rank 加一点偏移，避免完全相同的随机数序列
-    rank_seed = args.seed + args.rank
-    torch.manual_seed(rank_seed)
-    np.random.seed(rank_seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(rank_seed)
-
     if is_main_process(cfg):
         args.save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -348,7 +344,7 @@ def main():
     cfg.in_channels = int(sample["input"].shape[0])
     cfg.out_channels = int(sample["output"].shape[0])
     cfg.img_size = tuple(sample["output"].shape[-2:])
-    cfg.expert_configs[1]["base_size"] = cfg.img_size
+    cfg.expert_configs[2]["default_in_shape"] = cfg.img_size
 
     # === Model ===
     emo = build_emo_model(cfg, device)

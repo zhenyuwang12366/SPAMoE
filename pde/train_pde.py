@@ -161,7 +161,8 @@ class PDEBenchConfig(Default):
             'disco_layers': True,  # 启用DISCO层
             'diff_layers': True,   # 启用差分层
             'n_layers': 3,         # 设置层数
-            'default_in_shape': (70, 70),  # 基于输入张量形状设置
+            'default_in_shape': (70, 70),  # 基于输入张量形状设置（后面会覆盖）
+            'domain_length': [2, 2],
         },
         # # 小波域专家 - 适合处理局部特征和多尺度结构 WNO
         # {
@@ -277,6 +278,51 @@ def unwrap_model(model: nn.Module) -> nn.Module:
     if isinstance(model, (nn.parallel.DistributedDataParallel, nn.DataParallel)):
         return model.module
     return model
+
+
+# ===========================================================
+# 3.5 自动计算 radius_cutoff，使 DISCO 输出尺寸与输入一致
+# ===========================================================
+
+def auto_radius_cutoff_same_size(
+    in_shape,
+    domain_length=(2.0, 2.0),
+    target_support: int = 3,
+) -> float:
+    """
+    根据 EquidistantDiscreteContinuousConv2d 的公式：
+        psi_local_h = floor(2 * radius_cutoff * H / Lx) + 1
+        psi_local_w = floor(2 * radius_cutoff * W / Ly) + 1
+
+    这里选择 radius_cutoff，使得:
+        psi_local_h = psi_local_w = target_support (建议奇数: 3,5,7,...)
+    从而在 stride=1 + same padding 下保证空间尺寸不变。
+    """
+    H, W = in_shape
+    Lx, Ly = float(domain_length[0]), float(domain_length[1])
+    assert target_support % 2 == 1, "target_support 必须为奇数（3,5,7,...）"
+
+    # A,B 是关于 H,W,domain_length 的系数
+    A = 2.0 * H / max(Lx, 1e-6)
+    B = 2.0 * W / max(Ly, 1e-6)
+    k = float(target_support)
+
+    # 需要满足：
+    #   k-1 ≤ radius*A < k
+    #   k-1 ≤ radius*B < k
+    # → radius 的两个区间交集：
+    low = max((k - 1.0) / A, (k - 1.0) / B)
+    high = min(k / A, k / B)
+
+    if low >= high:
+        # 极端情况下退而求其次
+        radius = low
+    else:
+        # 取交集区间中点，避免落在边界
+        radius = 0.5 * (low + high)
+
+    return float(radius)
+
 
 # ===========================================================
 # 4. 构建数据集 (PDEBench)
@@ -671,11 +717,8 @@ def main():
     )
 
     if args.distributed:
-        cfg.distributed.use_distributed = True
-        device, is_logger = setup(cfg)
-    else:
-        device, is_logger = setup(cfg)
-
+        cfg.distributed.use_distributed = True 
+    device, is_logger = setup(cfg)
     cfg.is_logger = is_logger
     
     # 同步 rank/world_size
@@ -704,9 +747,23 @@ def main():
     cfg.img_size = tuple(sample_batch["output"].shape[-2:])
     # cfg.expert_configs[1]["base_size"] = cfg.img_size
     cfg.expert_configs[2]["default_in_shape"] = cfg.img_size
-    
-    # print(cfg.expert_configs[1]["base_size"])
-    
+
+    # ==== 这里：根据 img_size + domain_length 自动计算 LNO/DISCO 的 radius_cutoff ====
+    lno_cfg = cfg.expert_configs[2]
+    domain_length = lno_cfg.get("domain_length", [2, 2])
+    radius_cutoff = auto_radius_cutoff_same_size(
+        in_shape=cfg.img_size,
+        domain_length=(float(domain_length[0]), float(domain_length[1])),
+        target_support=3,   # 可以换成 5/7，看你想要的 DISCO 感受野
+    )
+    lno_cfg["radius_cutoff"] = radius_cutoff
+
+    if is_main_process(cfg):
+        print(
+            f"[LNO/DISCO] img_size={cfg.img_size}, domain_length={domain_length}, "
+            f"auto radius_cutoff={radius_cutoff:.6f}"
+        )
+
     emo = build_emo_model(cfg, device)
 
     cfg.has_complex_params = any(torch.is_complex(p) for p in emo.parameters())

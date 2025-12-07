@@ -5,13 +5,13 @@ set -e
 
 NUM_GPUS=2
 TASK="navier2d"
-DATA_ROOT_BASE="./pdebench_data"
+DATA_ROOT_BASE="../pdebench_data"
 DATA_ROOT=""
-STATUS_JSON="./pde_status.json"
-SAVE_DIR_BASE="./results_pde"
+STATUS_JSON="../pdebench_data/pde_status.json"
+SAVE_DIR_BASE="../results_pde"
 SAVE_DIR=""
 CHECKPOINT=""
-SPLIT="val"
+SPLIT="test"
 BATCH_SIZE=16
 USE_AMP=1
 AMP_DTYPE="bfloat16"
