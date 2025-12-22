@@ -70,7 +70,7 @@ class SpectralAttentionRouter(nn.Module):
     def __init__(
         self, 
         C: int, 
-        num_heads: int = 4,   # 这里其实是专家数 num_experts
+        num_heads: int = 3,   # 这里其实是专家数 num_experts
         top_k: int = 2,
         alpha: float = 0.0,
         band_sharpness: float = 20.0,

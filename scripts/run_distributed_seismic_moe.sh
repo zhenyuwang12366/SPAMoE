@@ -90,6 +90,7 @@ DISABLE_SOFT_BANDS=0
 DISABLE_FREQ_ATTN=0
 DISABLE_BAND_MIXING=0
 ROUTING_MODE="learned"          # learned / uniform / random
+ENABLE_FREQ_METRICS=0
 NOISY_GATING=""
 IS_SPECIFIC=0                   # flag -> --is_specific
 IS_CLASSIFIER=0                   # flag -> --is_classifier
@@ -213,6 +214,7 @@ while [[ $# -gt 0 ]]; do
     --disable_soft_bands) DISABLE_SOFT_BANDS=1; shift ;;
     --disable_freq_attn) DISABLE_FREQ_ATTN=1; shift ;;
     --disable_band_mixing) DISABLE_BAND_MIXING=1; shift ;;
+    --enable_freq_metrics) ENABLE_FREQ_METRICS=1; shift ;;
     --routing_mode) ROUTING_MODE="$2"; shift 2 ;;
     --fusion_type) FUSION_TYPE="$2"; shift 2 ;;
     --s_processor_type) S_PROCESSOR_TYPE="$2"; shift 2 ;;
@@ -406,6 +408,7 @@ echo "Router Type: $ROUTER_TYPE"
 echo "Router Hidden Dim: ${ROUTER_HIDDEN_DIM:-<config>}"
 echo "Router Alpha (afmoe): ${ROUTER_ALPHA:-<config>}"
 echo "AFreqMoE: band_sharpness=$BAND_SHARPNESS, freq_affinity_sharpness=$FREQ_AFFINITY_SHARPNESS, soft_bands=$((1-DISABLE_SOFT_BANDS)), freq_attn=$((1-DISABLE_FREQ_ATTN)), band_mixing=$((1-DISABLE_BAND_MIXING))"
+echo "Freq band metrics: $ENABLE_FREQ_METRICS"
 echo "Fusion Type: $FUSION_TYPE"
 echo "Strong-Group Processor: $S_PROCESSOR_TYPE"
 echo "Weak-Group Processor: $W_PROCESSOR_TYPE"
@@ -569,6 +572,7 @@ fi
 [[ $DISABLE_SOFT_BANDS -eq 1 ]] && ARGS+=( --disable_soft_bands )
 [[ $DISABLE_FREQ_ATTN -eq 1 ]] && ARGS+=( --disable_freq_attn )
 [[ $DISABLE_BAND_MIXING -eq 1 ]] && ARGS+=( --disable_band_mixing )
+[[ $ENABLE_FREQ_METRICS -eq 1 ]] && ARGS+=( --enable_freq_metrics )
 
 torchrun "${ARGS[@]}"
 

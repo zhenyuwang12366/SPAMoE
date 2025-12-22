@@ -1519,6 +1519,7 @@ def run_inference(n_args):
     mse_sum = mae_sum = psnr_sum = rmse_sum = ssim_sum = 0.0
     batch_count = 0
     visual_payload = None
+    band_accum = {}
 
     with torch.no_grad():
         for batch in tqdm.tqdm(test_loader, desc=f"推理中({eval_split})", disable=not is_logger):
@@ -1543,6 +1544,19 @@ def run_inference(n_args):
             rmse_sum += metrics_module.calculate_rmse(preds, targets)
             ssim_sum += metrics_module.calculate_ssim(preds, targets)
             batch_count += 1
+
+            if getattr(config, "enable_freq_metrics", False):
+                band_metrics = metrics_module.calculate_freq_band_metrics(preds, targets)
+                for name, vals in band_metrics.items():
+                    acc = band_accum.setdefault(
+                        name,
+                        {"rel_l2": 0.0, "mae": 0.0, "pred_energy_ratio": 0.0, "tgt_energy_ratio": 0.0, "count": 0},
+                    )
+                    acc["rel_l2"] += vals["rel_l2"]
+                    acc["mae"] += vals["mae"]
+                    acc["pred_energy_ratio"] += vals["pred_energy_ratio"]
+                    acc["tgt_energy_ratio"] += vals["tgt_energy_ratio"]
+                    acc["count"] += 1
 
             # 仅采样一次可视化样本
             if visual_payload is None and is_logger:
@@ -1590,6 +1604,35 @@ def run_inference(n_args):
 
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"  Inference |        -        |        -        | {mae:.6f} | {mse:.6f} | {psnr:.4f} | {rmse:.6f} | {ssim:.6f} |\n")
+
+    band_summary = {}
+    if band_accum:
+        for name, agg in band_accum.items():
+            cnt = max(1, int(agg.get("count", 1)))
+            band_summary[name] = {
+                "rel_l2": float(agg["rel_l2"] / cnt),
+                "mae": float(agg["mae"] / cnt),
+                "pred_energy_ratio": float(agg["pred_energy_ratio"] / cnt),
+                "tgt_energy_ratio": float(agg["tgt_energy_ratio"] / cnt),
+                "count": cnt,
+            }
+        if is_logger:
+            pretty = " | ".join(
+                f"{k}: rel_l2={v['rel_l2']:.4f}, mae={v['mae']:.4f}, "
+                f"predE={v['pred_energy_ratio']:.3f}, tgtE={v['tgt_energy_ratio']:.3f}"
+                for k, v in band_summary.items()
+            )
+            print(f"[FreqMetrics] {pretty}")
+        freq_json = results_dir / "freq_band_metrics.json"
+        with open(freq_json, "w", encoding="utf-8") as f:
+            json.dump(band_summary, f, indent=2, ensure_ascii=False)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("[FreqMetrics]\n")
+            for k, v in band_summary.items():
+                f.write(
+                    f"  {k}: rel_l2={v['rel_l2']:.6f}, mae={v['mae']:.6f}, "
+                    f"predE={v['pred_energy_ratio']:.6f}, tgtE={v['tgt_energy_ratio']:.6f}\n"
+                )
 
     # ===== 可视化输出（与训练日志一致）+ AFMOE 路由可视化 =====
     if visual_payload is not None:

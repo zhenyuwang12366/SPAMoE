@@ -33,6 +33,7 @@ class SeismicMOEConfig(Default):
     train_encoder = False
     use_encoder = True
     backbone = 'vit'
+    enable_freq_metrics = False  # 是否在推理阶段输出分频指标
     # v_type_id dict
     type_id_specific = {
         'curve_vel_a': 0,

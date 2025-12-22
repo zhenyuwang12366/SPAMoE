@@ -234,6 +234,75 @@ def _mk_seismic_exp(
     )
 
 
+def build_freq_specialization_suite(
+    families: Sequence[str],
+    seeds: Sequence[int],
+) -> List[Experiment]:
+    """低/中/高频专家对照 + 融合的实验组合。"""
+    experiments: List[Experiment] = []
+    for fam in families:
+        for s in seeds:
+            experiments.append(
+                _mk_seismic_exp(
+                    section="freq",
+                    tag="fno",
+                    family=fam,
+                    seed=s,
+                    top_k=1,
+                    moe_method="basic",
+                    router_type="basic",
+                    notes="单专家 FNO，偏低频",
+                    extra=["--choose_experts", "0", "--top_k", "1", "--enable_freq_metrics"],
+                )
+            )
+            experiments.append(
+                _mk_seismic_exp(
+                    section="freq",
+                    tag="mno",
+                    family=fam,
+                    seed=s,
+                    top_k=1,
+                    moe_method="basic",
+                    router_type="basic",
+                    notes="单专家 MNO，偏中频",
+                    extra=["--choose_experts", "1", "--top_k", "1", "--enable_freq_metrics"],
+                )
+            )
+            experiments.append(
+                _mk_seismic_exp(
+                    section="freq",
+                    tag="lno",
+                    family=fam,
+                    seed=s,
+                    top_k=1,
+                    moe_method="basic",
+                    router_type="basic",
+                    notes="单专家 LNO，偏高频",
+                    extra=["--choose_experts", "2", "--top_k", "1", "--enable_freq_metrics"],
+                )
+            )
+            experiments.append(
+                _mk_seismic_exp(
+                    section="freq",
+                    tag="fusion",
+                    family=fam,
+                    seed=s,
+                    top_k=2,
+                    moe_method="afmoe",
+                    router_type="sar",
+                    notes="FNO+MNO+LNO 互补",
+                    extra=[
+                        "--choose_experts", "0", "1", "2",
+                        "--top_k", "2",
+                        "--enable_freq_metrics",
+                        "--band_sharpness", "20",
+                        "--freq_affinity_sharpness", "10",
+                    ],
+                )
+            )
+    return experiments
+
+
 def build_seismic_suite(
     families: Sequence[str] | None = None,
     seeds: Sequence[int] | None = None,
@@ -242,6 +311,9 @@ def build_seismic_suite(
     fams = list(families) if families else list(DEFAULT_SEISMIC_FAMILIES)
     seed_list = list(seeds) if seeds else list(DEFAULT_SEEDS)
     experiments: List[Experiment] = []
+
+    # 频段对照/互补实验
+    experiments.extend(build_freq_specialization_suite(fams, seed_list))
 
     for fam in fams:
         for s in seed_list:

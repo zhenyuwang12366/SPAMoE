@@ -271,6 +271,8 @@ def get_seismic_config(args: argparse.Namespace):
         config.enable_band_mixing = not args.disable_band_mixing
     if hasattr(args, "noisy_gating") and args.noisy_gating is not None:
         config.noisy_gating = args.noisy_gating
+    if hasattr(args, "enable_freq_metrics"):
+        config.enable_freq_metrics = bool(args.enable_freq_metrics)
     
     # 设置专家组间融合方式
     if args.fusion_type:

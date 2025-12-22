@@ -465,6 +465,10 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
         help='消融：关闭频带混合输入，专家仅接收对应频带'
     )
     parser.add_argument(
+        '--enable_freq_metrics', action='store_true',
+        help='在验证/推理阶段计算低/中/高频 band 指标'
+    )
+    parser.add_argument(
         '--router_hidden_dim', type=int, default=None,
         help='路由器隐藏层宽度（若为 None 使用默认配置）'
     )
