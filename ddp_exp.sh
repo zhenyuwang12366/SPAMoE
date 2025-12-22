@@ -22,7 +22,7 @@ nohup python exp/run_afreqmoe_pipeline.py \
   --num-gpus 2 \
   --families curve_fault_a \
   --seeds 0 1 2 \
-  --seis-data-root ../FWINO_data \
+  --seis-zarr /root/autodl-tmp \
   --seis-status-json ./dataset_status/dataset_status.json \
   --save-root ./exp/runs \
   > "$LOGFILE" 2>&1 &
