@@ -50,12 +50,14 @@ class Experiment:
     top_k: int = 2
     backbone: str = "vit"         # "vit" | "convnext_tiny"
     hidden_channels: int = 128
-    batch_size: int = 16
-    test_batch_size: int = 16
+    batch_size: int = 32
+    test_batch_size: int = 32
     epochs: int = 200
     lr: float = 1e-4
     weight_decay: float = 0.0
     aux_loss_weight: float = 0.1
+    section: str = "misc"         # 实验大类标签（e1/e3/abl 等）
+    seed: int | None = None
     notes: str = ""
     use_amp: bool = True
     amp_dtype: str = "bfloat16"
@@ -91,6 +93,7 @@ class Experiment:
                     "--epochs", str(self.epochs),
                     "--batch_size", str(self.batch_size),
                     "--test_batch_size", str(self.test_batch_size),
+                    "--vis_freq", str(1_000_000_000),  # effectively disable training-time visualization
                     "--backbone", self.backbone,
                     "--output_dir", str(save_dir),
                     "--status_json", str(seismic_status_json),
@@ -109,10 +112,10 @@ class Experiment:
                     "--epochs", str(self.epochs),
                     "--batch_size", str(self.batch_size),
                     "--test_batch_size", str(self.test_batch_size),
+                    "--vis_freq", str(1_000_000_000),  # effectively disable training-time visualization
                     "--backbone", self.backbone,
                     "--output_dir", str(save_dir),
                     "--status_json", str(seismic_status_json),
-                    "--amp_dtype", self.amp_dtype,
                 ]
 
             if seismic_zarr is not None:
@@ -123,6 +126,9 @@ class Experiment:
 
             if self.use_amp:
                 cmd.append("--use_amp")
+
+            if self.seed is not None:
+                cmd.extend(["--seed", str(self.seed)])
 
             cmd.extend(self.extra_args)
             return cmd
@@ -180,245 +186,219 @@ class Experiment:
         cmd.extend(self.extra_args)
         return cmd
 
-DEFAULT_EXPERIMENTS: List[Experiment] = [
-    # ================= Navier-Stokes 2D =================
-    # 主结果：Navier 2D AFMoE
-    Experiment(
-        name="navier_sar_vit_top2",
-        task="navier2d",
-        router_type="sar",
-        top_k=2,
-        batch_size=32,
-        test_batch_size=32,
-        epochs=120,
-        lr=5e-4,
-        notes="Navier 2D AFreqMoE，ViT 编码器，主实验。",
-    ),
-    # Navier 消融：basic router 对照
-    Experiment(
-        name="navier_basic_vit_top2",
-        task="navier2d",
-        router_type="basic",
-        top_k=2,
-        batch_size=32,
-        test_batch_size=32,
-        epochs=120,
-        lr=5e-4,
-        notes="Navier 2D basic router 基线（唯一 PDE 任务上的 router 对照）。",
-    ),
-    # Navier 消融：单专家 vs 多专家
-    Experiment(
-        name="navier_sar_vit_top1",
-        task="navier2d",
-        router_type="sar",
-        top_k=1,
-        batch_size=32,
-        test_batch_size=32,
-        epochs=120,
-        lr=5e-4,
-        aux_loss_weight=0.05,
-        notes="Navier 2D AFreqMoE，单专家激活消融。",
-    ),
-
-    # ================= Darcy 2D =================
-    # 主结果：Darcy 2D AFMoE
-    Experiment(
-        name="darcy_sar_vit_top2",
-        task="darcy2d",
-        router_type="sar",
-        top_k=2,
-        batch_size=32,
-        test_batch_size=32,
-        epochs=160,
-        lr=1e-4,
-        notes="Darcy 2D AFreqMoE，ViT 编码器，主实验。",
-    ),
-    # Darcy 消融：单专家 vs 多专家（稳态 PDE 上多专家的必要性）
-    Experiment(
-        name="darcy_sar_vit_top1",
-        task="darcy2d",
-        router_type="sar",
-        top_k=1,
-        batch_size=32,
-        test_batch_size=32,
-        epochs=160,
-        lr=1e-4,
-        aux_loss_weight=0.05,
-        notes="Darcy 2D AFreqMoE，单专家激活消融。",
-    ),
-
-    # ================= Pipe =================
-    # 仅保留 AFMoE 主结果
-    Experiment(
-        name="pipe_sar_vit_top2",
-        task="pipe",
-        router_type="sar",
-        top_k=2,
-        batch_size=32,
-        test_batch_size=32,
-        epochs=150,
-        lr=2e-4,
-        notes="Pipe AFreqMoE，ViT 编码器，主实验。",
-    ),
-
-    # ================= Airfoil =================
-    Experiment(
-        name="airfoil_sar_vit_top2",
-        task="airfoil",
-        router_type="sar",
-        top_k=2,
-        batch_size=32,
-        test_batch_size=32,
-        epochs=150,
-        lr=2e-4,
-        notes="Airfoil AFreqMoE，ViT 编码器，主实验。",
-    ),
-
-    # ================= Plasticity =================
-    Experiment(
-        name="plasticity_sar_vit_top2",
-        task="plasticity",
-        router_type="sar",
-        top_k=2,
-        batch_size=32,
-        test_batch_size=32,
-        epochs=200,
-        lr=1e-4,
-        notes="Plasticity AFreqMoE，4*T 展平通道，主实验。",
-    ),
-
-    # ================= Seismic: Curve_Vel_A =================
-    # Seismic：局部曲线速度 AFMoE vs basic
-    Experiment(
-        name="seis_afmoe_curve_vel_a_top2_vit",
-        domain="seismic",
-        family="curve_vel_a",
-        moe_method="afmoe",
-        router_type="sar",
-        top_k=2,
-        backbone="vit",
-        batch_size=32,
-        test_batch_size=32,
-        epochs=120,
-        lr=2e-4,
-        weight_decay=5e-4,
-        notes="Seismic AFreqMoE，curve_vel_a，ViT。",
-    ),
-    Experiment(
-        name="seis_basic_curve_vel_a_top2_vit",
-        domain="seismic",
-        family="curve_vel_a",
-        moe_method="basic",
-        router_type="basic",
-        top_k=2,
-        backbone="vit",
-        batch_size=32,
-        test_batch_size=32,
-        epochs=120,
-        lr=2e-4,
-        weight_decay=5e-4,
-        notes="Seismic basic router 基线，curve_vel_a。",
-    ),
-
-    # ================= Seismic: Flat_Fault_A =================
-    # Seismic：平坦断层 AFMoE vs basic
-    Experiment(
-        name="seis_afmoe_flat_fault_a_top2_vit",
-        domain="seismic",
-        family="flat_fault_a",
-        moe_method="afmoe",
-        router_type="sar",
-        top_k=2,
-        backbone="vit",
-        batch_size=32,
-        test_batch_size=32,
-        epochs=120,
-        lr=2e-4,
-        weight_decay=5e-4,
-        notes="Seismic AFreqMoE，flat_fault_a，ViT。",
-    ),
-    Experiment(
-        name="seis_basic_flat_fault_a_top2_vit",
-        domain="seismic",
-        family="flat_fault_a",
-        moe_method="basic",
-        router_type="basic",
-        top_k=2,
-        backbone="vit",
-        batch_size=32,
-        test_batch_size=32,
-        epochs=120,
-        lr=2e-4,
-        weight_decay=5e-4,
-        notes="Seismic basic router 基线，flat_fault_a。",
-    ),
-
-    # ================= Seismic: All families =================
-    # 全量 all：AFMoE vs basic
-    Experiment(
-        name="seis_afmoe_all_top2_vit",
-        domain="seismic",
-        family="all",
-        moe_method="afmoe",
-        router_type="sar",
-        top_k=2,
-        backbone="vit",
-        batch_size=32,
-        test_batch_size=32,
-        epochs=140,
-        lr=1.5e-4,
-        weight_decay=5e-4,
-        notes="Seismic AFreqMoE，全量 all，ViT。",
-    ),
-    Experiment(
-        name="seis_basic_all_top2_vit",
-        domain="seismic",
-        family="all",
-        moe_method="basic",
-        router_type="basic",
-        top_k=2,
-        backbone="vit",
-        batch_size=32,
-        test_batch_size=32,
-        epochs=140,
-        lr=1.5e-4,
-        weight_decay=5e-4,
-        notes="Seismic basic router 全量 all 基线。",
-    ),
-    # 全量 all 消融：单专家
-    Experiment(
-        name="seis_afmoe_all_top1_vit",
-        domain="seismic",
-        family="all",
-        moe_method="afmoe",
-        router_type="sar",
-        top_k=1,
-        backbone="vit",
-        batch_size=32,
-        test_batch_size=32,
-        epochs=140,
-        lr=1.5e-4,
-        weight_decay=5e-4,
-        aux_loss_weight=0.05,
-        notes="Seismic AFreqMoE，全量 all，单专家激活消融。",
-    ),
-    # 全量 all 消融：ConvNeXt 骨干
-    Experiment(
-        name="seis_afmoe_all_top2_convnext",
-        domain="seismic",
-        family="all",
-        moe_method="afmoe",
-        router_type="sar",
-        top_k=2,
-        backbone="convnext_tiny",
-        batch_size=32,
-        test_batch_size=32,
-        epochs=140,
-        lr=1.5e-4,
-        weight_decay=5e-4,
-        notes="Seismic AFreqMoE，全量 all，ConvNeXt 骨干消融。",
-    ),
+DEFAULT_EXPERIMENTS: List[Experiment] = []
+DEFAULT_SEISMIC_FAMILIES: List[str] = [
+    # 按需求默认只跑这三类；如需更多请用 --families 覆盖
+    "flat_vel_a",
+    "curve_vel_a",
+    "curve_fault_a",
 ]
+DEFAULT_SEEDS: List[int] = [0, 1, 2]
+
+
+def _mk_seismic_exp(
+    *,
+    section: str,
+    tag: str,
+    family: str,
+    seed: int,
+    top_k: int = 2,
+    moe_method: str = "afmoe",
+    router_type: str = "sar",
+    notes: str = "",
+    extra: Sequence[str] = (),
+) -> Experiment:
+    """Helper to standardize naming & defaults for seismic experiments."""
+    name = f"{section}_{tag}_{family}_s{seed}"
+    return Experiment(
+        name=name,
+        domain="seismic",
+        family=family,
+        moe_method=moe_method,
+        router_type=router_type,
+        top_k=top_k,
+        backbone="vit",
+        hidden_channels=128,
+        batch_size=32,
+        test_batch_size=32,
+        epochs=150,
+        lr=1e-4,
+        weight_decay=1e-4,
+        aux_loss_weight=0.1,
+        section=section,
+        seed=seed,
+        use_amp=True,
+        amp_dtype="bfloat16",
+        notes=notes,
+        extra_args=list(extra),
+    )
+
+
+def build_seismic_suite(
+    families: Sequence[str] | None = None,
+    seeds: Sequence[int] | None = None,
+) -> List[Experiment]:
+    """构造覆盖消融/超参的 seismic 实验列表（不含 E1 主结果对比）。"""
+    fams = list(families) if families else list(DEFAULT_SEISMIC_FAMILIES)
+    seed_list = list(seeds) if seeds else list(DEFAULT_SEEDS)
+    experiments: List[Experiment] = []
+
+    for fam in fams:
+        for s in seed_list:
+            # E3：硬分频
+            experiments.append(
+                _mk_seismic_exp(
+                    section="e3",
+                    tag="hard_bands",
+                    family=fam,
+                    seed=s,
+                    top_k=2,
+                    moe_method="afmoe",
+                    router_type="sar",
+                    notes="E3 hard bands",
+                    extra=["--disable_soft_bands"],
+                )
+            )
+            # E3：全频（不分频，关闭 band mixing + 极低 band_sharpness）
+            experiments.append(
+                _mk_seismic_exp(
+                    section="e3",
+                    tag="full_band",
+                    family=fam,
+                    seed=s,
+                    top_k=2,
+                    moe_method="afmoe",
+                    router_type="sar",
+                    notes="E3 no frequency split",
+                    extra=["--disable_band_mixing", "--band_sharpness", "0.1"],
+                )
+            )
+            # E4：关闭频域注意力
+            experiments.append(
+                _mk_seismic_exp(
+                    section="e4",
+                    tag="no_freq_attn",
+                    family=fam,
+                    seed=s,
+                    top_k=2,
+                    moe_method="afmoe",
+                    router_type="sar",
+                    notes="E4 disable freq attn",
+                    extra=["--disable_freq_attn"],
+                )
+            )
+            # E4：均匀路由
+            experiments.append(
+                _mk_seismic_exp(
+                    section="e4",
+                    tag="uniform_router",
+                    family=fam,
+                    seed=s,
+                    top_k=2,
+                    moe_method="afmoe",
+                    router_type="sar",
+                    notes="E4 uniform routing",
+                    extra=["--routing_mode", "uniform"],
+                )
+            )
+            # E4：随机路由
+            experiments.append(
+                _mk_seismic_exp(
+                    section="e4",
+                    tag="random_router",
+                    family=fam,
+                    seed=s,
+                    top_k=2,
+                    moe_method="afmoe",
+                    router_type="sar",
+                    notes="E4 random routing",
+                    extra=["--routing_mode", "random"],
+                )
+            )
+            # E5：关闭 band 混合（专家直接对应单 band）
+            experiments.append(
+                _mk_seismic_exp(
+                    section="e5",
+                    tag="no_band_mix",
+                    family=fam,
+                    seed=s,
+                    top_k=2,
+                    moe_method="afmoe",
+                    router_type="sar",
+                    notes="E5 disable band mixing",
+                    extra=["--disable_band_mixing"],
+                )
+            )
+            # E7：软分频对照
+            experiments.append(
+                _mk_seismic_exp(
+                    section="e7",
+                    tag="soft_bands",
+                    family=fam,
+                    seed=s,
+                    top_k=2,
+                    moe_method="afmoe",
+                    router_type="sar",
+                    notes="E7 soft bands control",
+                )
+            )
+            # E9：top-k 扫描（1 与 3）
+            experiments.append(
+                _mk_seismic_exp(
+                    section="e9",
+                    tag="top1",
+                    family=fam,
+                    seed=s,
+                    top_k=1,
+                    moe_method="afmoe",
+                    router_type="sar",
+                    notes="E9 top-k=1",
+                )
+            )
+            experiments.append(
+                _mk_seismic_exp(
+                    section="e9",
+                    tag="top3",
+                    family=fam,
+                    seed=s,
+                    top_k=3,
+                    moe_method="afmoe",
+                    router_type="sar",
+                    notes="E9 top-k=3",
+                )
+            )
+            # E10：band_sharpness 扫描
+            for bs in (10, 40):
+                experiments.append(
+                    _mk_seismic_exp(
+                        section="e10",
+                        tag=f"bs{bs}",
+                        family=fam,
+                        seed=s,
+                        top_k=2,
+                        moe_method="afmoe",
+                        router_type="sar",
+                        notes=f"E10 band_sharpness={bs}",
+                        extra=["--band_sharpness", str(bs)],
+                    )
+                )
+            # E10：freq_affinity_sharpness 扫描
+            for fa in (5, 20):
+                experiments.append(
+                    _mk_seismic_exp(
+                        section="e10",
+                        tag=f"fa{fa}",
+                        family=fam,
+                        seed=s,
+                        top_k=2,
+                        moe_method="afmoe",
+                        router_type="sar",
+                        notes=f"E10 freq_affinity_sharpness={fa}",
+                        extra=["--freq_affinity_sharpness", str(fa)],
+                    )
+                )
+
+    return experiments
 
 
 def parse_args():
@@ -435,6 +415,12 @@ def parse_args():
                         help="Optional seismic Zarr dataset path; if set, overrides --seis-data-root.")
     parser.add_argument("--seis-status-json", type=Path, default=Path("./dataset_status/dataset_status.json"),
                         help="Seismic status JSON for normalization stats.")
+    parser.add_argument("--families", nargs="+", default=None,
+                        help="Limit seismic families (default: all supported).")
+    parser.add_argument("--seeds", nargs="+", type=int, default=None,
+                        help="Seeds for seismic sweeps (default: 0 1 2).")
+    parser.add_argument("--list-experiments", action="store_true",
+                        help="List experiments and exit.")
     parser.add_argument("--only", nargs="+", default=None,
                         help="Run only the named experiments (by name).")
     parser.add_argument("--skip", nargs="+", default=None,
@@ -448,8 +434,12 @@ def parse_args():
     return parser.parse_args()
 
 
-def filter_experiments(only: Iterable[str] | None, skip: Iterable[str] | None) -> List[Experiment]:
-    exp_map = {exp.name: exp for exp in DEFAULT_EXPERIMENTS}
+def filter_experiments(
+    experiments: Sequence[Experiment],
+    only: Iterable[str] | None,
+    skip: Iterable[str] | None,
+) -> List[Experiment]:
+    exp_map = {exp.name: exp for exp in experiments}
 
     if only:
         unknown = [name for name in only if name not in exp_map]
@@ -457,7 +447,7 @@ def filter_experiments(only: Iterable[str] | None, skip: Iterable[str] | None) -
             raise ValueError(f"--only contains unknown experiments: {', '.join(unknown)}")
         selected = [exp_map[name] for name in only]
     else:
-        selected = list(DEFAULT_EXPERIMENTS)
+        selected = list(experiments)
 
     if skip:
         skip_set = set(skip)
@@ -468,6 +458,33 @@ def filter_experiments(only: Iterable[str] | None, skip: Iterable[str] | None) -
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def _slugify(text: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in str(text))
+
+
+def find_latest_run_dir(exp_dir: Path, family: str) -> Path | None:
+    """Locate the latest training run directory for a given family."""
+    run_group = _slugify(family or "all")
+    root = exp_dir / f"seismic_moe_{run_group}"
+    if not root.exists():
+        return None
+    candidates = [p for p in root.iterdir() if p.is_dir()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def find_best_checkpoint(run_dir: Path) -> Path | None:
+    """Prefer best_model*.pt, otherwise last_model*.pt."""
+    best = sorted(run_dir.glob("best_model*.pt"))
+    if best:
+        return best[0]
+    last = sorted(run_dir.glob("last_model*.pt"))
+    if last:
+        return last[0]
+    return None
 
 
 def run_command(cmd: Sequence[str], log_file: Path) -> int:
@@ -493,7 +510,18 @@ def main():
     if args.num_gpus < 1:
         raise ValueError("--num-gpus must be at least 1.")
 
-    experiments = filter_experiments(args.only, args.skip)
+    all_experiments = build_seismic_suite(
+        families=args.families,
+        seeds=args.seeds,
+    )
+
+    if args.list_experiments:
+        print("Available experiments:")
+        for exp in all_experiments:
+            print(f"- {exp.name:35s} | {exp.section:3s} | {exp.family:12s} | top_k={exp.top_k} | router={exp.router_type} | {exp.notes}")
+        return
+
+    experiments = filter_experiments(all_experiments, args.only, args.skip)
     ensure_dir(args.save_root)
 
     summary_path = args.save_root / "summary.json"
@@ -536,10 +564,47 @@ def main():
             return_code = run_command(cmd, log_file)
 
         end_time = datetime.now().isoformat(timespec="seconds")
+        inference_code = None
+
+        # 自动推理：仅针对 seismic 任务且训练成功
+        if return_code == 0 and exp.domain == "seismic":
+            run_dir = find_latest_run_dir(exp_dir, exp.family)
+            if run_dir is None:
+                print(f"[warn] No run directory found for {exp.name}, skip inference.")
+            else:
+                ckpt = find_best_checkpoint(run_dir)
+                if ckpt is None:
+                    print(f"[warn] No checkpoint found in {run_dir}, skip inference.")
+                else:
+                    infer_log = exp_dir / "inference.log"
+                    infer_cmd = [
+                        sys.executable,
+                        str(SEISMIC_TRAIN_SCRIPT),
+                        "--mode", "inference",
+                        "--setting_path", str(run_dir),
+                        "--model_path", str(ckpt),
+                        "--status_json", str(args.seis_status_json),
+                    ]
+                    if args.seis_zarr is not None:
+                        infer_cmd.extend(["--zarr_path", str(os.path.join(args.seis_zarr, exp.family) + ".zarr")])
+                    else:
+                        infer_cmd.extend(["--data_dir", str(args.seis_data_root)])
+                    if exp.seed is not None:
+                        infer_cmd.extend(["--seed", str(exp.seed)])
+                    if args.num_gpus > 1:
+                        infer_cmd.extend(["--distributed"])
+                    print(f"[run][inference] {exp.name}")
+                    print("      cmd:", " ".join(infer_cmd))
+                    if not args.dry_run:
+                        inference_code = run_command(infer_cmd, infer_log)
+                    else:
+                        inference_code = 0
+
         summary.append(
             {
                 "name": exp.name,
                 "return_code": return_code,
+                "inference_return_code": inference_code,
                 "start": start_time,
                 "end": end_time,
                 "notes": exp.notes,

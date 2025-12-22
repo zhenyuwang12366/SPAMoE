@@ -494,7 +494,13 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             experts=experts,
             in_channels=moe_in_channels,
             topk=config.top_k,
-            alpha=0.1,
+            alpha=float(getattr(config, "router_alpha", 0.1)),
+            band_sharpness=float(getattr(config, "band_sharpness", 20.0)),
+            freq_affinity_sharpness=float(getattr(config, "freq_affinity_sharpness", 10.0)),
+            use_soft_bands=bool(getattr(config, "use_soft_bands", True)),
+            enable_freq_attn=bool(getattr(config, "enable_freq_attn", True)),
+            enable_band_mixing=bool(getattr(config, "enable_band_mixing", True)),
+            routing_mode=str(getattr(config, "routing_mode", "learned")),
         )
 
     # ======================

@@ -89,6 +89,7 @@ FREQ_AFFINITY_SHARPNESS=10.0
 DISABLE_SOFT_BANDS=0
 DISABLE_FREQ_ATTN=0
 DISABLE_BAND_MIXING=0
+ROUTING_MODE="learned"          # learned / uniform / random
 NOISY_GATING=""
 IS_SPECIFIC=0                   # flag -> --is_specific
 IS_CLASSIFIER=0                   # flag -> --is_classifier
@@ -212,6 +213,7 @@ while [[ $# -gt 0 ]]; do
     --disable_soft_bands) DISABLE_SOFT_BANDS=1; shift ;;
     --disable_freq_attn) DISABLE_FREQ_ATTN=1; shift ;;
     --disable_band_mixing) DISABLE_BAND_MIXING=1; shift ;;
+    --routing_mode) ROUTING_MODE="$2"; shift 2 ;;
     --fusion_type) FUSION_TYPE="$2"; shift 2 ;;
     --s_processor_type) S_PROCESSOR_TYPE="$2"; shift 2 ;;
     --w_processor_type) W_PROCESSOR_TYPE="$2"; shift 2 ;;
@@ -529,6 +531,7 @@ fi
 [[ -n "$MOE_MODE" ]] && ARGS+=( --moe_mode "$MOE_MODE" )
 [[ -n "$ROUTER_HIDDEN_DIM" ]] && ARGS+=( --router_hidden_dim "$ROUTER_HIDDEN_DIM" )
 [[ -n "$ROUTER_ALPHA" ]] && ARGS+=( --router_alpha "$ROUTER_ALPHA" )
+[[ -n "$ROUTING_MODE" ]] && ARGS+=( --routing_mode "$ROUTING_MODE" )
 if [[ "$NOISY_GATING" == "1" ]]; then
   ARGS+=( --enable_noisy_gating )
 elif [[ "$NOISY_GATING" == "0" ]]; then

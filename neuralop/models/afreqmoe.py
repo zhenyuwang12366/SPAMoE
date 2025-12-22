@@ -78,6 +78,7 @@ class SpectralAttentionRouter(nn.Module):
         use_soft_bands: bool = True,            # 消融：False -> 硬划分频带
         enable_freq_attn: bool = True,          # 消融：False -> 不做频率自注意力
         enable_band_mixing: bool = True,        # 消融：False -> 不做频带混合输入（专家=对应频带）
+        routing_mode: str = "learned",          # "learned" | "uniform" | "random"
     ):
         super().__init__()
         assert 1 <= top_k <= num_heads
@@ -89,6 +90,7 @@ class SpectralAttentionRouter(nn.Module):
         self.use_soft_bands = use_soft_bands
         self.enable_freq_attn = enable_freq_attn
         self.enable_band_mixing = enable_band_mixing
+        self.routing_mode = routing_mode
 
         # 频域 attention：qkv + proj（纯实数卷积，只吃幅度谱）
         self.qkv = nn.Conv2d(C, C * 3, 1)
@@ -192,10 +194,21 @@ class SpectralAttentionRouter(nn.Module):
             F_refined = F_amp
 
         # ===== 3. 全局专家门控（基于频域编码）=====
-        gates = torch.softmax(self.freq_proj(F_refined), dim=-1)  # [B,num_heads]
-        top_k_weights, top_k_indices = torch.topk(
-            gates, k=self.top_k, dim=-1
-        )  # [B,top_k], [B,top_k]
+        if self.routing_mode == "uniform":
+            gates = torch.full((B, self.num_heads), 1.0 / self.num_heads, device=x.device, dtype=F_refined.dtype)
+            top_k_indices = torch.arange(self.num_heads, device=x.device).unsqueeze(0).repeat(B, 1)
+            top_k_indices = top_k_indices[:, : self.top_k]
+            top_k_weights = torch.full((B, self.top_k), 1.0 / self.top_k, device=x.device, dtype=F_refined.dtype)
+        elif self.routing_mode == "random":
+            gates = torch.full((B, self.num_heads), 1.0 / self.num_heads, device=x.device, dtype=F_refined.dtype)
+            rand_idx = torch.rand(B, self.num_heads, device=x.device)
+            top_k_indices = torch.argsort(rand_idx, dim=-1, descending=True)[:, : self.top_k]
+            top_k_weights = torch.full((B, self.top_k), 1.0 / self.top_k, device=x.device, dtype=F_refined.dtype)
+        else:
+            gates = torch.softmax(self.freq_proj(F_refined), dim=-1)  # [B,num_heads]
+            top_k_weights, top_k_indices = torch.topk(
+                gates, k=self.top_k, dim=-1
+            )  # [B,top_k], [B,top_k]
 
         # 归一化 top-k 权重
         top_k_weights = top_k_weights / top_k_weights.sum(
@@ -320,6 +333,7 @@ class AdaptiveFreqMoE(nn.Module):
         use_soft_bands: bool = True,
         enable_freq_attn: bool = True,
         enable_band_mixing: bool = True,
+        routing_mode: str = "learned",
     ):
         super().__init__()
         # 注册为 ModuleList，确保参数被 optimizer 管理
@@ -338,6 +352,7 @@ class AdaptiveFreqMoE(nn.Module):
             use_soft_bands=use_soft_bands,
             enable_freq_attn=enable_freq_attn,
             enable_band_mixing=enable_band_mixing,
+            routing_mode=routing_mode,
         )
 
         # 最近一次 forward 的 routed 缓存（这里是“专家输入特征”）

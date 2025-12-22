@@ -78,6 +78,7 @@ class SeismicMOEConfig(Default):
     use_soft_bands = True
     enable_freq_attn = True
     enable_band_mixing = True
+    routing_mode = "learned"  # learned | uniform | random
     s_processor_type = 'linear'
     w_processor_type = 'linear'
     beta = 0.5

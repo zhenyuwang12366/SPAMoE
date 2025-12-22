@@ -125,6 +125,8 @@ def get_seismic_config(args: argparse.Namespace):
         config.backbone = args.backbone
     if args.use_moe:
         config.use_moe = True
+    if getattr(args, "routing_mode", None) is not None:
+        config.routing_mode = args.routing_mode
     if args.early_stop_patience is not None:
         config.early_stop_patience = args.early_stop_patience
     if args.early_stop_min_delta is not None:

@@ -468,6 +468,11 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
         '--router_hidden_dim', type=int, default=None,
         help='路由器隐藏层宽度（若为 None 使用默认配置）'
     )
+    parser.add_argument(
+        '--routing_mode', type=str, default=None,
+        choices=['learned', 'uniform', 'random'],
+        help='路由模式：learned=正常学习；uniform=均匀分配；random=随机 top-k'
+    )
 
     # 专家组间/组内融合方式
     parser.add_argument(
