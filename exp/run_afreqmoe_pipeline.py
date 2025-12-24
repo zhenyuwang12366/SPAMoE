@@ -63,6 +63,15 @@ class Experiment:
     amp_dtype: str = "bfloat16"
     extra_args: Sequence[str] = ()
 
+
+@dataclass
+class ResumeCandidate:
+    checkpoint: Path
+    run_dir: Path
+    last_epoch: int | None
+    target_epochs: int | None
+    is_complete: bool = False
+
     def build_cmd(
         self,
         *,
@@ -499,6 +508,8 @@ def parse_args():
                         help="Skip the named experiments (by name).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print commands without executing.")
+    parser.add_argument("--inference", action="store_true",
+                        help="Only run inference using existing checkpoints under --save-root.")
     parser.add_argument("--continue-on-failure", action="store_true",
                         help="If set, keep running remaining experiments even if one fails.")
     parser.add_argument("--num-gpus", type=int, default=1,
@@ -559,8 +570,117 @@ def find_best_checkpoint(run_dir: Path) -> Path | None:
     return None
 
 
-def run_command(cmd: Sequence[str], log_file: Path) -> int:
-    with log_file.open("w") as f:
+def find_deepest_best_checkpoint(exp_dir: Path) -> Path | None:
+    """Locate the best_model*.pt with the greatest directory depth under exp_dir."""
+    candidates = list(exp_dir.rglob("best_model*.pt"))
+    if not candidates:
+        return None
+
+    def _depth_key(path: Path) -> tuple[int, float]:
+        rel_parts = path.relative_to(exp_dir).parts
+        # Prefer deeper paths; tie-breaker: most recent mtime.
+        return (len(rel_parts), path.stat().st_mtime)
+
+    return max(candidates, key=_depth_key)
+
+
+def find_deepest_last_checkpoint(exp_dir: Path) -> Path | None:
+    """Locate the last_model*.pt with the greatest directory depth under exp_dir."""
+    candidates = list(exp_dir.rglob("last_model*.pt"))
+    if not candidates:
+        return None
+
+    def _depth_key(path: Path) -> tuple[int, float]:
+        rel_parts = path.relative_to(exp_dir).parts
+        return (len(rel_parts), path.stat().st_mtime)
+
+    return max(candidates, key=_depth_key)
+
+
+def _safe_read_json(path: Path) -> dict | None:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _extract_epochs(payload, *, fallback: int | None = None) -> int | None:
+    if isinstance(payload, dict):
+        for key in ("epochs", "num_epochs", "max_epochs"):
+            if key in payload and payload[key] is not None:
+                try:
+                    return int(payload[key])
+                except Exception:
+                    pass
+        for value in payload.values():
+            if isinstance(value, dict):
+                nested = _extract_epochs(value)
+                if nested is not None:
+                    return nested
+    return fallback
+
+
+def _load_checkpoint_epoch(ckpt: Path) -> int | None:
+    try:
+        import torch  # type: ignore
+    except Exception as e:
+        print(f"[resume] Unable to import torch to inspect {ckpt}: {e}")
+        return None
+    try:
+        payload = torch.load(ckpt, map_location="cpu", weights_only=False)
+    except Exception as e:
+        print(f"[resume] Failed to load checkpoint {ckpt}: {e}")
+        return None
+    if isinstance(payload, dict):
+        epoch_val = payload.get("epoch")
+        if epoch_val is not None:
+            try:
+                return int(epoch_val)
+            except Exception:
+                return None
+    return None
+
+
+def detect_resume_candidate(exp: Experiment, exp_dir: Path) -> ResumeCandidate | None:
+    """Search for the deepest last_model*.pt and report resume info."""
+    checkpoint = find_deepest_last_checkpoint(exp_dir)
+    if checkpoint is None:
+        return None
+
+    run_dir = checkpoint.parent
+
+    target_epochs = exp.epochs
+    for cfg_path in (
+        run_dir / "config.json",
+        run_dir / "pdebench_config.json",
+        run_dir / "args.json",
+    ):
+        payload = _safe_read_json(cfg_path)
+        maybe_epochs = _extract_epochs(payload) if payload else None
+        if maybe_epochs is not None:
+            target_epochs = maybe_epochs
+            break
+
+    last_epoch = _load_checkpoint_epoch(checkpoint)
+    is_complete = False
+    if target_epochs is not None and last_epoch is not None:
+        is_complete = (last_epoch + 1) >= int(target_epochs)
+
+    return ResumeCandidate(
+        checkpoint=checkpoint,
+        run_dir=run_dir,
+        last_epoch=last_epoch,
+        target_epochs=target_epochs,
+        is_complete=is_complete,
+    )
+
+
+def run_command(cmd: Sequence[str], log_file: Path, *, append: bool = False) -> int:
+    mode = "a" if append else "w"
+    with log_file.open(mode) as f:
+        if append:
+            f.write("\n\n")
         proc = subprocess.Popen(
             cmd,
             cwd=REPO_ROOT,
@@ -608,52 +728,32 @@ def main():
     print(f"[info] Save root        : {args.save_root}")
     print(f"[info] Num GPUs         : {args.num_gpus} ({'distributed' if args.num_gpus > 1 else 'single GPU'})")
     print(f"[info] Experiments      : {[exp.name for exp in experiments]}")
-    print(f"[info] Mode             : {'DRY-RUN' if args.dry_run else 'RUN'}")
+    mode_str = "INFERENCE-ONLY" if args.inference else "RUN"
+    print(f"[info] Mode             : {mode_str}{' DRY-RUN' if args.dry_run else ''}")
 
     for exp in experiments:
         exp_dir = args.save_root / exp.name
-        ensure_dir(exp_dir)
-        log_file = exp_dir / "train.log"
-
-        cmd = exp.build_cmd(
-            pde_data_root=args.data_root,
-            pde_status_json=args.status_json,
-            seismic_data_root=args.seis_data_root,
-            seismic_zarr=args.seis_zarr,
-            seismic_status_json=args.seis_status_json,
-            save_dir=exp_dir,
-            num_gpus=args.num_gpus,
-            distributed=args.num_gpus > 1,
-        )
-
-        start_time = datetime.now().isoformat(timespec="seconds")
-        print(f"\n[run] {exp.name}")
-        print("      cmd:", " ".join(cmd))
-
-        if args.dry_run:
-            return_code = 0
-        else:
-            return_code = run_command(cmd, log_file)
-
-        end_time = datetime.now().isoformat(timespec="seconds")
+        return_code = None
         inference_code = None
 
-        # 自动推理：仅针对 seismic 任务且训练成功
-        if return_code == 0 and exp.domain == "seismic":
-            run_dir = find_latest_run_dir(exp_dir, exp.family)
-            if run_dir is None:
-                print(f"[warn] No run directory found for {exp.name}, skip inference.")
+        if args.inference:
+            start_time = datetime.now().isoformat(timespec="seconds")
+            if not exp_dir.exists():
+                print(f"[warn] Exp dir {exp_dir} not found, skip inference for {exp.name}.")
+            elif exp.domain != "seismic":
+                print(f"[info] Skip inference for non-seismic experiment {exp.name}.")
             else:
-                ckpt = find_best_checkpoint(run_dir)
+                ckpt = find_deepest_best_checkpoint(exp_dir)
                 if ckpt is None:
-                    print(f"[warn] No checkpoint found in {run_dir}, skip inference.")
+                    print(f"[warn] No best_model*.pt under {exp_dir}, skip inference.")
                 else:
+                    setting_path = ckpt.parent
                     infer_log = exp_dir / "inference.log"
                     infer_cmd = [
                         sys.executable,
                         str(SEISMIC_TRAIN_SCRIPT),
                         "--mode", "inference",
-                        "--setting_path", str(run_dir),
+                        "--setting_path", str(setting_path),
                         "--model_path", str(ckpt),
                         "--status_json", str(args.seis_status_json),
                     ]
@@ -666,11 +766,108 @@ def main():
                     if args.num_gpus > 1:
                         infer_cmd.extend(["--distributed"])
                     print(f"[run][inference] {exp.name}")
+                    print(f"      setting_path: {setting_path}")
+                    print(f"      model_path  : {ckpt}")
                     print("      cmd:", " ".join(infer_cmd))
                     if not args.dry_run:
                         inference_code = run_command(infer_cmd, infer_log)
                     else:
                         inference_code = 0
+            end_time = datetime.now().isoformat(timespec="seconds")
+            resume_info = None
+        else:
+            ensure_dir(exp_dir)
+            log_file = exp_dir / "train.log"
+            resume_info = detect_resume_candidate(exp, exp_dir)
+            should_resume = bool(resume_info and not resume_info.is_complete)
+
+            cmd = exp.build_cmd(
+                pde_data_root=args.data_root,
+                pde_status_json=args.status_json,
+                seismic_data_root=args.seis_data_root,
+                seismic_zarr=args.seis_zarr,
+                seismic_status_json=args.seis_status_json,
+                save_dir=exp_dir,
+                num_gpus=args.num_gpus,
+                distributed=args.num_gpus > 1,
+            )
+            if should_resume and resume_info is not None:
+                cmd.extend(["--resume_path", str(resume_info.checkpoint)])
+
+            start_time = datetime.now().isoformat(timespec="seconds")
+            print(f"\n[run] {exp.name}")
+            print("      cmd:", " ".join(cmd))
+            if resume_info:
+                last_ep = f"{resume_info.last_epoch + 1}" if resume_info.last_epoch is not None else "?"
+                tgt_ep = resume_info.target_epochs or exp.epochs
+                if resume_info.is_complete:
+                    print(f"      resume: latest run in {resume_info.run_dir} looks complete (epoch {last_ep}/{tgt_ep}), start fresh.")
+                else:
+                    print(f"      resume: {resume_info.checkpoint} (epoch {last_ep}/{tgt_ep})")
+
+            if args.dry_run:
+                return_code = 0
+            else:
+                return_code = run_command(cmd, log_file, append=should_resume)
+
+            end_time = datetime.now().isoformat(timespec="seconds")
+
+            # 自动推理：仅针对 seismic 任务且训练成功，使用最深层 best_model*.pt
+            if return_code == 0 and exp.domain == "seismic":
+                ckpt = find_deepest_best_checkpoint(exp_dir)
+                if ckpt is None:
+                    print(f"[warn] No best_model*.pt under {exp_dir}, skip inference.")
+                else:
+                    setting_path = ckpt.parent
+                    infer_log = exp_dir / "inference.log"
+                    infer_cmd = [
+                        sys.executable,
+                        str(SEISMIC_TRAIN_SCRIPT),
+                        "--mode", "inference",
+                        "--setting_path", str(setting_path),
+                        "--model_path", str(ckpt),
+                        "--status_json", str(args.seis_status_json),
+                    ]
+                    if args.seis_zarr is not None:
+                        infer_cmd.extend(["--zarr_path", str(os.path.join(args.seis_zarr, exp.family) + ".zarr")])
+                    else:
+                        infer_cmd.extend(["--data_dir", str(args.seis_data_root)])
+                    if exp.seed is not None:
+                        infer_cmd.extend(["--seed", str(exp.seed)])
+                    if args.num_gpus > 1:
+                        infer_cmd.extend(["--distributed"])
+                    print(f"[run][inference] {exp.name}")
+                    print(f"      setting_path: {setting_path}")
+                    print(f"      model_path  : {ckpt}")
+                    print("      cmd:", " ".join(infer_cmd))
+                    if not args.dry_run:
+                        inference_code = run_command(infer_cmd, infer_log)
+                    else:
+                        inference_code = 0
+
+            if return_code != 0:
+                print(f"[warn] Experiment {exp.name} failed with code {return_code}. Check {log_file}.")
+                if not args.continue_on_failure:
+                    print("[info] Stopping subsequent runs (sequential mode).")
+                    # Persist summary before breaking
+                    summary.append(
+                        {
+                            "name": exp.name,
+                            "return_code": return_code,
+                            "inference_return_code": inference_code,
+                            "start": start_time,
+                            "end": end_time,
+                            "notes": exp.notes,
+                            "params": asdict(exp),
+                            "resume_from": str(resume_info.checkpoint) if resume_info else None,
+                            "resume_last_epoch": resume_info.last_epoch if resume_info else None,
+                            "resume_target_epochs": resume_info.target_epochs if resume_info else None,
+                            "resume_completed": resume_info.is_complete if resume_info else None,
+                        }
+                    )
+                    with summary_path.open("w") as f:
+                        json.dump(summary, f, indent=2)
+                    break
 
         summary.append(
             {
@@ -681,6 +878,10 @@ def main():
                 "end": end_time,
                 "notes": exp.notes,
                 "params": asdict(exp),
+                "resume_from": str(resume_info.checkpoint) if resume_info else None,
+                "resume_last_epoch": resume_info.last_epoch if resume_info else None,
+                "resume_target_epochs": resume_info.target_epochs if resume_info else None,
+                "resume_completed": resume_info.is_complete if resume_info else None,
             }
         )
 
@@ -688,11 +889,8 @@ def main():
         with summary_path.open("w") as f:
             json.dump(summary, f, indent=2)
 
-        if return_code != 0:
-            print(f"[warn] Experiment {exp.name} failed with code {return_code}. Check {log_file}.")
-            if not args.continue_on_failure:
-                print("[info] Stopping subsequent runs (sequential mode).")
-                break
+        if not args.inference and return_code != 0:
+            break
 
 
 if __name__ == "__main__":
