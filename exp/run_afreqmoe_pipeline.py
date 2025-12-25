@@ -782,6 +782,33 @@ def main():
             resume_info = detect_resume_candidate(exp, exp_dir)
             should_resume = bool(resume_info and not resume_info.is_complete)
 
+            if resume_info and resume_info.is_complete:
+                start_time = datetime.now().isoformat(timespec="seconds")
+                last_ep = f"{resume_info.last_epoch + 1}" if resume_info.last_epoch is not None else "?"
+                tgt_ep = resume_info.target_epochs or exp.epochs
+                print(f"\n[skip] {exp.name}")
+                print(f"      latest run in {resume_info.run_dir} looks complete (epoch {last_ep}/{tgt_ep}), skip training.")
+                end_time = datetime.now().isoformat(timespec="seconds")
+                summary.append(
+                    {
+                        "name": exp.name,
+                        "return_code": 0,
+                        "inference_return_code": None,
+                        "start": start_time,
+                        "end": end_time,
+                        "notes": exp.notes,
+                        "params": asdict(exp),
+                        "resume_from": str(resume_info.checkpoint),
+                        "resume_last_epoch": resume_info.last_epoch,
+                        "resume_target_epochs": resume_info.target_epochs,
+                        "resume_completed": resume_info.is_complete,
+                        "skipped": True,
+                    }
+                )
+                with summary_path.open("w") as f:
+                    json.dump(summary, f, indent=2)
+                continue
+
             cmd = exp.build_cmd(
                 pde_data_root=args.data_root,
                 pde_status_json=args.status_json,
