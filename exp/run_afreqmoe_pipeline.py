@@ -63,15 +63,6 @@ class Experiment:
     amp_dtype: str = "bfloat16"
     extra_args: Sequence[str] = ()
 
-
-@dataclass
-class ResumeCandidate:
-    checkpoint: Path
-    run_dir: Path
-    last_epoch: int | None
-    target_epochs: int | None
-    is_complete: bool = False
-
     def build_cmd(
         self,
         *,
@@ -84,6 +75,7 @@ class ResumeCandidate:
         num_gpus: int,
         distributed: bool,
     ) -> List[str]:
+        """Construct the training command for this experiment."""
         use_distributed = distributed and num_gpus > 1
         if self.domain == "seismic":
             if use_distributed:
@@ -102,7 +94,7 @@ class ResumeCandidate:
                     "--epochs", str(self.epochs),
                     "--batch_size", str(self.batch_size),
                     "--test_batch_size", str(self.test_batch_size),
-                    "--vis_freq", str(1_000_000_000),  # effectively disable training-time visualization
+                    "--vis_freq", str(1_000_000_000),
                     "--backbone", self.backbone,
                     "--output_dir", str(save_dir),
                     "--status_json", str(seismic_status_json),
@@ -121,7 +113,7 @@ class ResumeCandidate:
                     "--epochs", str(self.epochs),
                     "--batch_size", str(self.batch_size),
                     "--test_batch_size", str(self.test_batch_size),
-                    "--vis_freq", str(1_000_000_000),  # effectively disable training-time visualization
+                    "--vis_freq", str(1_000_000_000),
                     "--backbone", self.backbone,
                     "--output_dir", str(save_dir),
                     "--status_json", str(seismic_status_json),
@@ -194,6 +186,15 @@ class ResumeCandidate:
 
         cmd.extend(self.extra_args)
         return cmd
+
+
+@dataclass
+class ResumeCandidate:
+    checkpoint: Path
+    run_dir: Path
+    last_epoch: int | None
+    target_epochs: int | None
+    is_complete: bool = False
 
 DEFAULT_EXPERIMENTS: List[Experiment] = []
 DEFAULT_SEISMIC_FAMILIES: List[str] = [
