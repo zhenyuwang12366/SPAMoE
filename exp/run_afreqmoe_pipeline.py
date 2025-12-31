@@ -765,6 +765,8 @@ def main():
                 else:
                     setting_path = ckpt.parent
                     infer_log = exp_dir / "inference.log"
+                    infer_dir = exp_dir / "inference_results"
+                    ensure_dir(infer_dir)
                     infer_cmd = [
                         sys.executable,
                         str(SEISMIC_TRAIN_SCRIPT),
@@ -772,6 +774,7 @@ def main():
                         "--setting_path", str(setting_path),
                         "--model_path", str(ckpt),
                         "--status_json", str(args.seis_status_json),
+                        "--output_dir", str(infer_dir),
                     ]
                     if args.seis_zarr is not None:
                         infer_cmd.extend(["--zarr_path", str(os.path.join(args.seis_zarr, exp.family) + ".zarr")])
