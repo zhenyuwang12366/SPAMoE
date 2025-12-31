@@ -26,6 +26,7 @@ import argparse
 import json
 import sys
 import subprocess
+import re
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -548,6 +549,18 @@ def _slugify(text: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in str(text))
 
 
+def _parse_timestamp_from_dir(path: Path) -> float | None:
+    """Extract training timestamp suffix like 20240101-120000 to a POSIX float."""
+    match = re.search(r"(\d{8}-\d{6})", path.name)
+    if not match:
+        return None
+    try:
+        dt = datetime.strptime(match.group(1), "%Y%m%d-%H%M%S")
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
 def find_latest_run_dir(exp_dir: Path, family: str) -> Path | None:
     """Locate the latest training run directory for a given family."""
     run_group = _slugify(family or "all")
@@ -577,10 +590,11 @@ def find_deepest_best_checkpoint(exp_dir: Path) -> Path | None:
     if not candidates:
         return None
 
-    def _depth_key(path: Path) -> tuple[int, float]:
+    def _depth_key(path: Path) -> tuple[int, float, float]:
         rel_parts = path.relative_to(exp_dir).parts
-        # Prefer deeper paths; tie-breaker: most recent mtime.
-        return (len(rel_parts), path.stat().st_mtime)
+        ts = _parse_timestamp_from_dir(path.parent)
+        # Prefer deeper paths; tie-breaker: latest timestamp suffix, then mtime.
+        return (len(rel_parts), ts if ts is not None else -1.0, path.stat().st_mtime)
 
     return max(candidates, key=_depth_key)
 
@@ -591,9 +605,10 @@ def find_deepest_last_checkpoint(exp_dir: Path) -> Path | None:
     if not candidates:
         return None
 
-    def _depth_key(path: Path) -> tuple[int, float]:
+    def _depth_key(path: Path) -> tuple[int, float, float]:
         rel_parts = path.relative_to(exp_dir).parts
-        return (len(rel_parts), path.stat().st_mtime)
+        ts = _parse_timestamp_from_dir(path.parent)
+        return (len(rel_parts), ts if ts is not None else -1.0, path.stat().st_mtime)
 
     return max(candidates, key=_depth_key)
 

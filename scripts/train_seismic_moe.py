@@ -1175,11 +1175,15 @@ def run_inference(n_args):
 
     # ===== 归一化统计（优先 --status_json；否则 checkpoint 内的 data_dict）=====
     checkpoint = None
-    if experts_name_str != "all":
-        model_path = Path(getattr(runtime_args, "model_path", ""))
-        if not model_path.exists():
-            raise ValueError(f"[MoE] 常规推理需要提供模型文件 --model_path，未找到: {model_path}")
-        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+    checkpoint_path = None
+    model_path_arg = getattr(runtime_args, "model_path", None)
+    if model_path_arg:
+        checkpoint_path = Path(model_path_arg)
+        if not checkpoint_path.exists():
+            raise ValueError(f"[MoE] 提供的模型文件不存在: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    elif experts_name_str != "all":
+        raise ValueError("[MoE] 常规推理需要提供模型文件 --model_path")
 
     stats_dict = None
     status_json = getattr(runtime_args, "status_json", None)
@@ -1275,11 +1279,17 @@ def run_inference(n_args):
     if len(test_loader) == 0:
         raise RuntimeError("测试数据加载器为空，请检查数据集配置。")
 
+    model_state_dict = checkpoint.get("model_state_dict") if isinstance(checkpoint, dict) else None
+    router_state_dict = checkpoint.get("router_state_dict") if isinstance(checkpoint, dict) else None
+    expert_state_dict = checkpoint.get("expert_state_dict") if isinstance(checkpoint, dict) else None
+    encoder_state_dict = checkpoint.get("encoder_state_dict") if isinstance(checkpoint, dict) else None
+
     # ===== 构建 EMO（Encoder + MOE），与训练完全一致的参数 =====
     # 探测 in_channels
     sample_batch = next(iter(test_loader))
     config.in_channels = int(sample_batch["input"].shape[1])
 
+    encoder_loaded_from_ckpt = False
     # --- Encoder ---
     encoder_model = None
     if getattr(config, "use_encoder", False):
@@ -1297,31 +1307,22 @@ def run_inference(n_args):
             p.requires_grad_(False)
 
         # Encoder 权重优先级：--encoder_path > checkpoint.encoder_state_dict > 随机
-        if experts_name_str == "all":
-            enc_ckpt = getattr(runtime_args, "encoder_path", None)
-            if not enc_ckpt:
-                raise ValueError("[Encoder] experts_name_str='all' 模式下必须提供 --encoder_path")
+        enc_ckpt = getattr(runtime_args, "encoder_path", None)
+        if enc_ckpt:
             missing, unexpected = load_encoder_weights(encoder_model, enc_ckpt, map_location=device, strict=False)
             if is_logger:
-                print(f"[Encoder] (ALL) 已从 {enc_ckpt} 加载推理权重。")
-                if missing:    print(f"[Encoder] 缺失参数: {missing}")
-                if unexpected: print(f"[Encoder] 未使用参数: {unexpected}")
-        else:
-            enc_ckpt = getattr(runtime_args, "encoder_path", None)
-            if enc_ckpt:
-                missing, unexpected = load_encoder_weights(encoder_model, enc_ckpt, map_location=device, strict=False)
-                if is_logger:
-                    print(f"[Encoder] 已从 {enc_ckpt} 加载推理权重。")
-                    if missing:    print(f"[Encoder] 缺失参数: {missing}")
-                    if unexpected: print(f"[Encoder] 未使用参数: {unexpected}")
-            else:
-                encoder_state = checkpoint.get("encoder_state_dict") if isinstance(checkpoint, dict) else None
-                if encoder_state is not None:
-                    missing, unexpected = load_encoder_weights(encoder_model, encoder_state, map_location=device, strict=False)
-                    if is_logger and (missing or unexpected):
-                        print(f"[Encoder] 从 checkpoint 加载编码器: 缺失 {missing}, 多余 {unexpected}")
-                elif is_logger:
-                    print("[Encoder] 未提供 encoder_path，且 checkpoint 中缺少 encoder_state_dict，将使用随机初始化的编码器。")
+                print(f"[Encoder] 已从 {enc_ckpt} 加载推理权重。")
+                if missing:
+                    print(f"[Encoder] 缺失参数: {missing}")
+                if unexpected:
+                    print(f"[Encoder] 未使用参数: {unexpected}")
+        elif encoder_state_dict is not None:
+            missing, unexpected = load_encoder_weights(encoder_model, encoder_state_dict, map_location=device, strict=False)
+            encoder_loaded_from_ckpt = True
+            if is_logger and (missing or unexpected):
+                print(f"[Encoder] 从 checkpoint 加载编码器: 缺失 {missing}, 多余 {unexpected}")
+        elif is_logger:
+            print("[Encoder] 未提供 encoder_path，且 checkpoint 中缺少 encoder_state_dict，将使用随机初始化的编码器。")
 
         # 决定 moe_in_channels（用一次 probe）
         with torch.no_grad():
@@ -1441,37 +1442,50 @@ def run_inference(n_args):
     emo = EMO(encoder_model, moe, pass_encoder_logits_as_weights=True).to(device)
     emo.eval()
 
-    # ===== 权重加载（严格对偶保存逻辑）=====
-    if experts_name_str == "all":
-        # ALL 模式：专家已经从目录加载，这里只需要加载 router 权重
+    # ===== 权重加载（严格对偶保存逻辑，与 run_training.resume 对齐）=====
+    use_deepspeed = bool(getattr(runtime_args, "use_deepspeed", False))
+    target_model = emo
+    target_moe = getattr(target_model, "moe", None)
+
+    if (not use_deepspeed) and (experts_name_str == "all"):
+        # ALL 模式：专家已经从目录加载，这里只需要加载 router；优先明确路径，其次 checkpoint 内 router_state_dict
         router_path = getattr(runtime_args, "router_path", None)
-        if not router_path:
-            raise ValueError("[Router] experts_name_str='all' 模式下必须提供 --router_path")
-        _load_router_weights(emo.moe, router_path, map_location=device, is_logger=is_logger)
+        if router_path:
+            _load_router_weights(target_moe, router_path, map_location=device, is_logger=is_logger)
+        elif router_state_dict is not None and (target_moe is not None) and hasattr(target_moe, "router") and (target_moe.router is not None):
+            missing, unexpected = target_moe.router.load_state_dict(router_state_dict, strict=False)
+            if is_logger and (missing or unexpected):
+                print(f"[Inference][all][router] 缺失参数: {missing}, 多余参数: {unexpected}")
+        else:
+            raise ValueError("[Router] experts_name_str='all' 需要提供 --router_path 或 checkpoint.router_state_dict")
+
+        # Encoder：若未指定外部 encoder_path，则从 checkpoint 恢复
+        if hasattr(target_model, "encoder") and (encoder_state_dict is not None) and not getattr(runtime_args, "encoder_path", None) and not encoder_loaded_from_ckpt:
+            missing, unexpected = load_encoder_weights(target_model.encoder, encoder_state_dict, map_location=device, strict=False)
+            if is_logger and (missing or unexpected):
+                print(f"[Inference][all][encoder] 缺失参数: {missing}, 多余参数: {unexpected}")
+            encoder_loaded_from_ckpt = True
+        elif encoder_state_dict is not None and getattr(runtime_args, "encoder_path", None) and is_logger:
+            print("[Inference][all][encoder] 检测到 --encoder_path，跳过从 checkpoint 恢复 encoder")
     else:
         if not isinstance(checkpoint, dict):
             raise ValueError("checkpoint 不是字典，无法解析 state_dict。")
 
-        # 解析 checkpoint 中的各个部分
-        model_check   = checkpoint.get("model_state_dict", None)
-        router_check  = checkpoint.get("router_state_dict", None)
-        expert_check  = checkpoint.get("expert_state_dict", None)
-
         # 1) 优先尝试整模恢复（model_state_dict）
-        if model_check is not None:
-            missing, unexpected = emo.moe.load_state_dict(model_check, strict=False)
+        if model_state_dict is not None:
+            missing, unexpected = target_model.load_state_dict(model_state_dict, strict=False)
             if is_logger and (missing or unexpected):
-                print(f"[MoE][generic][model] 缺失参数: {missing}, 多余参数: {unexpected}")
+                print(f"[Inference][generic][model] 缺失参数: {missing}, 多余参数: {unexpected}")
             elif is_logger:
-                print(f"[MoE][generic][model] 已从 checkpoint 加载 model_state_dict")
-        elif router_check is not None:
+                print("[Inference][generic][model] 已从 checkpoint 加载 model_state_dict")
+        elif router_state_dict is not None:
             # 2) 如果没有整模，只能加载 router_state_dict
-            if hasattr(emo.moe, "router") and emo.moe.router is not None:
-                missing, unexpected = emo.moe.router.load_state_dict(router_check, strict=False)
+            if (target_moe is not None) and hasattr(target_moe, "router") and (target_moe.router is not None):
+                missing, unexpected = target_moe.router.load_state_dict(router_state_dict, strict=False)
                 if is_logger and (missing or unexpected):
-                    print(f"[MoE][generic][router-only] 缺失参数: {missing}, 多余参数: {unexpected}")
+                    print(f"[Inference][generic][router-only] 缺失参数: {missing}, 多余参数: {unexpected}")
                 elif is_logger:
-                    print(f"[MoE][generic][router-only] 已从 checkpoint 加载 router_state_dict")
+                    print("[Inference][generic][router-only] 已从 checkpoint 加载 router_state_dict")
             else:
                 raise ValueError("[MoE][generic] checkpoint 仅包含 router_state_dict，但模型中不存在 moe.router")
         else:
@@ -1480,26 +1494,47 @@ def run_inference(n_args):
         # 3) 单专家模式：若 ckpt 带 expert_state_dict，可进一步覆盖 experts[0]
         if experts_name is not None and isinstance(experts_name, (list, tuple)) \
                 and len(experts_name) == 1 and experts_name[0] != "all":
-            if expert_check is not None and hasattr(emo.moe, "experts") and len(emo.moe.experts) > 0:
-                missing, unexpected = emo.moe.experts[0].load_state_dict(expert_check, strict=False)
+            resume_expert_path = getattr(runtime_args, "resume_expert_path", None)
+            if resume_expert_path and os.path.exists(resume_expert_path):
+                try:
+                    expert_blob = torch.load(resume_expert_path, map_location="cpu", weights_only=False)
+                    expert_sd = expert_blob.get("expert_state_dict", None)
+                    if expert_sd is not None and (target_moe is not None) and hasattr(target_moe, "experts") and len(target_moe.experts) > 0:
+                        missing, unexpected = target_moe.experts[0].load_state_dict(expert_sd, strict=False)
+                        if is_logger and (missing or unexpected):
+                            print(f"[Inference][single-expert][experts[0]] 缺失参数: {missing}, 多余参数: {unexpected}")
+                        if is_logger:
+                            print(f"[Inference][single-expert] 已从 {resume_expert_path} 覆盖 experts[0]")
+                    elif is_logger:
+                        print(f"[Inference][single-expert] {resume_expert_path} 未含 expert_state_dict 或模型无 experts[0]")
+                except Exception as e:
+                    if is_logger:
+                        print(f"[Inference][single-expert] 载入 resume_expert_path 失败：{e}")
+            elif expert_state_dict is not None and (target_moe is not None) and hasattr(target_moe, "experts") and len(target_moe.experts) > 0:
+                missing, unexpected = target_moe.experts[0].load_state_dict(expert_state_dict, strict=False)
                 if is_logger and (missing or unexpected):
-                    print(f"[MoE][single-expert][experts[0]] 缺失参数: {missing}, 多余参数: {unexpected}")
-                elif is_logger:
-                    print(f"[MoE][single-expert] 已从 checkpoint 覆盖 experts[0]")
-            elif expert_check is not None and is_logger:
-                print("[MoE][single-expert] checkpoint 带 expert_state_dict 但模型无 experts[0]，跳过")
+                    print(f"[Inference][single-expert][experts[0]] 缺失参数: {missing}, 多余参数: {unexpected}")
 
-        # 4) 如果 checkpoint 同时有 model_state_dict 和 router_state_dict，可以选择性再覆盖一次 router
-        if router_check is not None and hasattr(emo.moe, "router") and emo.moe.router is not None:
+        # 4) Encoder：如果 checkpoint 有且未指定外部 encoder_path，则进行恢复
+        if hasattr(target_model, "encoder") and (encoder_state_dict is not None) and not getattr(runtime_args, "encoder_path", None) and not encoder_loaded_from_ckpt:
+            missing, unexpected = load_encoder_weights(target_model.encoder, encoder_state_dict, map_location=device, strict=False)
+            if is_logger and (missing or unexpected):
+                print(f"[Inference][generic][encoder] 缺失参数: {missing}, 多余参数: {unexpected}")
+            encoder_loaded_from_ckpt = True
+        elif encoder_state_dict is not None and getattr(runtime_args, "encoder_path", None) and is_logger:
+            print("[Inference][generic][encoder] 检测到 --encoder_path，跳过从 checkpoint 恢复 encoder")
+
+        # 5) 如果 checkpoint 同时有 model_state_dict 和 router_state_dict，可以选择性再覆盖一次 router
+        if router_state_dict is not None and (target_moe is not None) and hasattr(target_moe, "router") and (target_moe.router is not None):
             try:
-                missing, unexpected = emo.moe.router.load_state_dict(router_check, strict=False)
+                missing, unexpected = target_moe.router.load_state_dict(router_state_dict, strict=False)
                 if is_logger and (missing or unexpected):
-                    print(f"[MoE][generic][router] 额外覆盖 router：缺失参数: {missing}, 多余参数: {unexpected}")
+                    print(f"[Inference][generic][router] 额外覆盖 router：缺失参数: {missing}, 多余参数: {unexpected}")
                 elif is_logger:
-                    print(f"[MoE][generic][router] 已从 checkpoint 覆盖 router_state_dict")
+                    print("[Inference][generic][router] 已从 checkpoint 覆盖 router_state_dict")
             except Exception as e:
                 if is_logger:
-                    print(f"[MoE][generic][router] 覆盖 router_state_dict 失败：{e}")
+                    print(f"[Inference][generic][router] 覆盖 router_state_dict 失败：{e}")
 
     # ===== 推理循环（AMP bf16，与训练相同的 dtype 策略）=====
     amp_enabled = bool(getattr(config, "use_amp", False)) and device.type == "cuda"
