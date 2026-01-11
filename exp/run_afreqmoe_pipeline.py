@@ -490,7 +490,7 @@ def build_seismic_suite(
                     moe_method="basic",
                     router_type="basic",
                     notes="E11 only FNO expert",
-                    extra=["--choose_experts", "0", "--disable_encoder"],
+                    extra=["--choose_experts", "0", "--disable_encoder", "--is_resize", "--H_size", "70", "--W_size", "70"],
                 )
             )
 
