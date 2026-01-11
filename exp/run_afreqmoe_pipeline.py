@@ -480,6 +480,19 @@ def build_seismic_suite(
                         extra=["--freq_affinity_sharpness", str(fa)],
                     )
                 )
+            experiments.append(
+                _mk_seismic_exp(
+                    section="e11",
+                    tag="only_fno",
+                    family=fam,
+                    seed=s,
+                    top_k=1,
+                    moe_method="basic",
+                    router_type="basic",
+                    notes="E11 only FNO expert",
+                    extra=["--choose_experts", "0", "--disable_encoder"],
+                )
+            )
 
     return experiments
 
