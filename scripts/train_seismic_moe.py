@@ -500,6 +500,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             use_soft_bands=bool(getattr(config, "use_soft_bands", True)),
             enable_freq_attn=bool(getattr(config, "enable_freq_attn", True)),
             enable_band_mixing=bool(getattr(config, "enable_band_mixing", True)),
+            enable_band_decomposition=bool(getattr(config, "enable_band_decomposition", True)),
             routing_mode=str(getattr(config, "routing_mode", "learned")),
         )
 
@@ -1389,7 +1390,8 @@ def run_inference(n_args):
         use_soft_bands = bool(getattr(config, "use_soft_bands", True))
         enable_freq_attn = bool(getattr(config, "enable_freq_attn", True))
         enable_band_mixing = bool(getattr(config, "enable_band_mixing", True))
-
+        enable_band_decomposition = bool(getattr(config, "enable_band_decomposition", False))
+        
         if is_logger:
             print(
                 "[MoE] 使用 AdaptiveFreqMoE (afmoe)，"
@@ -1397,7 +1399,8 @@ def run_inference(n_args):
                 f"freq_affinity_sharpness={freq_affinity_sharpness}, "
                 f"use_soft_bands={use_soft_bands}, "
                 f"enable_freq_attn={enable_freq_attn}, "
-                f"enable_band_mixing={enable_band_mixing}"
+                f"enable_band_mixing={enable_band_mixing}, "
+                f"enable_band_decomposition={enable_band_decomposition}"
             )
 
         moe = AdaptiveFreqMoE(
@@ -1410,6 +1413,7 @@ def run_inference(n_args):
             use_soft_bands=use_soft_bands,
             enable_freq_attn=enable_freq_attn,
             enable_band_mixing=enable_band_mixing,
+            enable_band_decomposition=enable_band_decomposition
         ).to(device)
     else:
         if is_logger:

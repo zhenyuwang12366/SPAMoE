@@ -353,7 +353,7 @@ def build_seismic_suite(
                     moe_method="afmoe",
                     router_type="sar",
                     notes="E3 no frequency split",
-                    extra=["--disable_band_mixing", "--band_sharpness", "0.1"],
+                    extra=["--disable_band_decomposition", "--band_sharpness", "0.1"],
                 )
             )
             # E4：关闭频域注意力

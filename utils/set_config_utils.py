@@ -269,6 +269,8 @@ def get_seismic_config(args: argparse.Namespace):
         config.enable_freq_attn = not args.disable_freq_attn
     if hasattr(args, "disable_band_mixing"):
         config.enable_band_mixing = not args.disable_band_mixing
+    if hasattr(args, "disable_band_decomposition"):
+        config.enable_band_decomposition = not args.disable_band_decomposition
     if hasattr(args, "noisy_gating") and args.noisy_gating is not None:
         config.noisy_gating = args.noisy_gating
     if hasattr(args, "enable_freq_metrics"):

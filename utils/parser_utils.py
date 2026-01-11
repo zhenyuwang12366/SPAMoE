@@ -453,6 +453,10 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
         help='专家频率偏好与频带中心匹配的锐度（控制频带混合）'
     )
     parser.add_argument(
+        "--disable_band_decomposition", action='store_true',
+        help='消融：关闭频带分解，直接将输入送入专家'
+    )
+    parser.add_argument(
         '--disable_soft_bands', action='store_true',
         help='消融：关闭软频带划分，改为硬划分'
     )

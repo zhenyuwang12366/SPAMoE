@@ -78,6 +78,7 @@ class SpectralAttentionRouter(nn.Module):
         use_soft_bands: bool = True,            # 消融：False -> 硬划分频带
         enable_freq_attn: bool = True,          # 消融：False -> 不做频率自注意力
         enable_band_mixing: bool = True,        # 消融：False -> 不做频带混合输入（专家=对应频带）
+        enable_band_decomposition: bool = True,  # 消融：是否频带分解
         routing_mode: str = "learned",          # "learned" | "uniform" | "random"
     ):
         super().__init__()
@@ -91,7 +92,8 @@ class SpectralAttentionRouter(nn.Module):
         self.enable_freq_attn = enable_freq_attn
         self.enable_band_mixing = enable_band_mixing
         self.routing_mode = routing_mode
-
+        self.enable_band_decomposition = enable_band_decomposition
+        
         # 频域 attention：qkv + proj（纯实数卷积，只吃幅度谱）
         self.qkv = nn.Conv2d(C, C * 3, 1)
         self.proj = nn.Conv2d(C, C, 1)
@@ -237,6 +239,11 @@ class SpectralAttentionRouter(nn.Module):
         else:
             aux_loss = None
         
+        if self.enable_band_decomposition is False:
+            # 消融：不做频带分解，直接返回输入给专家
+            routed = [x for _ in range(self.num_heads)]
+            return routed, top_k_weights, top_k_indices, aux_loss
+        
         # ===== 5. 在“已 shift 的频谱”上做真正的同心圆分频 =====
         r = make_radius_grid(H, W).to(x.device)                 # 以中心为圆心, r∈[0,1]
         if self.use_soft_bands:
@@ -333,6 +340,7 @@ class AdaptiveFreqMoE(nn.Module):
         use_soft_bands: bool = True,
         enable_freq_attn: bool = True,
         enable_band_mixing: bool = True,
+        enable_band_decomposition: bool = True,
         routing_mode: str = "learned",
     ):
         super().__init__()
@@ -352,6 +360,7 @@ class AdaptiveFreqMoE(nn.Module):
             use_soft_bands=use_soft_bands,
             enable_freq_attn=enable_freq_attn,
             enable_band_mixing=enable_band_mixing,
+            enable_band_decomposition=enable_band_decomposition,
             routing_mode=routing_mode,
         )
 
