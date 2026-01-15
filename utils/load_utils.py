@@ -90,6 +90,8 @@ def load_encoder_weights(
     map_location: Union[str, torch.device] = "cpu",
     strict: bool = False,
     strip_prefixes: Iterable[str] = ("module.",),
+    drop_prefixes: Iterable[str] = ("type_head.",),   # <- 新增：要跳过的 head 前缀
+    drop_if_contains: Iterable[str] = (),              # <- 可选：按关键字丢弃
 ) -> Tuple[List[str], List[str]]:
     """
     将 encoder checkpoint 加载到给定模型中。
@@ -106,6 +108,21 @@ def load_encoder_weights(
         loaded = checkpoint
 
     state_dict = _extract_encoder_state_dict(loaded, strip_prefixes=strip_prefixes)
+
+    # --------- 1) 显式丢弃 head / 指定前缀 ----------
+    if drop_prefixes or drop_if_contains:
+        filtered = {}
+        dropped = []
+        for k, v in state_dict.items():
+            if any(k.startswith(p) for p in drop_prefixes) or any(s in k for s in drop_if_contains):
+                dropped.append(k)
+                continue
+            filtered[k] = v
+        state_dict = filtered
+        if dropped:
+            print(f"[load_encoder_weights] dropped keys ({len(dropped)}): {dropped[:20]}"
+                  + (" ..." if len(dropped) > 20 else ""))
+
     missing, unexpected = encoder.load_state_dict(state_dict, strict=strict)
     return list(missing), list(unexpected)
 

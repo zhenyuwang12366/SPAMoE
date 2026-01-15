@@ -297,6 +297,10 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
         '--model_path', type=str, default=None,
         help='推理模式下使用的模型 checkpoint 路径'
     )
+    parser.add_argument(
+        '--infer_one', type=int, default=None,
+        help='推理模式下仅对单一样本进行推理（指定样本索引，基于 eval_split 数据集）'
+    )
 
     # ------------------------------------------------------------------
     #  G. 编码器 & 主干网络

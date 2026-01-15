@@ -1245,9 +1245,19 @@ def run_inference(n_args):
         to_float32=True,
     )
     test_dataset_with_transform = TransformedSubset(test_dataset, data_processor)
+    infer_one = getattr(runtime_args, "infer_one", None)
+    if infer_one is not None:
+        infer_one = int(infer_one)
+        dataset_len = len(test_dataset_with_transform)
+        if infer_one < 0 or infer_one >= dataset_len:
+            raise ValueError(f"--infer_one 索引超出范围: {infer_one} (有效范围: 0~{dataset_len - 1})")
+        test_dataset_with_transform = Subset(test_dataset_with_transform, [infer_one])
+        if is_logger:
+            print(f"[Inference] infer_one={infer_one}，仅对单一样本推理。")
 
     # 分布式/单机（与训练一致）
-    if getattr(runtime_args, "distributed", False) and world_size > 1:
+    effective_test_batch_size = 1 if infer_one is not None else int(config.test_batch_size)
+    if getattr(runtime_args, "distributed", False) and world_size > 1 and infer_one is None:
         test_sampler = DistributedSampler(
             test_dataset_with_transform,
             num_replicas=world_size,
@@ -1259,7 +1269,7 @@ def run_inference(n_args):
         test_loader = DataLoader(
             test_dataset_with_transform,
             sampler=test_sampler,
-            batch_size=int(config.test_batch_size),
+            batch_size=effective_test_batch_size,
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
@@ -1270,7 +1280,7 @@ def run_inference(n_args):
         num_workers = max(0, getattr(runtime_args, "num_workers", 0))
         test_loader = DataLoader(
             test_dataset_with_transform,
-            batch_size=int(config.test_batch_size),
+            batch_size=effective_test_batch_size,
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
