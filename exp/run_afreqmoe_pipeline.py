@@ -529,6 +529,8 @@ def parse_args():
                         help="If set, keep running remaining experiments even if one fails.")
     parser.add_argument("--num-gpus", type=int, default=1,
                         help="GPU count. >1 will trigger distributed shell scripts.")
+    parser.add_argument("--infer-one", type=int, default=None,
+                        help="If set, only run inference on the specified experiment index (0-based) among the selected experiments.")
     return parser.parse_args()
 
 
@@ -797,6 +799,8 @@ def main():
                         infer_cmd.extend(["--seed", str(exp.seed)])
                     if args.num_gpus > 1:
                         infer_cmd.extend(["--distributed"])
+                    if args.infer_one is not None:
+                        infer_cmd.extend(["--infer_one", str(args.infer_one)])
                     print(f"[run][inference] {exp.name}")
                     print(f"      setting_path: {setting_path}")
                     print(f"      model_path  : {ckpt}")
