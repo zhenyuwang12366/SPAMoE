@@ -1116,23 +1116,23 @@ def run_inference(n_args):
       1) 载入训练期 args/config，并用 CLI 覆盖
       2) 构建数据管线（Zarr + 归一化）
       3) 构建 Encoder + MOE -> EMO（参数与训练完全一致）
-      4) 权重加载：
-         - 'all'：仅加载 router（以及必须提供 encoder_path）；专家从目录 load
-         - 其他：从 checkpoint 加载 MoE（model_state_dict 或 router_state_dict），Encoder 优先 encoder_path
-      5) AMP(bf16) 推理、指标统计、可视化/类型预测保存/频域分析 + afmoe 路由可视化
+      4) 权重加载
+      5) AMP(bf16) 推理 + 全 batch 指标统计
+      6) [新增] encoder vs bilinear-interpolation 的频谱假设检验（A1-A3 代理量）
+      7) 可视化 + 路由可视化（保持你原逻辑）
     """
-    import tqdm
-    from argparse import Namespace
-    from torchvision.transforms import Compose
+    from utils.calculate import SpectralAccumulator
 
-    # ===== 读取训练期保存的 args/config，并被 CLI 覆盖 =====
+    # =======================
+    # 1) 读取训练期 args/config，并被 CLI 覆盖
+    # =======================
     setting_dir = Path(getattr(n_args, "setting_path", ""))
     if not setting_dir:
         raise ValueError("推理需要 --setting_path（包含训练时保存的 args.json 与 config.json）")
     if not setting_dir.exists():
         raise ValueError(f"--setting_path 不存在: {setting_dir}")
 
-    args_path   = setting_dir / "args.json"
+    args_path = setting_dir / "args.json"
     config_path = setting_dir / "config.json"
     if not args_path.exists():
         raise ValueError(f"缺少训练时保存的参数文件: {args_path}")
@@ -1144,7 +1144,6 @@ def run_inference(n_args):
     with open(config_path, "r", encoding="utf-8") as f:
         stored_config_dict = json.load(f)
 
-    # CLI 高优先级覆盖
     runtime_args_dict = dict(stored_args_dict)
     for key, value in vars(n_args).items():
         if value is not None:
@@ -1152,16 +1151,17 @@ def run_inference(n_args):
     runtime_args_dict["mode"] = "inference"
     runtime_args = Namespace(**runtime_args_dict)
 
-    # ===== 初始化 config / 运行环境（与训练一致） =====
+    # =======================
+    # 2) 初始化 config / 运行环境（与训练一致）
+    # =======================
     config, runtime_ctx = get_seismic_config(runtime_args)
-    device       = runtime_ctx["device"]
-    is_logger    = runtime_ctx["is_logger"]
-    world_size   = runtime_ctx["world_size"]
-    local_rank   = runtime_ctx["local_rank"]
+    device = runtime_ctx["device"]
+    is_logger = runtime_ctx["is_logger"]
+    world_size = runtime_ctx["world_size"]
+    local_rank = runtime_ctx["local_rank"]
     experts_name = runtime_ctx["experts_name"]
     experts_name_str = runtime_ctx["experts_name_str"]
 
-    # 回填训练时的 config 字段（保持一致）
     def _recursive_update(obj, payload):
         for k, v in payload.items():
             if isinstance(v, dict) and hasattr(obj, k):
@@ -1172,9 +1172,12 @@ def run_inference(n_args):
                     setattr(obj, k, v)
             else:
                 setattr(obj, k, v)
+
     _recursive_update(config, stored_config_dict)
 
-    # ===== 归一化统计（优先 --status_json；否则 checkpoint 内的 data_dict）=====
+    # =======================
+    # 3) 归一化统计（优先 --status_json；否则 checkpoint 内的 data_dict）
+    # =======================
     checkpoint = None
     checkpoint_path = None
     model_path_arg = getattr(runtime_args, "model_path", None)
@@ -1195,25 +1198,33 @@ def run_inference(n_args):
             stats_dict = status_payload.get("overall")
         else:
             stats_dict = status_payload.get("per_type", {}).get(config.family)
+
     if stats_dict is None and isinstance(checkpoint, dict):
         stats_dict = checkpoint.get("data_dict")
+
     if stats_dict is None:
         hint = "（ALL 模式下通常无整体 checkpoint，请通过 --status_json 提供归一化统计量）" if experts_name_str == "all" else ""
         raise ValueError(f"无法获取归一化统计量，请提供 --status_json 或确保 checkpoint 中包含 data_dict。{hint}")
 
-    # ===== 数据变换 & Zarr DataLoader（与训练相同的对数 + MinMax）=====
+    # =======================
+    # 4) 数据变换 & Zarr DataLoader
+    # =======================
     k_value = float(getattr(runtime_args, "k", 1.0))
     input_transform = Compose([
         T.LogTransform(k=k_value),
-        T.MinMaxNormalize(T.log_transform(stats_dict["input_min"], k=k_value),
-                          T.log_transform(stats_dict["input_max"], k=k_value)),
+        T.MinMaxNormalize(
+            T.log_transform(stats_dict["input_min"], k=k_value),
+            T.log_transform(stats_dict["input_max"], k=k_value),
+        ),
     ])
     output_transform = Compose([
         T.MinMaxNormalize(stats_dict["output_min"], stats_dict["output_max"])
     ])
     input_inverse_transform = Compose([
-        T.InverseMinMaxNormalize(T.log_transform(stats_dict["input_min"], k=k_value),
-                                 T.log_transform(stats_dict["input_max"], k=k_value)),
+        T.InverseMinMaxNormalize(
+            T.log_transform(stats_dict["input_min"], k=k_value),
+            T.log_transform(stats_dict["input_max"], k=k_value),
+        ),
         T.InverseLogTransform(k=k_value),
     ])
     output_inverse_transform = Compose([
@@ -1245,6 +1256,7 @@ def run_inference(n_args):
         to_float32=True,
     )
     test_dataset_with_transform = TransformedSubset(test_dataset, data_processor)
+
     infer_one = getattr(runtime_args, "infer_one", None)
     if infer_one is not None:
         infer_one = int(infer_one)
@@ -1255,7 +1267,6 @@ def run_inference(n_args):
         if is_logger:
             print(f"[Inference] infer_one={infer_one}，仅对单一样本推理。")
 
-    # 分布式/单机（与训练一致）
     effective_test_batch_size = 1 if infer_one is not None else int(config.test_batch_size)
     if getattr(runtime_args, "distributed", False) and world_size > 1 and infer_one is None:
         test_sampler = DistributedSampler(
@@ -1295,17 +1306,17 @@ def run_inference(n_args):
     expert_state_dict = checkpoint.get("expert_state_dict") if isinstance(checkpoint, dict) else None
     encoder_state_dict = checkpoint.get("encoder_state_dict") if isinstance(checkpoint, dict) else None
 
-    # ===== 构建 EMO（Encoder + MOE），与训练完全一致的参数 =====
-    # 探测 in_channels
+    # =======================
+    # 5) 构建 EMO（Encoder + MOE）
+    # =======================
     sample_batch = next(iter(test_loader))
     config.in_channels = int(sample_batch["input"].shape[1])
 
     encoder_loaded_from_ckpt = False
-    # --- Encoder ---
     encoder_model = None
     if getattr(config, "use_encoder", False):
         num_types = int(getattr(config, "v_type_num", 10) or 10)
-        type_act  = "identity" if getattr(config, "train_encoder", False) else "softmax"
+        type_act = "identity" if getattr(config, "train_encoder", False) else "softmax"
         encoder_model = get_encoder(
             in_channels=config.in_channels,
             out_channels=128,
@@ -1317,7 +1328,6 @@ def run_inference(n_args):
         for p in encoder_model.parameters():
             p.requires_grad_(False)
 
-        # Encoder 权重优先级：--encoder_path > checkpoint.encoder_state_dict > 随机
         enc_ckpt = getattr(runtime_args, "encoder_path", None)
         if enc_ckpt:
             missing, unexpected = load_encoder_weights(encoder_model, enc_ckpt, map_location=device, strict=False)
@@ -1335,7 +1345,6 @@ def run_inference(n_args):
         elif is_logger:
             print("[Encoder] 未提供 encoder_path，且 checkpoint 中缺少 encoder_state_dict，将使用随机初始化的编码器。")
 
-        # 决定 moe_in_channels（用一次 probe）
         with torch.no_grad():
             probe_inputs = sample_batch["input"].to(device, non_blocking=True)
             encoder_probe, _, _ = encoder_model(probe_inputs)
@@ -1345,7 +1354,7 @@ def run_inference(n_args):
         config.moe_in_channels = config.in_channels
         if is_logger:
             print("[Encoder] use_encoder=False，推理阶段直接使用原始输入。")
-    
+
     # --- Experts ---
     if experts_name_str == "all":
         experts_dir = getattr(config, "use_experts_path", None) or getattr(runtime_args, "experts_path", None)
@@ -1390,27 +1399,22 @@ def run_inference(n_args):
 
     # --- MoE ---
     moe_method = getattr(config, "moe_method", "basic")
-
-    # === 新增/修改: AFMOE 分支 ===
     if moe_method == "afmoe":
-        # router 正则强度 / 频带尖锐度，从 config 中取，不存在则给默认值
-        router_alpha    = float(getattr(config, "router_alpha", 0.0))
-        band_sharpness  = float(getattr(config, "band_sharpness", 20.0))
+        router_alpha = float(getattr(config, "router_alpha", 0.0))
+        band_sharpness = float(getattr(config, "band_sharpness", 20.0))
         freq_affinity_sharpness = float(getattr(config, "freq_affinity_sharpness", 10.0))
         use_soft_bands = bool(getattr(config, "use_soft_bands", True))
         enable_freq_attn = bool(getattr(config, "enable_freq_attn", True))
         enable_band_mixing = bool(getattr(config, "enable_band_mixing", True))
         enable_band_decomposition = bool(getattr(config, "enable_band_decomposition", False))
-        
+
         if is_logger:
             print(
                 "[MoE] 使用 AdaptiveFreqMoE (afmoe)，"
                 f"alpha={router_alpha}, band_sharpness={band_sharpness}, "
                 f"freq_affinity_sharpness={freq_affinity_sharpness}, "
-                f"use_soft_bands={use_soft_bands}, "
-                f"enable_freq_attn={enable_freq_attn}, "
-                f"enable_band_mixing={enable_band_mixing}, "
-                f"enable_band_decomposition={enable_band_decomposition}"
+                f"use_soft_bands={use_soft_bands}, enable_freq_attn={enable_freq_attn}, "
+                f"enable_band_mixing={enable_band_mixing}, enable_band_decomposition={enable_band_decomposition}"
             )
 
         moe = AdaptiveFreqMoE(
@@ -1423,7 +1427,7 @@ def run_inference(n_args):
             use_soft_bands=use_soft_bands,
             enable_freq_attn=enable_freq_attn,
             enable_band_mixing=enable_band_mixing,
-            enable_band_decomposition=enable_band_decomposition
+            enable_band_decomposition=enable_band_decomposition,
         ).to(device)
     else:
         if is_logger:
@@ -1447,22 +1451,22 @@ def run_inference(n_args):
             is_classifier=config.is_classifier,
             batch_size=config.batch_size,
             v_type_num=config.v_type_num,
-            use_expert_memory_proxy=config.use_gpu_proxy,   # 与训练一致
+            use_expert_memory_proxy=config.use_gpu_proxy,
             use_encoder=getattr(config, "use_encoder", False),
-            device=device,                                  # 与训练保持同构
+            device=device,
         )
 
-    # --- EMO 封装 ---
     emo = EMO(encoder_model, moe, pass_encoder_logits_as_weights=True).to(device)
     emo.eval()
 
-    # ===== 权重加载（严格对偶保存逻辑，与 run_training.resume 对齐）=====
+    # =======================
+    # 6) 权重加载（与训练对偶）
+    # =======================
     use_deepspeed = bool(getattr(runtime_args, "use_deepspeed", False))
     target_model = emo
     target_moe = getattr(target_model, "moe", None)
 
     if (not use_deepspeed) and (experts_name_str == "all"):
-        # ALL 模式：专家已经从目录加载，这里只需要加载 router；优先明确路径，其次 checkpoint 内 router_state_dict
         router_path = getattr(runtime_args, "router_path", None)
         if router_path:
             _load_router_weights(target_moe, router_path, map_location=device, is_logger=is_logger)
@@ -1473,7 +1477,6 @@ def run_inference(n_args):
         else:
             raise ValueError("[Router] experts_name_str='all' 需要提供 --router_path 或 checkpoint.router_state_dict")
 
-        # Encoder：若未指定外部 encoder_path，则从 checkpoint 恢复
         if hasattr(target_model, "encoder") and (encoder_state_dict is not None) and not getattr(runtime_args, "encoder_path", None) and not encoder_loaded_from_ckpt:
             missing, unexpected = load_encoder_weights(target_model.encoder, encoder_state_dict, map_location=device, strict=False)
             if is_logger and (missing or unexpected):
@@ -1485,7 +1488,6 @@ def run_inference(n_args):
         if not isinstance(checkpoint, dict):
             raise ValueError("checkpoint 不是字典，无法解析 state_dict。")
 
-        # 1) 优先尝试整模恢复（model_state_dict）
         if model_state_dict is not None:
             missing, unexpected = target_model.load_state_dict(model_state_dict, strict=False)
             if is_logger and (missing or unexpected):
@@ -1493,7 +1495,6 @@ def run_inference(n_args):
             elif is_logger:
                 print("[Inference][generic][model] 已从 checkpoint 加载 model_state_dict")
         elif router_state_dict is not None:
-            # 2) 如果没有整模，只能加载 router_state_dict
             if (target_moe is not None) and hasattr(target_moe, "router") and (target_moe.router is not None):
                 missing, unexpected = target_moe.router.load_state_dict(router_state_dict, strict=False)
                 if is_logger and (missing or unexpected):
@@ -1505,9 +1506,7 @@ def run_inference(n_args):
         else:
             raise ValueError("checkpoint 中既无 model_state_dict 也无 router_state_dict，无法恢复 MoE。")
 
-        # 3) 单专家模式：若 ckpt 带 expert_state_dict，可进一步覆盖 experts[0]
-        if experts_name is not None and isinstance(experts_name, (list, tuple)) \
-                and len(experts_name) == 1 and experts_name[0] != "all":
+        if experts_name is not None and isinstance(experts_name, (list, tuple)) and len(experts_name) == 1 and experts_name[0] != "all":
             resume_expert_path = getattr(runtime_args, "resume_expert_path", None)
             if resume_expert_path and os.path.exists(resume_expert_path):
                 try:
@@ -1519,8 +1518,6 @@ def run_inference(n_args):
                             print(f"[Inference][single-expert][experts[0]] 缺失参数: {missing}, 多余参数: {unexpected}")
                         if is_logger:
                             print(f"[Inference][single-expert] 已从 {resume_expert_path} 覆盖 experts[0]")
-                    elif is_logger:
-                        print(f"[Inference][single-expert] {resume_expert_path} 未含 expert_state_dict 或模型无 experts[0]")
                 except Exception as e:
                     if is_logger:
                         print(f"[Inference][single-expert] 载入 resume_expert_path 失败：{e}")
@@ -1529,7 +1526,6 @@ def run_inference(n_args):
                 if is_logger and (missing or unexpected):
                     print(f"[Inference][single-expert][experts[0]] 缺失参数: {missing}, 多余参数: {unexpected}")
 
-        # 4) Encoder：如果 checkpoint 有且未指定外部 encoder_path，则进行恢复
         if hasattr(target_model, "encoder") and (encoder_state_dict is not None) and not getattr(runtime_args, "encoder_path", None) and not encoder_loaded_from_ckpt:
             missing, unexpected = load_encoder_weights(target_model.encoder, encoder_state_dict, map_location=device, strict=False)
             if is_logger and (missing or unexpected):
@@ -1538,19 +1534,18 @@ def run_inference(n_args):
         elif encoder_state_dict is not None and getattr(runtime_args, "encoder_path", None) and is_logger:
             print("[Inference][generic][encoder] 检测到 --encoder_path，跳过从 checkpoint 恢复 encoder")
 
-        # 5) 如果 checkpoint 同时有 model_state_dict 和 router_state_dict，可以选择性再覆盖一次 router
         if router_state_dict is not None and (target_moe is not None) and hasattr(target_moe, "router") and (target_moe.router is not None):
             try:
                 missing, unexpected = target_moe.router.load_state_dict(router_state_dict, strict=False)
                 if is_logger and (missing or unexpected):
                     print(f"[Inference][generic][router] 额外覆盖 router：缺失参数: {missing}, 多余参数: {unexpected}")
-                elif is_logger:
-                    print("[Inference][generic][router] 已从 checkpoint 覆盖 router_state_dict")
             except Exception as e:
                 if is_logger:
                     print(f"[Inference][generic][router] 覆盖 router_state_dict 失败：{e}")
 
-    # ===== 推理循环（AMP bf16，与训练相同的 dtype 策略）=====
+    # =======================
+    # 7) 推理循环 + 全 batch 指标统计 + 频谱假设检验
+    # =======================
     amp_enabled = bool(getattr(config, "use_amp", False)) and device.type == "cuda"
 
     default_root = getattr(config, "experiment_dir", None) or getattr(config, "output_dir", None) or setting_dir
@@ -1570,14 +1565,32 @@ def run_inference(n_args):
     visual_payload = None
     band_accum = {}
 
+    # ====== 新增：两个累积器（Encoder vs Interpolation）======
+    spec_enc = SpectralAccumulator(name="encoder")
+    spec_int = SpectralAccumulator(name="bilinear_interp")
+
+    # 可选：频带定义从 config/args 读取（没有就用默认）
+    # 例如：config.low_band=(0.05,0.3), config.high_band=(0.4,0.85)
+    if hasattr(config, "low_band") and hasattr(config, "high_band"):
+        try:
+            spec_enc.low_band = tuple(config.low_band)
+            spec_enc.high_band = tuple(config.high_band)
+            spec_int.low_band = tuple(config.low_band)
+            spec_int.high_band = tuple(config.high_band)
+        except Exception:
+            pass
+
     with torch.no_grad():
+        global_sample_id = 0
+
         for batch in tqdm.tqdm(test_loader, desc=f"推理中({eval_split})", disable=not is_logger):
-            inputs  = batch["input"].to(device, non_blocking=True)
+            inputs = batch["input"].to(device, non_blocking=True)  # [B,1,1000,350]
             targets = batch.get("output")
             if targets is None:
                 continue
-            targets = targets.to(device, non_blocking=True).to(dtype=torch.float32)
+            targets = targets.to(device, non_blocking=True).to(dtype=torch.float32)  # [B,1,70,70]
 
+            # --- 前向 ---
             if amp_enabled:
                 with torch.amp.autocast(device_type=device.type, enabled=True, dtype=torch.bfloat16):
                     preds, aux, enc_weights = emo(inputs)
@@ -1586,9 +1599,9 @@ def run_inference(n_args):
 
             preds = preds.to(dtype=torch.float32)
 
-            # 指标累计（与训练的 metrics 模块一致）
-            mse_sum  += metrics_module.calculate_mse(preds, targets)
-            mae_sum  += metrics_module.calculate_mae(preds, targets)
+            # --- 空间域指标累计 ---
+            mse_sum += metrics_module.calculate_mse(preds, targets)
+            mae_sum += metrics_module.calculate_mae(preds, targets)
             psnr_sum += metrics_module.calculate_psnr(preds, targets)
             rmse_sum += metrics_module.calculate_rmse(preds, targets)
             ssim_sum += metrics_module.calculate_ssim(preds, targets)
@@ -1607,29 +1620,59 @@ def run_inference(n_args):
                     acc["tgt_energy_ratio"] += vals["tgt_energy_ratio"]
                     acc["count"] += 1
 
-            # 仅采样一次可视化样本
-            if visual_payload is None and is_logger:
-                inputs_cpu  = inputs.detach().cpu()
-                targets_cpu = targets.detach().cpu()
-                preds_cpu   = preds.detach().cpu()
-                if input_inverse_transform is not None:
-                    inputs_cpu = input_inverse_transform(inputs_cpu)
-                if output_inverse_transform is not None:
-                    preds_cpu   = output_inverse_transform(preds_cpu)
-                    targets_cpu = output_inverse_transform(targets_cpu)
-                logits_cpu = enc_weights.detach().cpu() if enc_weights is not None else None
+            # --- 反归一化到物理域（用于频谱统计）---
+            inputs_cpu = inputs.detach().cpu()
+            preds_cpu = preds.detach().cpu()
+            targets_cpu = targets.detach().cpu()
 
-                # 若启用 encoder，额外导出中间编码特征
-                if encoder_model is not None:
-                    if amp_enabled:
-                        with torch.amp.autocast(device_type=device.type, enabled=True, dtype=torch.bfloat16):
-                            encoded, _, _ = encoder_model(inputs)
-                    else:
-                        encoded, _, _ = encoder_model(inputs)
-                    encoded_cpu = encoded.detach().cpu()
+            if input_inverse_transform is not None:
+                inputs_cpu = input_inverse_transform(inputs_cpu)
+            if output_inverse_transform is not None:
+                preds_cpu = output_inverse_transform(preds_cpu)
+                targets_cpu = output_inverse_transform(targets_cpu)
+
+            # --- encoder 的 u_c：R(z)=mean over channel（线性读出）---
+            encoded_cpu = None
+            if encoder_model is not None:
+                if amp_enabled:
+                    with torch.amp.autocast(device_type=device.type, enabled=True, dtype=torch.bfloat16):
+                        z, _, _ = encoder_model(inputs)
                 else:
-                    encoded_cpu = None
+                    z, _, _ = encoder_model(inputs)
+                encoded_cpu = z.detach().cpu()  # [B,C,H,W]
 
+            # --- 插值 u_int：bilinear resize 到 (H,W) ---
+            H, W = preds_cpu.shape[-2], preds_cpu.shape[-1]
+            u_int = F.interpolate(
+                inputs_cpu.to(dtype=torch.float32),
+                size=(H, W),
+                mode="bilinear",
+                align_corners=False,
+            )  # [B,1,H,W]
+
+            # --- 逐样本累积（全 batch）---
+            B = preds_cpu.shape[0]
+            for b in range(B):
+                y_hat = preds_cpu[b, 0].numpy()
+                y_gt = targets_cpu[b, 0].numpy()
+
+                # interpolation always exists
+                u_int_b = u_int[b, 0].numpy()
+                spec_int.add_sample(u_front=u_int_b, y_pred=y_hat, y_gt=y_gt, sample_id=global_sample_id)
+
+                # encoder only if available
+                if encoded_cpu is not None:
+                    u_enc_b = encoded_cpu[b].mean(0).numpy()  # [H,W]
+                    spec_enc.add_sample(u_front=u_enc_b, y_pred=y_hat, y_gt=y_gt, sample_id=global_sample_id)
+                else:
+                    # 没有 encoder 时不记录 encoder 组
+                    pass
+
+                global_sample_id += 1
+
+            # --- 仅采样一次可视化样本（保持你原逻辑）---
+            if visual_payload is None and is_logger:
+                logits_cpu = enc_weights.detach().cpu() if enc_weights is not None else None
                 visual_payload = {
                     "inputs": inputs_cpu,
                     "targets": targets_cpu,
@@ -1642,8 +1685,8 @@ def run_inference(n_args):
     if batch_count == 0:
         raise RuntimeError("测试数据集中没有可评估的样本。")
 
-    mse  = mse_sum  / batch_count
-    mae  = mae_sum  / batch_count
+    mse = mse_sum / batch_count
+    mae = mae_sum / batch_count
     psnr = psnr_sum / batch_count
     rmse = rmse_sum / batch_count
     ssim = ssim_sum / batch_count
@@ -1654,6 +1697,61 @@ def run_inference(n_args):
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"  Inference |        -        |        -        | {mae:.6f} | {mse:.6f} | {psnr:.4f} | {rmse:.6f} | {ssim:.6f} |\n")
 
+    # =======================
+    # 8) DDP 聚合：all_gather_object（把不同 rank 的 records 合并）
+    # =======================
+    def _dist_ready():
+        return (dist is not None) and dist.is_available() and dist.is_initialized()
+
+    def _gather_records(records):
+        if not _dist_ready():
+            return records
+        gathered = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(gathered, records)
+        merged = []
+        for g in gathered:
+            if g:
+                merged.extend(g)
+        return merged
+
+    spec_int.records = _gather_records(spec_int.records)
+    if encoder_model is not None:
+        spec_enc.records = _gather_records(spec_enc.records)
+
+    # =======================
+    # 9) 导出频谱假设检验结果（rank0 保存即可；你这里 is_logger 通常就是 rank0）
+    # =======================
+    if is_logger:
+        out_payload = {
+            "interpolation": spec_int.summary(),
+        }
+        if encoder_model is not None:
+            out_payload["encoder"] = spec_enc.summary()
+
+        out_json = results_dir / "spectral_assumption_check.json"
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(out_payload, f, indent=2, ensure_ascii=False)
+
+        print(f"[AssumptionCheck] 已保存: {out_json}")
+
+        # 可选：在 log 里也落一份简要摘要，方便你写 Appendix 的“实验检验”段落
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("\n[AssumptionCheck]\n")
+            for key in out_payload:
+                f.write(f"  [{key}]\n")
+                summ = out_payload[key]
+                f.write(f"    count={summ.get('count')}\n")
+                for k in ["a1_ratio_h", "a2_ratio_l", "gain_H_pred_over_u", "gain_L_pred_over_u", "spec_corr_u_gt", "spec_corr_pred_gt"]:
+                    if k in summ:
+                        vv = summ[k]
+                        f.write(f"    {k}: mean={vv.get('mean')}, p05={vv.get('p05')}, p50={vv.get('p50')}, p95={vv.get('p95')}\n")
+                if "A3_empirical_bounds" in summ:
+                    bnd = summ["A3_empirical_bounds"]
+                    f.write(f"    A3_empirical_bounds: {bnd}\n")
+
+    # =======================
+    # 10) 你原本的 band_metrics summary（保持）
+    # =======================
     band_summary = {}
     if band_accum:
         for name, agg in band_accum.items():
@@ -1667,39 +1765,35 @@ def run_inference(n_args):
             }
         if is_logger:
             pretty = " | ".join(
-                f"{k}: rel_l2={v['rel_l2']:.4f}, mae={v['mae']:.4f}, "
-                f"predE={v['pred_energy_ratio']:.3f}, tgtE={v['tgt_energy_ratio']:.3f}"
+                f"{k}: rel_l2={v['rel_l2']:.4f}, mae={v['mae']:.4f}, predE={v['pred_energy_ratio']:.3f}, tgtE={v['tgt_energy_ratio']:.3f}"
                 for k, v in band_summary.items()
             )
             print(f"[FreqMetrics] {pretty}")
+
         freq_json = results_dir / "freq_band_metrics.json"
         with open(freq_json, "w", encoding="utf-8") as f:
             json.dump(band_summary, f, indent=2, ensure_ascii=False)
+
         with open(log_path, "a", encoding="utf-8") as f:
             f.write("[FreqMetrics]\n")
             for k, v in band_summary.items():
                 f.write(
-                    f"  {k}: rel_l2={v['rel_l2']:.6f}, mae={v['mae']:.6f}, "
-                    f"predE={v['pred_energy_ratio']:.6f}, tgtE={v['tgt_energy_ratio']:.6f}\n"
+                    f"  {k}: rel_l2={v['rel_l2']:.6f}, mae={v['mae']:.6f}, predE={v['pred_energy_ratio']:.6f}, tgtE={v['tgt_energy_ratio']:.6f}\n"
                 )
 
-    # ===== 可视化输出（与训练日志一致）+ AFMOE 路由可视化 =====
+    # =======================
+    # 11) 可视化输出 + 路由可视化（保持你原逻辑）
+    # =======================
     if visual_payload is not None:
-        inputs_vis  = visual_payload["inputs"]
+        inputs_vis = visual_payload["inputs"]
         targets_vis = visual_payload["targets"]
-        preds_vis   = visual_payload["preds"]
-        logits_vis  = visual_payload["logits"]
+        preds_vis = visual_payload["preds"]
+        logits_vis = visual_payload["logits"]
         encoded_vis = visual_payload["encoded"]
-        vis_batch   = visual_payload["batch"]
+        vis_batch = visual_payload["batch"]
         num_samples = min(4, inputs_vis.shape[0])
 
-        visualize_results(
-            inputs_vis,
-            targets_vis,
-            preds_vis,
-            save_dir=img_path,
-            max_samples=num_samples,
-        )
+        visualize_results(inputs_vis, targets_vis, preds_vis, save_dir=img_path, max_samples=num_samples)
 
         save_type_predictions_txt(
             logits=logits_vis,
@@ -1712,22 +1806,10 @@ def run_inference(n_args):
             is_logger=is_logger,
         )
 
-        analyze_fourier_domain(
-            inputs_vis,
-            targets_vis,
-            preds_vis,
-            save_dir=img_path,
-            max_samples=num_samples,
-        )
+        analyze_fourier_domain(inputs_vis, targets_vis, preds_vis, save_dir=img_path, max_samples=num_samples)
 
-        visualize_encoded(
-            encoded_vis,
-            save_dir=img_path,
-            max_samples=num_samples,
-            selection='l2',
-        )
+        visualize_encoded(encoded_vis, save_dir=img_path, max_samples=num_samples, selection="l2")
 
-        # === 新增: AFMOE 路由统计 & routed_bands 可视化 ===
         if isinstance(emo.moe, AdaptiveFreqMoE):
             router_vis_dir = img_path / "router"
             router_vis_dir.mkdir(parents=True, exist_ok=True)
@@ -1752,7 +1834,7 @@ def run_inference(n_args):
             try:
                 routed_bands = emo.moe.get_last_routed_bands()
                 if routed_bands is not None:
-                    band_centers = router_stats.get("band_centers", None) if 'router_stats' in locals() else None
+                    band_centers = router_stats.get("band_centers", None) if "router_stats" in locals() else None
                     visualize_routed_bands(
                         routed_bands,
                         save_dir=router_vis_dir,
