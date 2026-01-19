@@ -1641,7 +1641,7 @@ def run_inference(n_args):
                     z, _, _ = encoder_model(inputs)
                 encoded_cpu = z.detach().cpu()  # [B,C,H,W]
 
-            if input_inverse_transform is not None:
+            if encoded_cpu is not None and input_inverse_transform is not None:
                 encoded_cpu = input_inverse_transform(encoded_cpu)
             
             # --- 插值 u_int：bilinear resize 到 (H,W) ---
