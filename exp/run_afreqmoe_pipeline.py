@@ -53,7 +53,7 @@ class Experiment:
     hidden_channels: int = 128
     batch_size: int = 32
     test_batch_size: int = 32
-    epochs: int = 200
+    epochs: int = 160
     lr: float = 1e-4
     weight_decay: float = 0.0
     aux_loss_weight: float = 0.1
@@ -232,7 +232,7 @@ def _mk_seismic_exp(
         hidden_channels=128,
         batch_size=32,
         test_batch_size=32,
-        epochs=150,
+        epochs=160,
         lr=1e-4,
         weight_decay=1e-4,
         aux_loss_weight=0.1,
