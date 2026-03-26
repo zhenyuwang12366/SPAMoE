@@ -1010,102 +1010,125 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     best_epoch_metrics = None
     best_epoch_index = 0
 
-    # ======================
-    # 核心训练循环
-    # ======================
+    success_flag = results_dir / "TRAIN_DONE"
+    failed_flag = results_dir / "TRAIN_FAILED"
+
+    # 可选：启动前先删除旧标志，避免误判
+    if is_logger:
+        if success_flag.exists():
+            success_flag.unlink()
+        if failed_flag.exists():
+            failed_flag.unlink()
+
     try:
-        for epoch in range(start_epoch, config.epochs):
-            vis_now = (is_logger and ((epoch + 1) % args.vis_freq == 0))
+        # ======================
+        # 核心训练循环
+        # ======================
+        try:
+            for epoch in range(start_epoch, config.epochs):
+                vis_now = (is_logger and ((epoch + 1) % args.vis_freq == 0))
 
-            stats, best_val_loss, stop_flag = train_one_epoch(
-                model=model,
-                optimizer=optimizer,
-                criterion=criterion,
-                train_loader=train_loader,
-                val_loader=val_loader,
-                device=device,
-                epoch=epoch,
-                config=config,
-                is_logger=is_logger,
-                log_file=log_file,
-                results_dir=results_dir,
-                lr_scheduler=lr_scheduler,
-                scheduler_step_mode=("per_step" if config.use_onecycle else "per_epoch"),
-                accum_steps=config.accum_steps,
-                vis_now=vis_now,
-                input_inverse_transform=input_inverse_transform,
-                output_inverse_transform=output_inverse_transform,
-                use_wandb=args.use_wandb,
-                wandb_module=wandb if args.use_wandb else None,
-                early_stopper=early_stopper if config.early_stop else None,
-                best_val_loss=best_val_loss,
-                best_model_path=best_model_path,
-                best_expert_path=best_expert_path,
-                best_encoder_path=best_encoder_path,
-                best_router_path=best_router_path,
-                last_model_path=last_model_path,
-                last_expert_path=last_expert_path,
-                last_encoder_path=last_encoder_path,
-                last_router_path=last_router_path,
-                experts_name=experts_name,
-                experts_name_str=experts_name_str,
-                data_dict=data_dict,
-                metrics_module=metrics,
-                tqdm_module=tqdm,
-                profile_timing=args.profile_timing,
-                amp_enabled=amp_enabled,
-                encoder_frozen=not any(p.requires_grad for p in encoder_model.parameters()) if encoder_model else True,
-                train_encoder=config.train_encoder,
-                tb_writer=tb_writer,
-                # ==== 关键：把 DeepSpeed 引擎传入 ====
-                engine=(model if use_deepspeed else None),
-                use_deepspeed=use_deepspeed,
-            )
+                stats, best_val_loss, stop_flag = train_one_epoch(
+                    model=model,
+                    optimizer=optimizer,
+                    criterion=criterion,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    device=device,
+                    epoch=epoch,
+                    config=config,
+                    is_logger=is_logger,
+                    log_file=log_file,
+                    results_dir=results_dir,
+                    lr_scheduler=lr_scheduler,
+                    scheduler_step_mode=("per_step" if config.use_onecycle else "per_epoch"),
+                    accum_steps=config.accum_steps,
+                    vis_now=vis_now,
+                    input_inverse_transform=input_inverse_transform,
+                    output_inverse_transform=output_inverse_transform,
+                    use_wandb=args.use_wandb,
+                    wandb_module=wandb if args.use_wandb else None,
+                    early_stopper=early_stopper if config.early_stop else None,
+                    best_val_loss=best_val_loss,
+                    best_model_path=best_model_path,
+                    best_expert_path=best_expert_path,
+                    best_encoder_path=best_encoder_path,
+                    best_router_path=best_router_path,
+                    last_model_path=last_model_path,
+                    last_expert_path=last_expert_path,
+                    last_encoder_path=last_encoder_path,
+                    last_router_path=last_router_path,
+                    experts_name=experts_name,
+                    experts_name_str=experts_name_str,
+                    data_dict=data_dict,
+                    metrics_module=metrics,
+                    tqdm_module=tqdm,
+                    profile_timing=args.profile_timing,
+                    amp_enabled=amp_enabled,
+                    encoder_frozen=not any(p.requires_grad for p in encoder_model.parameters()) if encoder_model else True,
+                    train_encoder=config.train_encoder,
+                    tb_writer=tb_writer,
+                    engine=(model if use_deepspeed else None),
+                    use_deepspeed=use_deepspeed,
+                )
 
-            if (
-                tb_writer is not None
-                and is_logger
-                and math.isfinite(stats.get("val_loss", float("inf")))
-                and math.isclose(stats.get("val_loss", float("inf")), best_val_loss, rel_tol=0.0, abs_tol=1e-8)
-            ):
-                best_epoch_metrics = dict(stats)
-                best_epoch_metrics["epoch"] = epoch + 1
-                best_epoch_index = epoch + 1
+                if (
+                    tb_writer is not None
+                    and is_logger
+                    and math.isfinite(stats.get("val_loss", float("inf")))
+                    and math.isclose(stats.get("val_loss", float("inf")), best_val_loss, rel_tol=0.0, abs_tol=1e-8)
+                ):
+                    best_epoch_metrics = dict(stats)
+                    best_epoch_metrics["epoch"] = epoch + 1
+                    best_epoch_index = epoch + 1
 
-            if stop_flag == 1:
-                break
+                if stop_flag == 1:
+                    break
 
+            if is_logger:
+                print(f"VAL_LOSS:{best_val_loss}", flush=True)
+                plot_loss_curve(log_file, save_path=results_dir / "loss_curve.png")
+
+            if tb_writer is not None and is_logger:
+                hparam_summary = {
+                    "family": str(config.family),
+                    "router_type": str(config.router_type),
+                    "learning_rate": float(config.learning_rate),
+                    "batch_size": int(config.batch_size),
+                    "top_k": int(getattr(config, "top_k", 1)),
+                }
+                metric_summary = {
+                    "best/val_loss": float(best_val_loss),
+                }
+                if best_epoch_metrics is not None:
+                    metric_summary.update({
+                        "best/train_loss": float(best_epoch_metrics.get("train_loss", float("nan"))),
+                        "best/psnr": float(best_epoch_metrics.get("psnr", float("nan"))),
+                        "best/mse": float(best_epoch_metrics.get("mse", float("nan"))),
+                        "best/mae": float(best_epoch_metrics.get("mae", float("nan"))),
+                        "best/rmse": float(best_epoch_metrics.get("rmse", float("nan"))),
+                        "best/ssim": float(best_epoch_metrics.get("ssim", float("nan"))),
+                        "best/epoch": float(best_epoch_index or 0),
+                    })
+                tb_writer.add_hparams(hparam_summary, metric_summary)
+                print("已写入hparams")
+
+        finally:
+            if tb_writer is not None:
+                tb_writer.flush()
+                tb_writer.close()
+
+        # ===== 正常执行到这里，说明训练主体和 finally 清理都完成了 =====
         if is_logger:
-            print(f"VAL_LOSS:{best_val_loss}", flush=True)
-            plot_loss_curve(log_file, save_path=results_dir / "loss_curve.png")
+            success_flag.write_text("ok\n", encoding="utf-8")
+            print(f"[done] success flag written to: {success_flag}", flush=True)
 
-        if tb_writer is not None and is_logger:
-            hparam_summary = {
-                "family": str(config.family),
-                "router_type": str(config.router_type),
-                "learning_rate": float(config.learning_rate),
-                "batch_size": int(config.batch_size),
-                "top_k": int(getattr(config, "top_k", 1)),
-            }
-            metric_summary = {
-                "best/val_loss": float(best_val_loss),
-            }
-            if best_epoch_metrics is not None:
-                metric_summary.update({
-                    "best/train_loss": float(best_epoch_metrics.get("train_loss", float("nan"))),
-                    "best/psnr": float(best_epoch_metrics.get("psnr", float("nan"))),
-                    "best/mse": float(best_epoch_metrics.get("mse", float("nan"))),
-                    "best/mae": float(best_epoch_metrics.get("mae", float("nan"))),
-                    "best/rmse": float(best_epoch_metrics.get("rmse", float("nan"))),
-                    "best/ssim": float(best_epoch_metrics.get("ssim", float("nan"))),
-                    "best/epoch": float(best_epoch_index or 0),
-                })
-            tb_writer.add_hparams(hparam_summary, metric_summary)
-            print("已写入hparams")
-    finally:
-        if tb_writer is not None:
-            tb_writer.flush()
-            tb_writer.close()
+    except Exception as e:
+        # ===== 只有主进程写失败标志，避免多卡重复写 =====
+        if is_logger:
+            failed_flag.write_text(f"{type(e).__name__}: {e}\n", encoding="utf-8")
+            print(f"[failed] failure flag written to: {failed_flag}", flush=True)
+        raise
 
     return model, best_val_loss
 

@@ -13,12 +13,8 @@ Features:
   - Writes each run into its own output directory under --save-root.
   - Logs stdout/stderr to file and keeps a summary.json for quick review.
   - Dry-run mode to preview commands.
-
-Usage examples:
-  python exp/run_afreqmoe_pipeline.py --dry-run
-  python exp/run_afreqmoe_pipeline.py --only navier_sar_top2 pipe_basic_top2
-  python exp/run_afreqmoe_pipeline.py --data-root ./pdebench_data --save-root ./results/pde_exp
 """
+
 from __future__ import annotations
 
 import os
@@ -27,6 +23,8 @@ import json
 import sys
 import subprocess
 import re
+import time       # ===== 修改 1：用于轮询监控 TRAIN_DONE =====
+import signal     # ===== 修改 2：用于结束整个进程组，避免 Slurm 下卡住 =====
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -47,9 +45,9 @@ class Experiment:
     task: str = ""                 # PDE task name
     family: str = "vel"            # Seismic family (vel/fault/style/all/curve_vel_a...)
     moe_method: str = "afmoe"      # seismic: afmoe/basic; pde ignores
-    router_type: str = "sar"      # "sar" -> AdaptiveFreqMoE, "basic" -> baseline router
+    router_type: str = "sar"       # "sar" -> AdaptiveFreqMoE, "basic" -> baseline router
     top_k: int = 2
-    backbone: str = "vit"         # "vit" | "convnext_tiny"
+    backbone: str = "vit"          # "vit" | "convnext_tiny"
     hidden_channels: int = 128
     batch_size: int = 32
     test_batch_size: int = 32
@@ -57,7 +55,7 @@ class Experiment:
     lr: float = 1e-4
     weight_decay: float = 0.0
     aux_loss_weight: float = 0.1
-    section: str = "misc"         # 实验大类标签（e1/e3/abl 等）
+    section: str = "misc"          # 实验大类标签（e1/e3/abl 等）
     seed: int | None = None
     notes: str = ""
     use_amp: bool = True
@@ -78,6 +76,7 @@ class Experiment:
     ) -> List[str]:
         """Construct the training command for this experiment."""
         use_distributed = distributed and num_gpus > 1
+
         if self.domain == "seismic":
             if use_distributed:
                 script = SEISMIC_DISTRIBUTED_SCRIPT
@@ -104,6 +103,7 @@ class Experiment:
                 script = SEISMIC_TRAIN_SCRIPT
                 cmd = [
                     sys.executable,
+                    "-u",  # ===== 修改 3：Python 无缓冲输出 =====
                     str(script),
                     "--mode", "train",
                     "--family", self.family,
@@ -121,8 +121,9 @@ class Experiment:
                 ]
 
             if seismic_zarr is not None:
-                seismic_zarr = os.path.join(seismic_zarr, self.family) + ".zarr"
-                cmd.extend(["--zarr_path", str(seismic_zarr)])
+                # ===== 修改 4：改为 Path 风格拼接，避免 Path 和 os.path.join 混用 =====
+                zarr_path = seismic_zarr / f"{self.family}.zarr"
+                cmd.extend(["--zarr_path", str(zarr_path)])
             else:
                 cmd.extend(["--data_dir", str(seismic_data_root)])
 
@@ -162,6 +163,7 @@ class Experiment:
             script = PDE_TRAIN_SCRIPT
             cmd = [
                 sys.executable,
+                "-u",  # ===== 修改 5：Python 无缓冲输出 =====
                 str(script),
                 "--task", self.task,
                 "--data_root", str(pde_data_root),
@@ -197,12 +199,19 @@ class ResumeCandidate:
     target_epochs: int | None
     is_complete: bool = False
 
+
 DEFAULT_EXPERIMENTS: List[Experiment] = []
 DEFAULT_SEISMIC_FAMILIES: List[str] = [
-    # 按需求默认只跑这三类；如需更多请用 --families 覆盖
     "flat_vel_a",
     "curve_vel_a",
     "curve_fault_a",
+    "style_style_a",
+    "style_style_b",
+    "curve_vel_b",
+    "curve_fault_b",
+    "flat_vel_b",
+    "flat_fault_a",
+    "flat_fault_b",
 ]
 DEFAULT_SEEDS: List[int] = [0, 1, 2]
 
@@ -219,7 +228,6 @@ def _mk_seismic_exp(
     notes: str = "",
     extra: Sequence[str] = (),
 ) -> Experiment:
-    """Helper to standardize naming & defaults for seismic experiments."""
     name = f"{section}_{tag}_{family}_s{seed}"
     return Experiment(
         name=name,
@@ -249,7 +257,6 @@ def build_freq_specialization_suite(
     families: Sequence[str],
     seeds: Sequence[int],
 ) -> List[Experiment]:
-    """低/中/高频专家对照 + 融合的实验组合。"""
     experiments: List[Experiment] = []
     for fam in families:
         for s in seeds:
@@ -318,17 +325,14 @@ def build_seismic_suite(
     families: Sequence[str] | None = None,
     seeds: Sequence[int] | None = None,
 ) -> List[Experiment]:
-    """构造覆盖消融/超参的 seismic 实验列表（不含 E1 主结果对比）。"""
     fams = list(families) if families else list(DEFAULT_SEISMIC_FAMILIES)
     seed_list = list(seeds) if seeds else list(DEFAULT_SEEDS)
     experiments: List[Experiment] = []
 
-    # 频段对照/互补实验
     experiments.extend(build_freq_specialization_suite(fams, seed_list))
 
     for fam in fams:
         for s in seed_list:
-            # E3：硬分频
             experiments.append(
                 _mk_seismic_exp(
                     section="e3",
@@ -342,7 +346,6 @@ def build_seismic_suite(
                     extra=["--disable_soft_bands"],
                 )
             )
-            # E3：全频（不分频，关闭 band mixing + 极低 band_sharpness）
             experiments.append(
                 _mk_seismic_exp(
                     section="e3",
@@ -356,7 +359,6 @@ def build_seismic_suite(
                     extra=["--disable_band_decomposition", "--band_sharpness", "0.1"],
                 )
             )
-            # E4：关闭频域注意力
             experiments.append(
                 _mk_seismic_exp(
                     section="e4",
@@ -370,7 +372,6 @@ def build_seismic_suite(
                     extra=["--disable_freq_attn"],
                 )
             )
-            # E4：均匀路由
             experiments.append(
                 _mk_seismic_exp(
                     section="e4",
@@ -384,7 +385,6 @@ def build_seismic_suite(
                     extra=["--routing_mode", "uniform"],
                 )
             )
-            # E4：随机路由
             experiments.append(
                 _mk_seismic_exp(
                     section="e4",
@@ -398,7 +398,6 @@ def build_seismic_suite(
                     extra=["--routing_mode", "random"],
                 )
             )
-            # E5：关闭 band 混合（专家直接对应单 band）
             experiments.append(
                 _mk_seismic_exp(
                     section="e5",
@@ -412,7 +411,6 @@ def build_seismic_suite(
                     extra=["--disable_band_mixing"],
                 )
             )
-            # E7：软分频对照
             experiments.append(
                 _mk_seismic_exp(
                     section="e7",
@@ -425,7 +423,6 @@ def build_seismic_suite(
                     notes="E7 soft bands control",
                 )
             )
-            # E9：top-k 扫描（1 与 3）
             experiments.append(
                 _mk_seismic_exp(
                     section="e9",
@@ -450,7 +447,6 @@ def build_seismic_suite(
                     notes="E9 top-k=3",
                 )
             )
-            # E10：band_sharpness 扫描
             for bs in (10, 40):
                 experiments.append(
                     _mk_seismic_exp(
@@ -465,7 +461,6 @@ def build_seismic_suite(
                         extra=["--band_sharpness", str(bs)],
                     )
                 )
-            # E10：freq_affinity_sharpness 扫描
             for fa in (5, 20):
                 experiments.append(
                     _mk_seismic_exp(
@@ -499,38 +494,30 @@ def build_seismic_suite(
 
 def parse_args():
     parser = argparse.ArgumentParser("AFreqMoE experiment pipeline")
-    parser.add_argument("--data-root", type=Path, default=Path("./pdebench_data"),
-                        help="Path to PDEBench-style data root.")
-    parser.add_argument("--save-root", type=Path, default=Path("./exp/runs"),
-                        help="Folder to place all experiment outputs.")
-    parser.add_argument("--status-json", type=Path, default=Path("./pde_status.json"),
-                        help="Status json for data availability; same as train_pde.py expects.")
-    parser.add_argument("--seis-data-root", type=Path, default=Path("./FWINO_data"),
-                        help="Seismic raw/preprocessed data dir (train_seismic_moe.py --data_dir).")
-    parser.add_argument("--seis-zarr", type=Path, default=None,
-                        help="Optional seismic Zarr dataset path; if set, overrides --seis-data-root.")
-    parser.add_argument("--seis-status-json", type=Path, default=Path("./dataset_status/dataset_status.json"),
-                        help="Seismic status JSON for normalization stats.")
-    parser.add_argument("--families", nargs="+", default=None,
-                        help="Limit seismic families (default: all supported).")
-    parser.add_argument("--seeds", nargs="+", type=int, default=None,
-                        help="Seeds for seismic sweeps (default: 0 1 2).")
-    parser.add_argument("--list-experiments", action="store_true",
-                        help="List experiments and exit.")
-    parser.add_argument("--only", nargs="+", default=None,
-                        help="Run only the named experiments (by name).")
-    parser.add_argument("--skip", nargs="+", default=None,
-                        help="Skip the named experiments (by name).")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print commands without executing.")
-    parser.add_argument("--inference", action="store_true",
-                        help="Only run inference using existing checkpoints under --save-root.")
-    parser.add_argument("--continue-on-failure", action="store_true",
-                        help="If set, keep running remaining experiments even if one fails.")
-    parser.add_argument("--num-gpus", type=int, default=1,
-                        help="GPU count. >1 will trigger distributed shell scripts.")
-    parser.add_argument("--infer-one", type=int, default=None,
-                        help="If set, only run inference on the specified experiment index (0-based) among the selected experiments.")
+    parser.add_argument("--data-root", type=Path, default=Path("./pdebench_data"))
+    parser.add_argument("--save-root", type=Path, default=Path("./exp/runs"))
+    parser.add_argument("--status-json", type=Path, default=Path("./pde_status.json"))
+    parser.add_argument("--seis-data-root", type=Path, default=Path("./FWINO_data"))
+    parser.add_argument("--seis-zarr", type=Path, default=None)
+    parser.add_argument("--seis-status-json", type=Path, default=Path("./dataset_status/dataset_status.json"))
+    parser.add_argument("--families", nargs="+", default=None)
+    parser.add_argument("--seeds", nargs="+", type=int, default=None)
+    parser.add_argument("--list-experiments", action="store_true")
+    parser.add_argument("--only", nargs="+", default=None)
+    parser.add_argument("--skip", nargs="+", default=None)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--inference", action="store_true")
+    parser.add_argument("--continue-on-failure", action="store_true")
+    parser.add_argument("--num-gpus", type=int, default=1)
+    parser.add_argument("--infer-one", type=int, default=None)
+
+    # ===== 修改 6：新增手动指定 pt 文件路径 =====
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        default=None,
+        help="Manual checkpoint path for inference, e.g. /path/to/best_model.pt",
+    )
     return parser.parse_args()
 
 
@@ -565,7 +552,6 @@ def _slugify(text: str) -> str:
 
 
 def _parse_timestamp_from_dir(path: Path) -> float | None:
-    """Extract training timestamp suffix like 20240101-120000 to a POSIX float."""
     match = re.search(r"(\d{8}-\d{6})", path.name)
     if not match:
         return None
@@ -577,7 +563,6 @@ def _parse_timestamp_from_dir(path: Path) -> float | None:
 
 
 def find_latest_run_dir(exp_dir: Path, family: str) -> Path | None:
-    """Locate the latest training run directory for a given family."""
     run_group = _slugify(family or "all")
     root = exp_dir / f"seismic_moe_{run_group}"
     if not root.exists():
@@ -589,7 +574,6 @@ def find_latest_run_dir(exp_dir: Path, family: str) -> Path | None:
 
 
 def find_best_checkpoint(run_dir: Path) -> Path | None:
-    """Prefer best_model*.pt, otherwise last_model*.pt."""
     best = sorted(run_dir.glob("best_model*.pt"))
     if best:
         return best[0]
@@ -600,7 +584,6 @@ def find_best_checkpoint(run_dir: Path) -> Path | None:
 
 
 def find_deepest_best_checkpoint(exp_dir: Path) -> Path | None:
-    """Locate the best_model*.pt with the greatest directory depth under exp_dir."""
     candidates = list(exp_dir.rglob("best_model*.pt"))
     if not candidates:
         return None
@@ -608,14 +591,12 @@ def find_deepest_best_checkpoint(exp_dir: Path) -> Path | None:
     def _depth_key(path: Path) -> tuple[int, float, float]:
         rel_parts = path.relative_to(exp_dir).parts
         ts = _parse_timestamp_from_dir(path.parent)
-        # Prefer deeper paths; tie-breaker: latest timestamp suffix, then mtime.
         return (len(rel_parts), ts if ts is not None else -1.0, path.stat().st_mtime)
 
     return max(candidates, key=_depth_key)
 
 
 def find_deepest_last_checkpoint(exp_dir: Path) -> Path | None:
-    """Locate the last_model*.pt with the greatest directory depth under exp_dir."""
     candidates = list(exp_dir.rglob("last_model*.pt"))
     if not candidates:
         return None
@@ -626,6 +607,34 @@ def find_deepest_last_checkpoint(exp_dir: Path) -> Path | None:
         return (len(rel_parts), ts if ts is not None else -1.0, path.stat().st_mtime)
 
     return max(candidates, key=_depth_key)
+
+
+# ===== 修改 7：新增 TRAIN_DONE 检索函数，替代 loss_curve.png 作为完成标志 =====
+def find_train_done(exp_dir: Path) -> Path | None:
+    """
+    在 exp_dir 下递归查找 TRAIN_DONE。
+
+    目录形态示例：
+      exp_dir=/.../exp/runs/freq_mno_curve_fault_a_s0
+      result_dir=/.../freq_mno_curve_fault_a_s0/scale_1/seismic_moe_curve_fault_a/MOE_router-basic_lr..._20260325-080804
+      TRAIN_DONE 位于 result_dir 中
+
+    一个 exp_dir 下可能存在多个 result_dir，因此这里取“更深且更新”的那个。
+    """
+    candidates = list(exp_dir.rglob("TRAIN_DONE"))
+    if not candidates:
+        return None
+
+    def _rank_key(path: Path) -> tuple[int, float, float]:
+        rel_parts = path.relative_to(exp_dir).parts
+        ts = _parse_timestamp_from_dir(path.parent)
+        return (
+            len(rel_parts),                         # 优先更深层
+            ts if ts is not None else -1.0,        # 再优先时间戳目录
+            path.stat().st_mtime,                  # 最后按文件修改时间
+        )
+
+    return max(candidates, key=_rank_key)
 
 
 def _safe_read_json(path: Path) -> dict | None:
@@ -674,7 +683,6 @@ def _load_checkpoint_epoch(ckpt: Path) -> int | None:
 
 
 def detect_resume_candidate(exp: Experiment, exp_dir: Path) -> ResumeCandidate | None:
-    """Search for the deepest last_model*.pt and report resume info."""
     checkpoint = find_deepest_last_checkpoint(exp_dir)
     if checkpoint is None:
         return None
@@ -707,25 +715,111 @@ def detect_resume_candidate(exp: Experiment, exp_dir: Path) -> ResumeCandidate |
     )
 
 
-def run_command(cmd: Sequence[str], log_file: Path, *, append: bool = False) -> int:
+# ===== 修改 8：将 run_command 改为“运行中轮询监控 TRAIN_DONE”的版本 =====
+def run_command(
+    cmd: Sequence[str],
+    log_file: Path,
+    *,
+    append: bool = False,
+    watch_dir: Path | None = None,
+    watch_train_done: bool = False,
+    poll_interval: float = 5.0,
+    graceful_wait_after_done: float = 20.0,
+    kill_wait_timeout: float = 15.0,
+) -> int:
+    """
+    运行子进程。
+
+    若 watch_train_done=True，则递归监控 watch_dir 下是否出现 TRAIN_DONE：
+      1. 一旦出现 TRAIN_DONE，先等待 graceful_wait_after_done 秒，给训练脚本自然退出机会
+      2. 若仍未退出，则对整个进程组发送 SIGTERM
+      3. 若仍未退出，再发送 SIGKILL
+
+    这样可解决：
+      - 训练逻辑已完成
+      - TRAIN_DONE 已写好
+      - 但 bash/torchrun/DDP worker 仍未完全退出，导致外层卡住
+    """
     mode = "a" if append else "w"
-    with log_file.open(mode) as f:
+    with log_file.open(mode, encoding="utf-8") as f:
         if append:
             f.write("\n\n")
+            f.flush()
+
         proc = subprocess.Popen(
             cmd,
             cwd=REPO_ROOT,
-            stdout=subprocess.PIPE,
+            stdout=f,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1,
+            start_new_session=True,   # ===== 修改 9：创建新的进程组，便于 killpg 整组结束 =====
         )
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            sys.stdout.write(line)
-            f.write(line)
-        proc.wait()
-        return int(proc.returncode)
+
+        detected_done: Path | None = None
+        done_detect_time: float | None = None
+
+        while True:
+            # 先看子进程是否自然退出
+            return_code = proc.poll()
+            if return_code is not None:
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+                return int(return_code)
+
+            # 运行中递归监控 TRAIN_DONE
+            if watch_train_done and watch_dir is not None:
+                done_file = find_train_done(watch_dir)
+                if done_file is not None:
+                    if detected_done is None:
+                        detected_done = done_file
+                        done_detect_time = time.time()
+                        print(f"[info] Detected TRAIN_DONE: {detected_done}")
+                        print(f"[info] Waiting up to {graceful_wait_after_done:.1f}s for natural process exit...")
+
+                    assert done_detect_time is not None
+                    if time.time() - done_detect_time >= graceful_wait_after_done:
+                        print("[info] TRAIN_DONE exists but process still alive, terminating process group...")
+                        try:
+                            os.killpg(proc.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+
+                        deadline = time.time() + kill_wait_timeout
+                        while time.time() < deadline:
+                            return_code = proc.poll()
+                            if return_code is not None:
+                                f.flush()
+                                try:
+                                    os.fsync(f.fileno())
+                                except OSError:
+                                    pass
+                                # ===== 修改 10：有 TRAIN_DONE 时，即使是外层强制收尾，也按成功处理 =====
+                                return 0
+                            time.sleep(1.0)
+
+                        print("[warn] Process group still alive after SIGTERM, sending SIGKILL...")
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
+                        try:
+                            proc.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            pass
+
+                        f.flush()
+                        try:
+                            os.fsync(f.fileno())
+                        except OSError:
+                            pass
+
+                        return 0
+
+            time.sleep(poll_interval)
 
 
 def main():
@@ -769,51 +863,90 @@ def main():
 
         if args.inference:
             start_time = datetime.now().isoformat(timespec="seconds")
-            if not exp_dir.exists():
-                print(f"[warn] Exp dir {exp_dir} not found, skip inference for {exp.name}.")
-            elif exp.domain != "seismic":
-                print(f"[info] Skip inference for non-seismic experiment {exp.name}.")
+
+            if args.model_path is None:
+                raise ValueError("When using --inference, you must provide --model-path /path/to/model.pt")
+
+            ckpt = args.model_path
+            if not ckpt.exists():
+                raise FileNotFoundError(f"--model-path not found: {ckpt}")
+
+            setting_path = ckpt.parent
+            infer_log = exp_dir / "inference.log"
+            infer_dir = exp_dir / "inference_results"
+            ensure_dir(exp_dir)
+            ensure_dir(infer_dir)
+
+            infer_cmd = [
+                sys.executable,
+                "-u",  # ===== 修改 11：推理阶段也使用无缓冲输出 =====
+                str(SEISMIC_TRAIN_SCRIPT),
+                "--mode", "inference",
+                "--setting_path", str(setting_path),
+                "--model_path", str(ckpt),
+                "--status_json", str(args.seis_status_json),
+                "--output_dir", str(infer_dir),
+            ]
+            if args.seis_zarr is not None:
+                # ===== 修改 12：改为 Path 风格拼接 =====
+                zarr_path = args.seis_zarr / f"{exp.family}.zarr"
+                infer_cmd.extend(["--zarr_path", str(zarr_path)])
             else:
-                ckpt = find_deepest_best_checkpoint(exp_dir)
-                if ckpt is None:
-                    print(f"[warn] No best_model*.pt under {exp_dir}, skip inference.")
-                else:
-                    setting_path = ckpt.parent
-                    infer_log = exp_dir / "inference.log"
-                    infer_dir = exp_dir / "inference_results"
-                    ensure_dir(infer_dir)
-                    infer_cmd = [
-                        sys.executable,
-                        str(SEISMIC_TRAIN_SCRIPT),
-                        "--mode", "inference",
-                        "--setting_path", str(setting_path),
-                        "--model_path", str(ckpt),
-                        "--status_json", str(args.seis_status_json),
-                        "--output_dir", str(infer_dir),
-                    ]
-                    if args.seis_zarr is not None:
-                        infer_cmd.extend(["--zarr_path", str(os.path.join(args.seis_zarr, exp.family) + ".zarr")])
-                    else:
-                        infer_cmd.extend(["--data_dir", str(args.seis_data_root)])
-                    if exp.seed is not None:
-                        infer_cmd.extend(["--seed", str(exp.seed)])
-                    if args.num_gpus > 1:
-                        infer_cmd.extend(["--distributed"])
-                    if args.infer_one is not None:
-                        infer_cmd.extend(["--infer_one", str(args.infer_one)])
-                    print(f"[run][inference] {exp.name}")
-                    print(f"      setting_path: {setting_path}")
-                    print(f"      model_path  : {ckpt}")
-                    print("      cmd:", " ".join(infer_cmd))
-                    if not args.dry_run:
-                        inference_code = run_command(infer_cmd, infer_log)
-                    else:
-                        inference_code = 0
+                infer_cmd.extend(["--data_dir", str(args.seis_data_root)])
+
+            if exp.seed is not None:
+                infer_cmd.extend(["--seed", str(exp.seed)])
+            if args.num_gpus > 1:
+                infer_cmd.extend(["--distributed"])
+            if args.infer_one is not None:
+                infer_cmd.extend(["--infer_one", str(args.infer_one)])
+
+            print(f"[run][inference] {exp.name}")
+            print(f"      setting_path: {setting_path}")
+            print(f"      model_path  : {ckpt}")
+            print("      cmd:", " ".join(infer_cmd))
+            if not args.dry_run:
+                inference_code = run_command(infer_cmd, infer_log)
+            else:
+                inference_code = 0
+
             end_time = datetime.now().isoformat(timespec="seconds")
             resume_info = None
+
         else:
             ensure_dir(exp_dir)
             log_file = exp_dir / "train.log"
+
+            # ===== 修改 13：启动前先检查 exp_dir 下是否已有 TRAIN_DONE，若有则直接跳过 =====
+            train_done = find_train_done(exp_dir)
+            if train_done is not None:
+                start_time = datetime.now().isoformat(timespec="seconds")
+                print(f"\n[skip] {exp.name}")
+                print(f"      found completed marker: {train_done}")
+                end_time = datetime.now().isoformat(timespec="seconds")
+                resume_info = None
+                summary.append(
+                    {
+                        "name": exp.name,
+                        "return_code": 0,
+                        "inference_return_code": None,
+                        "start": start_time,
+                        "end": end_time,
+                        "notes": exp.notes,
+                        "params": asdict(exp),
+                        "resume_from": None,
+                        "resume_last_epoch": None,
+                        "resume_target_epochs": None,
+                        "resume_completed": True,
+                        "skipped": True,
+                        "completed_by": "TRAIN_DONE",
+                        "train_done_path": str(train_done),
+                    }
+                )
+                with summary_path.open("w") as f:
+                    json.dump(summary, f, indent=2)
+                continue
+
             resume_info = detect_resume_candidate(exp, exp_dir)
             should_resume = bool(resume_info and not resume_info.is_complete)
 
@@ -838,6 +971,7 @@ def main():
                         "resume_target_epochs": resume_info.target_epochs,
                         "resume_completed": resume_info.is_complete,
                         "skipped": True,
+                        "completed_by": "resume_checkpoint_epoch",
                     }
                 )
                 with summary_path.open("w") as f:
@@ -871,51 +1005,27 @@ def main():
             if args.dry_run:
                 return_code = 0
             else:
-                return_code = run_command(cmd, log_file, append=should_resume)
+                # ===== 修改 14：训练时开启对 exp_dir 下 TRAIN_DONE 的运行中监控 =====
+                return_code = run_command(
+                    cmd,
+                    log_file,
+                    append=should_resume,
+                    watch_dir=exp_dir,
+                    watch_train_done=True,
+                    poll_interval=5.0,
+                    graceful_wait_after_done=20.0,
+                    kill_wait_timeout=15.0,
+                )
 
             end_time = datetime.now().isoformat(timespec="seconds")
 
-            # 自动推理：仅针对 seismic 任务且训练成功，使用最深层 best_model*.pt
-            if return_code == 0 and exp.domain == "seismic":
-                ckpt = find_deepest_best_checkpoint(exp_dir)
-                if ckpt is None:
-                    print(f"[warn] No best_model*.pt under {exp_dir}, skip inference.")
-                else:
-                    setting_path = ckpt.parent
-                    infer_log = exp_dir / "inference.log"
-                    infer_dir = exp_dir / "inference_results"
-                    ensure_dir(infer_dir)
-                    infer_cmd = [
-                        sys.executable,
-                        str(SEISMIC_TRAIN_SCRIPT),
-                        "--mode", "inference",
-                        "--setting_path", str(setting_path),
-                        "--model_path", str(ckpt),
-                        "--status_json", str(args.seis_status_json),
-                        "--output_dir", str(infer_dir),
-                    ]
-                    if args.seis_zarr is not None:
-                        infer_cmd.extend(["--zarr_path", str(os.path.join(args.seis_zarr, exp.family) + ".zarr")])
-                    else:
-                        infer_cmd.extend(["--data_dir", str(args.seis_data_root)])
-                    if exp.seed is not None:
-                        infer_cmd.extend(["--seed", str(exp.seed)])
-                    if args.num_gpus > 1:
-                        infer_cmd.extend(["--distributed"])
-                    print(f"[run][inference] {exp.name}")
-                    print(f"      setting_path: {setting_path}")
-                    print(f"      model_path  : {ckpt}")
-                    print("      cmd:", " ".join(infer_cmd))
-                    if not args.dry_run:
-                        inference_code = run_command(infer_cmd, infer_log)
-                    else:
-                        inference_code = 0
+            # ===== 修改 15：删除训练成功后的自动推理功能 =====
+            inference_code = None
 
             if return_code != 0:
                 print(f"[warn] Experiment {exp.name} failed with code {return_code}. Check {log_file}.")
                 if not args.continue_on_failure:
                     print("[info] Stopping subsequent runs (sequential mode).")
-                    # Persist summary before breaking
                     summary.append(
                         {
                             "name": exp.name,
@@ -951,7 +1061,6 @@ def main():
             }
         )
 
-        # Persist summary after each run to avoid loss on interruption
         with summary_path.open("w") as f:
             json.dump(summary, f, indent=2)
 

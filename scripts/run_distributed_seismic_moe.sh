@@ -1,19 +1,19 @@
 #!/bin/bash
 
 # ================================
-# 默认参数
+# 默认参数（以 parser_utils 为准）
 # ================================
-MODE="train"                     # train / inference / overfit1
+MODE="train"                     # train / inference / train_encoder
 NUM_GPUS=2
-DATA_DIR="/data1/wuruoyu/waveform-inversion"
+DATA_DIR=""
 ZARR_PATH=""
 STATUS_JSON="./dataset_status/dataset_status.json"
-FAMILY="all"
+FAMILY=""
 MODEL_NAME="MOE"
-BATCH_SIZE=8
+BATCH_SIZE=""
 TEST_BATCH_SIZE=""
-EPOCHS=100
-OUTPUT_DIR="./results/distributed_seismic_moe"
+EPOCHS=""
+OUTPUT_DIR="./results"
 VIS_FREQ=5
 USE_WANDB=0
 USE_AMP=0
@@ -29,14 +29,14 @@ CHANNEL_DIM=""
 CONCAT_CHANNELS=""
 
 # 训练超参
-LEARNING_RATE=0.001
+LEARNING_RATE=1e-4
 WEIGHT_DECAY=0.05
 LR_WARMUP=5
 LR_WARMUP_FACTOR=0.3333333333
 LR_WARMUP_METHOD="linear"
 LR_SCHEDULER_TYPE="cos_restart"
-MILESTONES=(30 60 90)            # list 参数
-SCHEDULER_GAMMA=0.2
+MILESTONES=(30 60 90)
+SCHEDULER_GAMMA=0.3
 LR_COSINE_TMAX_EPOCHS=50
 LR_COSINE_RESTART_T0_EPOCHS=10
 LR_COSINE_RESTART_T_MULT=2
@@ -51,36 +51,35 @@ LAMBDA_CE=0.2
 K=1
 TOP_K=1
 CHOOSE_EXPERTS=()
-MOE_MODE=""
+MOE_MODE="standard"
 
-# FNO/WNO/MNO/LNO/GeoFNO
+# FNO/WNO/MNO/LNO
 FNO_H=16
 FNO_W=16
-FNO_N_LAYERS=8
+FNO_N_LAYERS=4
 
 WNO_H=2
 WNO_W=2
-# —— WNO 结构新增 ——
 WNO_N_LAYERS=4
 WNO_DROPOUT_RATE=0.1
-WAVELET_TYPE="db6"   # haar | db4
+WAVELET_TYPE="db6"
 DTCWT_TYPE=()
 
 MNO_SCALES=3
-MNO_FACTORS=(1.0 0.5 0.25)
+MNO_FACTORS=(1.0 0.6 0.3)
 MNO_LAYERS=3
 LNO_MODES=(16 16)
 LNO_LAYERS=3
 
 # 模型结构 / MoE 融合相关
-MOEMETHOD="basic"                    # basic/afmoe
-HIDDEN_CHANNELS=64
+MOEMETHOD="afmoe"
+HIDDEN_CHANNELS=128
 USE_EXPERTS_PATH=""
-USE_MOE=0                       # flag -> --use_moe
-ROUTER_TYPE="basic"             # 'basic' / 'adamv'
-FUSION_TYPE="linear"            # 'linear' / 'attention' / 'swa'
-S_PROCESSOR_TYPE="linear"       # 'linear' / 'atten' / 'mean' / 'sum'
-W_PROCESSOR_TYPE="linear"       # 'linear' / 'atten' / 'mean' / 'sum'
+USE_MOE=0
+ROUTER_TYPE="basic"
+FUSION_TYPE="linear"
+S_PROCESSOR_TYPE="linear"
+W_PROCESSOR_TYPE="linear"
 BETA=0.5
 ROUTER_HIDDEN_DIM=""
 ROUTER_ALPHA=""
@@ -90,12 +89,12 @@ DISABLE_SOFT_BANDS=0
 DISABLE_FREQ_ATTN=0
 DISABLE_BAND_MIXING=0
 DISABLE_BAND_DECOMPOSITION=0
-ROUTING_MODE="learned"          # learned / uniform / random
+ROUTING_MODE=""
 ENABLE_FREQ_METRICS=0
 NOISY_GATING=""
-IS_SPECIFIC=0                   # flag -> --is_specific
-IS_CLASSIFIER=0                   # flag -> --is_classifier
-V_TYPE_NUM=""                  # 可选 -> --v_type_num
+IS_SPECIFIC=0
+IS_CLASSIFIER=0
+V_TYPE_NUM=""
 USE_GPU_PROXY=0
 USE_ENCODER=""
 BACKBONE="vit"
@@ -104,12 +103,12 @@ TARGET_SIZE=70
 ENC_C=128
 
 # 推理/恢复
-MODEL_PATH=""                   # inference 时常用
+MODEL_PATH=""
 RESUME_PATH=""
 LOG_ROOT=""
 
 # 性能统计
-PROFILE_TIMING=0                # flag -> --profile_timing
+PROFILE_TIMING=0
 IS_RESIZE=0
 H_SIZE=256
 W_SIZE=256
@@ -201,7 +200,7 @@ while [[ $# -gt 0 ]]; do
     --MNO_n_layers) MNO_LAYERS="$2"; shift 2 ;;
     --LNO_n_modes) shift; LNO_MODES=(); while [[ $# -gt 0 && $1 != --* ]]; do LNO_MODES+=("$1"); shift; done ;;
     --LNO_n_layers) LNO_LAYERS="$2"; shift 2 ;;
-    
+
     --moe_method) MOEMETHOD="$2"; shift 2 ;;
     --hidden_channels) HIDDEN_CHANNELS="$2"; shift 2 ;;
     --use_experts_path) USE_EXPERTS_PATH="$2"; shift 2 ;;
@@ -252,40 +251,28 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ================================
-# 目录与可选参数拼装
+# 目录准备
 # ================================
 mkdir -p "$OUTPUT_DIR"
 
-WANDB_ARG=""
-[[ "$USE_WANDB" -eq 1 ]] && WANDB_ARG="--use_wandb"
-
-USE_MOE_ARG=""
-[[ "$USE_MOE" -eq 1 ]] && USE_MOE_ARG="--use_moe"
-
-IS_SPECIFIC_ARG=""
-[[ "$IS_SPECIFIC" -eq 1 ]] && IS_SPECIFIC_ARG="--is_specific"
-
-IS_CLASSIER_ARG=""
-[[ "$IS_CLASSIFIER" -eq 1 ]] && IS_CLASSIFIER_ARG="--is_classifier"
-
-USE_EXPERTS_PATH_ARG=""
-[[ -n "$USE_EXPERTS_PATH" ]] && USE_EXPERTS_PATH_ARG="--use_experts_path \"$USE_EXPERTS_PATH\""
-
-MODEL_PATH_ARG=""
-[[ -n "$MODEL_PATH" ]] && MODEL_PATH_ARG="--model_path \"$MODEL_PATH\""
-
+# ================================
+# 自动补全逻辑
+# ================================
 if [[ $EARLY_STOP -eq 0 ]]; then
   if [[ -n "$EARLY_STOP_PATIENCE" || -n "$EARLY_STOP_MIN_DELTA" || -n "$EARLY_STOP_WARMUP" ]]; then
     EARLY_STOP=1
   fi
 fi
 
+# ================================
+# 展示辅助变量
+# ================================
 if [[ "$CONCAT_CHANNELS" == "1" ]]; then
   CONCAT_DISPLAY="enabled"
 elif [[ "$CONCAT_CHANNELS" == "0" ]]; then
   CONCAT_DISPLAY="disabled"
 else
-  CONCAT_DISPLAY="<config>"
+  CONCAT_DISPLAY="<parser_default>"
 fi
 
 if [[ "$MIXED_PRECISION" == "1" ]]; then
@@ -293,7 +280,7 @@ if [[ "$MIXED_PRECISION" == "1" ]]; then
 elif [[ "$MIXED_PRECISION" == "0" ]]; then
   MIXED_PRECISION_DISPLAY="disabled"
 else
-  MIXED_PRECISION_DISPLAY="<config>"
+  MIXED_PRECISION_DISPLAY="<parser_default>"
 fi
 
 if [[ "$USE_ONECYCLE" == "1" ]]; then
@@ -301,7 +288,7 @@ if [[ "$USE_ONECYCLE" == "1" ]]; then
 elif [[ "$USE_ONECYCLE" == "0" ]]; then
   ONECYCLE_DISPLAY="disabled"
 else
-  ONECYCLE_DISPLAY="<config>"
+  ONECYCLE_DISPLAY="<parser_default>"
 fi
 
 if [[ "$NOISY_GATING" == "1" ]]; then
@@ -309,7 +296,7 @@ if [[ "$NOISY_GATING" == "1" ]]; then
 elif [[ "$NOISY_GATING" == "0" ]]; then
   NOISY_GATING_DISPLAY="disabled"
 else
-  NOISY_GATING_DISPLAY="<config>"
+  NOISY_GATING_DISPLAY="<parser_default>"
 fi
 
 if [[ "$VERBOSE" == "1" ]]; then
@@ -317,7 +304,7 @@ if [[ "$VERBOSE" == "1" ]]; then
 elif [[ "$VERBOSE" == "0" ]]; then
   VERBOSE_DISPLAY="quiet"
 else
-  VERBOSE_DISPLAY="<config>"
+  VERBOSE_DISPLAY="<parser_default>"
 fi
 
 if [[ "$USE_GPU_PROXY" -eq 1 ]]; then
@@ -331,7 +318,7 @@ if [[ "$USE_ENCODER" == "1" ]]; then
 elif [[ "$USE_ENCODER" == "0" ]]; then
   USE_ENCODER_DISPLAY="disabled"
 else
-  USE_ENCODER_DISPLAY="<config>"
+  USE_ENCODER_DISPLAY="<parser_default>"
 fi
 
 if [[ "$EARLY_STOP" -eq 1 ]]; then
@@ -340,7 +327,8 @@ else
   EARLY_STOP_DISPLAY="disabled"
 fi
 
-MOE_MODE_DISPLAY="${MOE_MODE:-<config>}"
+MOE_MODE_DISPLAY="${MOE_MODE:-<parser_default>}"
+ROUTING_MODE_DISPLAY="${ROUTING_MODE:-<parser_default>}"
 
 # ================================
 # 打印配置
@@ -348,16 +336,16 @@ MOE_MODE_DISPLAY="${MOE_MODE:-<config>}"
 echo "启动分布式训练/推理，配置如下："
 echo "Mode: $MODE"
 echo "GPU数量: $NUM_GPUS"
-echo "数据目录: $DATA_DIR"
-echo "Zarr数据集路径: $ZARR_PATH"
+echo "数据目录: ${DATA_DIR:-<parser_default>}"
+echo "Zarr数据集路径: ${ZARR_PATH:-<parser_default>}"
 echo "数据集统计量json: $STATUS_JSON"
-echo "数据系列: $FAMILY"
+echo "数据系列: ${FAMILY:-<parser_default>}"
 echo "模型名称: $MODEL_NAME"
-echo "批次大小: $BATCH_SIZE"
-echo "测试批次大小: ${TEST_BATCH_SIZE:-<config>}"
-echo "训练轮数: $EPOCHS"
+echo "批次大小: ${BATCH_SIZE:-<parser_default>}"
+echo "测试批次大小: ${TEST_BATCH_SIZE:-<parser_default>}"
+echo "训练轮数: ${EPOCHS:-<parser_default>}"
 echo "输出目录: $OUTPUT_DIR"
-echo "TensorBoard 日志根目录: ${LOG_ROOT:-<config>}"
+echo "TensorBoard 日志根目录: ${LOG_ROOT:-<parser_default>}"
 echo "可视化频率: $VIS_FREQ"
 echo "使用WandB: $USE_WANDB"
 echo "使用AMP: $USE_AMP"
@@ -365,13 +353,13 @@ echo "Mixed Precision override: $MIXED_PRECISION_DISPLAY"
 echo "验证集比例: $VAL_RATIO"
 echo "Num Workers: $NUM_WORKERS"
 echo "Seed: $SEED"
-echo "训练/测试子集: train=${N_TRAIN_SAMPLES:-<all>}, test=${N_TEST_SAMPLES:-<all>}"
-echo "Channel dim override: ${CHANNEL_DIM:-<config>}, concat_channels: $CONCAT_DISPLAY"
+echo "训练/测试子集: train=${N_TRAIN_SAMPLES:-<parser_default>}, test=${N_TEST_SAMPLES:-<parser_default>}"
+echo "Channel dim override: ${CHANNEL_DIM:-<parser_default>}, concat_channels: $CONCAT_DISPLAY"
 echo "是否Resize输入: $IS_RESIZE, H_size: $H_SIZE, W_size: $W_SIZE"
 echo "梯度累计步数: $ACCUM_STEPS"
 echo "OneCycle 调度: $ONECYCLE_DISPLAY"
-echo "早停: $EARLY_STOP_DISPLAY (patience=${EARLY_STOP_PATIENCE:-<config>}, min_delta=${EARLY_STOP_MIN_DELTA:-<config>}, warmup=${EARLY_STOP_WARMUP:-<config>})"
-echo "验证间隔: ${EVAL_INTERVAL:-<config>}"
+echo "早停: $EARLY_STOP_DISPLAY (patience=${EARLY_STOP_PATIENCE:-<parser_default>}, min_delta=${EARLY_STOP_MIN_DELTA:-<parser_default>}, warmup=${EARLY_STOP_WARMUP:-<parser_default>})"
+echo "验证间隔: ${EVAL_INTERVAL:-<parser_default>}"
 echo "日志输出模式: $VERBOSE_DISPLAY"
 echo "学习率: $LEARNING_RATE"
 echo "WeightDecay: $WEIGHT_DECAY"
@@ -388,16 +376,10 @@ echo "Cosine Eta Min: $LR_COSINE_ETA_MIN"
 echo "Loss λ_g1v: $LAMBDA_G1V, λ_g2v: $LAMBDA_G2V, λ_grad_l1: $LAMBDA_GRAD_L1, λ_fourier_mag_l1: $LAMBDA_FOURIER_MAG_L1, λ_ce: $LAMBDA_CE"
 echo "数据预处理缩放因子 k: $K"
 echo "Top-K 专家数: $TOP_K"
-echo "专家选择: ${CHOOSE_EXPERTS[*]}"
+echo "专家选择: ${CHOOSE_EXPERTS[*]:-<parser_default>}"
 echo "FNO(H,W,layers): ($FNO_H, $FNO_W, $FNO_N_LAYERS)"
 echo "WNO(levels H,W): ($WNO_H, $WNO_W)"
-echo "WNO(n_layers, block_layers, dropout, wavelet): ($WNO_N_LAYERS, $WNO_BLOCK_N_LAYERS, $WNO_DROPOUT_RATE, $WAVELET_TYPE)"
-echo "WNO pad_mode override: ${WNO_PAD_MODE:-<default>}"
-echo "WNO ensure_even_shapes flag: ${WNO_ENSURE_SHAPES:-<default>}"
-echo "WNO adaptive_padding flag: ${WNO_ADAPTIVE_PADDING:-<default>}"
-echo "WNO channel MLP usage flag: ${WNO_USE_CHANNEL_MLP:-<default>}"
-echo "WNO channel MLP dropout: ${WNO_CHANNEL_MLP_DROPOUT:-<default>}"
-echo "WNO channel MLP expansion: ${WNO_CHANNEL_MLP_EXPANSION:-<default>}"
+echo "WNO(n_layers, dropout, wavelet): ($WNO_N_LAYERS, $WNO_DROPOUT_RATE, $WAVELET_TYPE)"
 echo "DTCWT type: ${DTCWT_TYPE[*]:-<None>}"
 echo "MNO(scales,layers,factors): ($MNO_SCALES, $MNO_LAYERS, ${MNO_FACTORS[*]})"
 echo "LNO(modes H W, layers): (${LNO_MODES[*]}, $LNO_LAYERS)"
@@ -407,9 +389,9 @@ echo "Use Experts Path: ${USE_EXPERTS_PATH:-<None>}"
 echo "Use MoE: $USE_MOE"
 echo "MoE 模式: $MOE_MODE_DISPLAY"
 echo "Router Type: $ROUTER_TYPE"
-echo "Router Hidden Dim: ${ROUTER_HIDDEN_DIM:-<config>}"
-echo "Router Alpha (afmoe): ${ROUTER_ALPHA:-<config>}"
-echo "AFreqMoE: band_sharpness=$BAND_SHARPNESS, freq_affinity_sharpness=$FREQ_AFFINITY_SHARPNESS, soft_bands=$((1-DISABLE_SOFT_BANDS)), freq_attn=$((1-DISABLE_FREQ_ATTN)), band_mixing=$((1-DISABLE_BAND_MIXING)), band_decomposition=$((1-DISABLE_BAND_DECOMPOSITION)), routing_mode=$ROUTING_MODE"
+echo "Router Hidden Dim: ${ROUTER_HIDDEN_DIM:-<parser_default>}"
+echo "Router Alpha (afmoe): ${ROUTER_ALPHA:-<parser_default>}"
+echo "AFreqMoE: band_sharpness=$BAND_SHARPNESS, freq_affinity_sharpness=$FREQ_AFFINITY_SHARPNESS, soft_bands=$((1-DISABLE_SOFT_BANDS)), freq_attn=$((1-DISABLE_FREQ_ATTN)), band_mixing=$((1-DISABLE_BAND_MIXING)), band_decomposition=$((1-DISABLE_BAND_DECOMPOSITION)), routing_mode=$ROUTING_MODE_DISPLAY"
 echo "Freq band metrics: $ENABLE_FREQ_METRICS"
 echo "Fusion Type: $FUSION_TYPE"
 echo "Strong-Group Processor: $S_PROCESSOR_TYPE"
@@ -423,15 +405,14 @@ echo "Enc target size: $TARGET_SIZE"
 echo "Enc channels: $ENC_C"
 echo "Encoder Checkpoint: ${ENCODER_PATH:-<None>}"
 echo "is_specific: $IS_SPECIFIC, is_classifier: $IS_CLASSIFIER"
-echo "v_type_num: ${V_TYPE_NUM:-<auto>}"
+echo "v_type_num: ${V_TYPE_NUM:-<parser_default>}"
 echo "Model Path(仅 inference 用): ${MODEL_PATH:-<None>}"
-echo "ResumePath: $RESUME_PATH"
+echo "ResumePath: ${RESUME_PATH:-<None>}"
 echo "Profile Timing: $PROFILE_TIMING"
 
 # ================================
-# 启动 torchrun
+# 构建 torchrun 参数
 # ================================
-# 注意：为避免引号问题，拆分为数组传参更安全
 ARGS=(
   --standalone
   --nnodes=1
@@ -439,19 +420,13 @@ ARGS=(
   scripts/train_seismic_moe.py
   --mode "$MODE"
   --model_name "$MODEL_NAME"
-  --data_dir "$DATA_DIR"
   --status_json "$STATUS_JSON"
-  --family "$FAMILY"
-  --batch_size "$BATCH_SIZE"
-  --epochs "$EPOCHS"
-  --output_dir "$OUTPUT_DIR"
   --vis_freq "$VIS_FREQ"
   --val_ratio "$VAL_RATIO"
   --distributed
   --num_workers "$NUM_WORKERS"
   --seed "$SEED"
   --top_k "$TOP_K"
-  --choose_experts "${CHOOSE_EXPERTS[@]}"
   --FNO_n_modes_height "$FNO_H"
   --FNO_n_modes_width "$FNO_W"
   --FNO_n_layers "$FNO_N_LAYERS"
@@ -461,9 +436,7 @@ ARGS=(
   --WNO_dropout_rate "$WNO_DROPOUT_RATE"
   --wavelet_type "$WAVELET_TYPE"
   --MNO_n_scales "$MNO_SCALES"
-  --MNO_scale_factors "${MNO_FACTORS[@]}"
   --MNO_n_layers "$MNO_LAYERS"
-  --LNO_n_modes "${LNO_MODES[@]}"
   --LNO_n_layers "$LNO_LAYERS"
   --k "$K"
   --H_size "$H_SIZE"
@@ -474,13 +447,11 @@ ARGS=(
   --target_size "$TARGET_SIZE"
   --enc_channels "$ENC_C"
   --learning_rate "$LEARNING_RATE"
-  --resume_path "$RESUME_PATH"
   --weight_decay "$WEIGHT_DECAY"
   --lr_warmup_epochs "$LR_WARMUP"
   --lr_warmup_factor "$LR_WARMUP_FACTOR"
   --lr_warmup_method "$LR_WARMUP_METHOD"
   --lr_scheduler_type "$LR_SCHEDULER_TYPE"
-  --milestones "${MILESTONES[@]}"
   --scheduler_gamma "$SCHEDULER_GAMMA"
   --lr_cosine_tmax_epochs "$LR_COSINE_TMAX_EPOCHS"
   --lr_cosine_restart_t0_epochs "$LR_COSINE_RESTART_T0_EPOCHS"
@@ -501,82 +472,109 @@ ARGS=(
   --lambda_ce "$LAMBDA_CE"
 )
 
+# 仅在非空时追加，确保真正回退到 parser 默认值
+[[ -n "$DATA_DIR" ]] && ARGS+=( --data_dir "$DATA_DIR" )
 [[ -n "$ZARR_PATH" ]] && ARGS+=( --zarr_path "$ZARR_PATH" )
+[[ -n "$FAMILY" ]] && ARGS+=( --family "$FAMILY" )
+[[ -n "$BATCH_SIZE" ]] && ARGS+=( --batch_size "$BATCH_SIZE" )
 [[ -n "$TEST_BATCH_SIZE" ]] && ARGS+=( --test_batch_size "$TEST_BATCH_SIZE" )
+[[ -n "$EPOCHS" ]] && ARGS+=( --epochs "$EPOCHS" )
+[[ -n "$OUTPUT_DIR" ]] && ARGS+=( --output_dir "$OUTPUT_DIR" )
+[[ -n "$LOG_ROOT" ]] && ARGS+=( --log_root "$LOG_ROOT" )
 [[ -n "$N_TRAIN_SAMPLES" ]] && ARGS+=( --n_train_samples "$N_TRAIN_SAMPLES" )
 [[ -n "$N_TEST_SAMPLES" ]] && ARGS+=( --n_test_samples "$N_TEST_SAMPLES" )
 [[ -n "$CHANNEL_DIM" ]] && ARGS+=( --channel_dim "$CHANNEL_DIM" )
+[[ -n "$MOE_MODE" ]] && ARGS+=( --moe_mode "$MOE_MODE" )
+[[ -n "$ROUTER_HIDDEN_DIM" ]] && ARGS+=( --router_hidden_dim "$ROUTER_HIDDEN_DIM" )
+[[ -n "$ROUTER_ALPHA" ]] && ARGS+=( --router_alpha "$ROUTER_ALPHA" )
+[[ -n "$ROUTING_MODE" ]] && ARGS+=( --routing_mode "$ROUTING_MODE" )
+[[ -n "$USE_EXPERTS_PATH" ]] && ARGS+=( --use_experts_path "$USE_EXPERTS_PATH" )
+[[ -n "$MODEL_PATH" ]] && ARGS+=( --model_path "$MODEL_PATH" )
+[[ -n "$RESUME_PATH" ]] && ARGS+=( --resume_path "$RESUME_PATH" )
+[[ -n "$ENCODER_PATH" ]] && ARGS+=( --encoder_path "$ENCODER_PATH" )
+[[ -n "$V_TYPE_NUM" ]] && ARGS+=( --v_type_num "$V_TYPE_NUM" )
+[[ -n "$EARLY_STOP_PATIENCE" ]] && ARGS+=( --early_stop_patience "$EARLY_STOP_PATIENCE" )
+[[ -n "$EARLY_STOP_MIN_DELTA" ]] && ARGS+=( --early_stop_min_delta "$EARLY_STOP_MIN_DELTA" )
+[[ -n "$EARLY_STOP_WARMUP" ]] && ARGS+=( --early_stop_warmup_epochs "$EARLY_STOP_WARMUP" )
+[[ -n "$EVAL_INTERVAL" ]] && ARGS+=( --eval_interval "$EVAL_INTERVAL" )
+
+# 数组型参数：只有非空时才传，避免把空项传进去
+if [[ ${#CHOOSE_EXPERTS[@]} -gt 0 ]]; then
+  ARGS+=( --choose_experts "${CHOOSE_EXPERTS[@]}" )
+fi
+
+if [[ ${#MILESTONES[@]} -gt 0 ]]; then
+  ARGS+=( --milestones "${MILESTONES[@]}" )
+fi
+
+if [[ ${#MNO_FACTORS[@]} -gt 0 ]]; then
+  ARGS+=( --MNO_scale_factors "${MNO_FACTORS[@]}" )
+fi
+
+if [[ ${#LNO_MODES[@]} -gt 0 ]]; then
+  ARGS+=( --LNO_n_modes "${LNO_MODES[@]}" )
+fi
+
+if [[ ${#DTCWT_TYPE[@]} -eq 2 ]]; then
+  ARGS+=( --dtcwt_type "${DTCWT_TYPE[@]}" )
+fi
+
+# 布尔开关参数
 if [[ "$CONCAT_CHANNELS" == "1" ]]; then
   ARGS+=( --concat_channels )
 elif [[ "$CONCAT_CHANNELS" == "0" ]]; then
   ARGS+=( --no_concat_channels )
 fi
+
 if [[ "$MIXED_PRECISION" == "1" ]]; then
   ARGS+=( --mixed_precision )
 elif [[ "$MIXED_PRECISION" == "0" ]]; then
   ARGS+=( --disable_mixed_precision )
 fi
+
 if [[ "$USE_ONECYCLE" == "1" ]]; then
   ARGS+=( --use_onecycle )
 elif [[ "$USE_ONECYCLE" == "0" ]]; then
   ARGS+=( --disable_onecycle )
 fi
-if [[ "$EARLY_STOP" -eq 1 ]]; then
-  ARGS+=( --early_stop )
-fi
-[[ -n "$EARLY_STOP_PATIENCE" ]] && ARGS+=( --early_stop_patience "$EARLY_STOP_PATIENCE" )
-[[ -n "$EARLY_STOP_MIN_DELTA" ]] && ARGS+=( --early_stop_min_delta "$EARLY_STOP_MIN_DELTA" )
-[[ -n "$EARLY_STOP_WARMUP" ]] && ARGS+=( --early_stop_warmup_epochs "$EARLY_STOP_WARMUP" )
-[[ -n "$EVAL_INTERVAL" ]] && ARGS+=( --eval_interval "$EVAL_INTERVAL" )
-if [[ "$VERBOSE" == "1" ]]; then
-  ARGS+=( --verbose )
-elif [[ "$VERBOSE" == "0" ]]; then
-  ARGS+=( --quiet )
-fi
-[[ -n "$MOE_MODE" ]] && ARGS+=( --moe_mode "$MOE_MODE" )
-[[ -n "$ROUTER_HIDDEN_DIM" ]] && ARGS+=( --router_hidden_dim "$ROUTER_HIDDEN_DIM" )
-[[ -n "$ROUTER_ALPHA" ]] && ARGS+=( --router_alpha "$ROUTER_ALPHA" )
-[[ -n "$ROUTING_MODE" ]] && ARGS+=( --routing_mode "$ROUTING_MODE" )
+
 if [[ "$NOISY_GATING" == "1" ]]; then
   ARGS+=( --enable_noisy_gating )
 elif [[ "$NOISY_GATING" == "0" ]]; then
   ARGS+=( --disable_noisy_gating )
 fi
-if [[ "$USE_GPU_PROXY" -eq 1 ]]; then
-  ARGS+=( --use_gpu_proxy )
-fi
-[[ -n "$LAMBDA_GRAD" ]] && ARGS+=( --lambda_grad "$LAMBDA_GRAD" )
-[[ -n "$LAMBDA_SSIM" ]] && ARGS+=( --lambda_ssim "$LAMBDA_SSIM" )
 
-[[ ${#DTCWT_TYPE[@]} -eq 2 ]] && ARGS+=( --dtcwt_type "${DTCWT_TYPE[@]}" )
-
-# 可选开关类参数
-[[ "$USE_DEEPSPEED" -eq 1 ]]   && ARGS+=( --use_deepspeed )
-[[ "$USE_AMP" -eq 1 ]]   && ARGS+=( --use_amp )
-[[ "$USE_WANDB" -eq 1 ]]   && ARGS+=( --use_wandb )
-[[ "$USE_MOE" -eq 1 ]]     && ARGS+=( --use_moe )
-[[ "$IS_SPECIFIC" -eq 1 ]] && ARGS+=( --is_specific )
-[[ "$IS_CLASSIFIER" -eq 1 ]] && ARGS+=( --is_classifier )
-[[ "$PROFILE_TIMING" -eq 1 ]] && ARGS+=( --profile_timing )
-[[ "$IS_RESIZE" -eq 1 ]]  && ARGS+=( --is_resize )
 if [[ "$USE_ENCODER" == "1" ]]; then
   ARGS+=( --use_encoder )
 elif [[ "$USE_ENCODER" == "0" ]]; then
   ARGS+=( --disable_encoder )
 fi
 
-# 可选路径参数（非空才追加）
-[[ -n "$USE_EXPERTS_PATH" ]] && ARGS+=( --use_experts_path "$USE_EXPERTS_PATH" )
-[[ -n "$MODEL_PATH" ]]       && ARGS+=( --model_path "$MODEL_PATH" )
-[[ -n "$ENCODER_PATH" ]]     && ARGS+=( --encoder_path "$ENCODER_PATH" )
-[[ -n "$LOG_ROOT" ]]         && ARGS+=( --log_root "$LOG_ROOT" )
-[[ -n "$V_TYPE_NUM" ]]       && ARGS+=( --v_type_num "$V_TYPE_NUM" )
-[[ $DISABLE_SOFT_BANDS -eq 1 ]] && ARGS+=( --disable_soft_bands )
-[[ $DISABLE_FREQ_ATTN -eq 1 ]] && ARGS+=( --disable_freq_attn )
-[[ $DISABLE_BAND_MIXING -eq 1 ]] && ARGS+=( --disable_band_mixing )
-[[ $DISABLE_BAND_DECOMPOSITION -eq 1 ]] && ARGS+=( --disable_band_decomposition )
-[[ $ENABLE_FREQ_METRICS -eq 1 ]] && ARGS+=( --enable_freq_metrics )
+if [[ "$VERBOSE" == "1" ]]; then
+  ARGS+=( --verbose )
+elif [[ "$VERBOSE" == "0" ]]; then
+  ARGS+=( --quiet )
+fi
 
+[[ "$EARLY_STOP" -eq 1 ]] && ARGS+=( --early_stop )
+[[ "$USE_DEEPSPEED" -eq 1 ]] && ARGS+=( --use_deepspeed )
+[[ "$USE_AMP" -eq 1 ]] && ARGS+=( --use_amp )
+[[ "$USE_WANDB" -eq 1 ]] && ARGS+=( --use_wandb )
+[[ "$USE_MOE" -eq 1 ]] && ARGS+=( --use_moe )
+[[ "$IS_SPECIFIC" -eq 1 ]] && ARGS+=( --is_specific )
+[[ "$IS_CLASSIFIER" -eq 1 ]] && ARGS+=( --is_classifier )
+[[ "$PROFILE_TIMING" -eq 1 ]] && ARGS+=( --profile_timing )
+[[ "$IS_RESIZE" -eq 1 ]] && ARGS+=( --is_resize )
+[[ "$USE_GPU_PROXY" -eq 1 ]] && ARGS+=( --use_gpu_proxy )
+[[ "$DISABLE_SOFT_BANDS" -eq 1 ]] && ARGS+=( --disable_soft_bands )
+[[ "$DISABLE_FREQ_ATTN" -eq 1 ]] && ARGS+=( --disable_freq_attn )
+[[ "$DISABLE_BAND_MIXING" -eq 1 ]] && ARGS+=( --disable_band_mixing )
+[[ "$DISABLE_BAND_DECOMPOSITION" -eq 1 ]] && ARGS+=( --disable_band_decomposition )
+[[ "$ENABLE_FREQ_METRICS" -eq 1 ]] && ARGS+=( --enable_freq_metrics )
+
+# ================================
+# 启动
+# ================================
 torchrun "${ARGS[@]}"
 
 echo "分布式流程结束！"

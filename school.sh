@@ -29,8 +29,12 @@ bash scripts/run_distributed_seismic_moe.sh \
   --status_json ./dataset_status/dataset_status.json \
   --family curve_vel_b \
   --batch_size 32 \
-  --epochs 150 \
-  --output_dir ../results_seismic \
+  --seed 0 \
+  --epochs 160 \
+  --output_dir exp/runs/freq_fusion_curve_vel_b_s0 \
   --top_k 2 \
   --use_amp \
-  --band_sharpness 10
+  --band_sharpness 20 \
+  --learning_rate 0.00026711555047527854 \
+  --hidden_channels 96 \
+  --weight_decay 0.08952068376871994
