@@ -35,6 +35,6 @@ bash scripts/run_distributed_seismic_moe.sh \
   --top_k 2 \
   --use_amp \
   --band_sharpness 20 \
-  --learning_rate 0.00026711555047527854 \
   --hidden_channels 96 \
-  --weight_decay 0.08952068376871994
+  --moe_method afmoe \
+  --choose_experts 0 1 2
