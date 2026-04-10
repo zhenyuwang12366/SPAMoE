@@ -5,6 +5,8 @@
 # ================================
 MODE="train"                     # train / inference / train_encoder
 NUM_GPUS=2
+CONFIG=""
+ARGS_JSON=""
 DATA_DIR=""
 ZARR_PATH=""
 STATUS_JSON="./dataset_status/dataset_status.json"
@@ -30,13 +32,13 @@ CONCAT_CHANNELS=""
 
 # 训练超参
 LEARNING_RATE=1e-4
-WEIGHT_DECAY=0.05
+WEIGHT_DECAY=1e-4
 LR_WARMUP=5
 LR_WARMUP_FACTOR=0.3333333333
 LR_WARMUP_METHOD="linear"
 LR_SCHEDULER_TYPE="cos_restart"
 MILESTONES=(30 60 90)
-SCHEDULER_GAMMA=0.3
+SCHEDULER_GAMMA=0.2
 LR_COSINE_TMAX_EPOCHS=50
 LR_COSINE_RESTART_T0_EPOCHS=10
 LR_COSINE_RESTART_T_MULT=2
@@ -56,7 +58,7 @@ MOE_MODE="standard"
 # FNO/WNO/MNO/LNO
 FNO_H=16
 FNO_W=16
-FNO_N_LAYERS=4
+FNO_N_LAYERS=8
 
 WNO_H=2
 WNO_W=2
@@ -66,14 +68,14 @@ WAVELET_TYPE="db6"
 DTCWT_TYPE=()
 
 MNO_SCALES=3
-MNO_FACTORS=(1.0 0.6 0.3)
+MNO_FACTORS=(1.0 0.5 0.25)
 MNO_LAYERS=3
 LNO_MODES=(16 16)
 LNO_LAYERS=3
 
 # 模型结构 / MoE 融合相关
 MOEMETHOD="afmoe"
-HIDDEN_CHANNELS=128
+HIDDEN_CHANNELS=64
 USE_EXPERTS_PATH=""
 USE_MOE=0
 ROUTER_TYPE="basic"
@@ -125,6 +127,8 @@ VERBOSE=""
 # ================================
 while [[ $# -gt 0 ]]; do
   case $1 in
+    --config) CONFIG="$2"; shift 2 ;;
+    --args) ARGS_JSON="$2"; shift 2 ;;
     --mode) MODE="$2"; shift 2 ;;
     --num_gpus) NUM_GPUS="$2"; shift 2 ;;
     --data_dir) DATA_DIR="$2"; shift 2 ;;
@@ -253,7 +257,9 @@ done
 # ================================
 # 目录准备
 # ================================
-mkdir -p "$OUTPUT_DIR"
+if [[ -z "$CONFIG" && -z "$ARGS_JSON" ]]; then
+  mkdir -p "$OUTPUT_DIR"
+fi
 
 # ================================
 # 自动补全逻辑
@@ -334,6 +340,24 @@ ROUTING_MODE_DISPLAY="${ROUTING_MODE:-<parser_default>}"
 # 打印配置
 # ================================
 echo "启动分布式训练/推理，配置如下："
+if [[ -n "$ARGS_JSON" && -n "$CONFIG" ]]; then
+echo "Args 模式: enabled"
+echo "Args 路径: $ARGS_JSON"
+echo "Config 路径: $CONFIG"
+echo "GPU数量: $NUM_GPUS"
+echo "--args 与 --config 同时提供时，优先使用 args.json。"
+echo "其余训练参数以 args.json 为准，命令行参数不会覆盖。"
+elif [[ -n "$ARGS_JSON" ]]; then
+echo "Args 模式: enabled"
+echo "Args 路径: $ARGS_JSON"
+echo "GPU数量: $NUM_GPUS"
+echo "其余训练参数以 args.json 为准，命令行参数不会覆盖。"
+elif [[ -n "$CONFIG" ]]; then
+echo "Config 模式: enabled"
+echo "Config 路径: $CONFIG"
+echo "GPU数量: $NUM_GPUS"
+echo "其余训练参数以 JSON 为准，命令行参数不会覆盖。"
+else
 echo "Mode: $MODE"
 echo "GPU数量: $NUM_GPUS"
 echo "数据目录: ${DATA_DIR:-<parser_default>}"
@@ -409,114 +433,133 @@ echo "v_type_num: ${V_TYPE_NUM:-<parser_default>}"
 echo "Model Path(仅 inference 用): ${MODEL_PATH:-<None>}"
 echo "ResumePath: ${RESUME_PATH:-<None>}"
 echo "Profile Timing: $PROFILE_TIMING"
+fi
 
 # ================================
 # 构建 torchrun 参数
 # ================================
-ARGS=(
-  --standalone
-  --nnodes=1
-  --nproc_per_node="$NUM_GPUS"
-  scripts/train_seismic_moe.py
-  --mode "$MODE"
-  --model_name "$MODEL_NAME"
-  --status_json "$STATUS_JSON"
-  --vis_freq "$VIS_FREQ"
-  --val_ratio "$VAL_RATIO"
-  --distributed
-  --num_workers "$NUM_WORKERS"
-  --seed "$SEED"
-  --top_k "$TOP_K"
-  --FNO_n_modes_height "$FNO_H"
-  --FNO_n_modes_width "$FNO_W"
-  --FNO_n_layers "$FNO_N_LAYERS"
-  --WNO_n_levels_height "$WNO_H"
-  --WNO_n_levels_width "$WNO_W"
-  --WNO_n_layers "$WNO_N_LAYERS"
-  --WNO_dropout_rate "$WNO_DROPOUT_RATE"
-  --wavelet_type "$WAVELET_TYPE"
-  --MNO_n_scales "$MNO_SCALES"
-  --MNO_n_layers "$MNO_LAYERS"
-  --LNO_n_layers "$LNO_LAYERS"
-  --k "$K"
-  --H_size "$H_SIZE"
-  --W_size "$W_SIZE"
-  --moe_method "$MOEMETHOD"
-  --hidden_channels "$HIDDEN_CHANNELS"
-  --backbone "$BACKBONE"
-  --target_size "$TARGET_SIZE"
-  --enc_channels "$ENC_C"
-  --learning_rate "$LEARNING_RATE"
-  --weight_decay "$WEIGHT_DECAY"
-  --lr_warmup_epochs "$LR_WARMUP"
-  --lr_warmup_factor "$LR_WARMUP_FACTOR"
-  --lr_warmup_method "$LR_WARMUP_METHOD"
-  --lr_scheduler_type "$LR_SCHEDULER_TYPE"
-  --scheduler_gamma "$SCHEDULER_GAMMA"
-  --lr_cosine_tmax_epochs "$LR_COSINE_TMAX_EPOCHS"
-  --lr_cosine_restart_t0_epochs "$LR_COSINE_RESTART_T0_EPOCHS"
-  --lr_cosine_restart_t_mult "$LR_COSINE_RESTART_T_MULT"
-  --lr_cosine_eta_min "$LR_COSINE_ETA_MIN"
-  --accum_steps "$ACCUM_STEPS"
-  --router_type "$ROUTER_TYPE"
-  --band_sharpness "$BAND_SHARPNESS"
-  --freq_affinity_sharpness "$FREQ_AFFINITY_SHARPNESS"
-  --fusion_type "$FUSION_TYPE"
-  --s_processor_type "$S_PROCESSOR_TYPE"
-  --w_processor_type "$W_PROCESSOR_TYPE"
-  --beta "$BETA"
-  --lambda_g1v "$LAMBDA_G1V"
-  --lambda_g2v "$LAMBDA_G2V"
-  --lambda_grad_l1 "$LAMBDA_GRAD_L1"
-  --lambda_fourier_mag_l1 "$LAMBDA_FOURIER_MAG_L1"
-  --lambda_ce "$LAMBDA_CE"
-)
+if [[ -n "$ARGS_JSON" ]]; then
+  ARGS=(
+    --standalone
+    --nnodes=1
+    --nproc_per_node="$NUM_GPUS"
+    scripts/train_seismic_moe.py
+    --args "$ARGS_JSON"
+  )
+elif [[ -n "$CONFIG" ]]; then
+  ARGS=(
+    --standalone
+    --nnodes=1
+    --nproc_per_node="$NUM_GPUS"
+    scripts/train_seismic_moe.py
+    --config "$CONFIG"
+  )
+else
+  ARGS=(
+    --standalone
+    --nnodes=1
+    --nproc_per_node="$NUM_GPUS"
+    scripts/train_seismic_moe.py
+    --mode "$MODE"
+    --model_name "$MODEL_NAME"
+    --status_json "$STATUS_JSON"
+    --vis_freq "$VIS_FREQ"
+    --val_ratio "$VAL_RATIO"
+    --distributed
+    --num_workers "$NUM_WORKERS"
+    --seed "$SEED"
+    --top_k "$TOP_K"
+    --FNO_n_modes_height "$FNO_H"
+    --FNO_n_modes_width "$FNO_W"
+    --FNO_n_layers "$FNO_N_LAYERS"
+    --WNO_n_levels_height "$WNO_H"
+    --WNO_n_levels_width "$WNO_W"
+    --WNO_n_layers "$WNO_N_LAYERS"
+    --WNO_dropout_rate "$WNO_DROPOUT_RATE"
+    --wavelet_type "$WAVELET_TYPE"
+    --MNO_n_scales "$MNO_SCALES"
+    --MNO_n_layers "$MNO_LAYERS"
+    --LNO_n_layers "$LNO_LAYERS"
+    --k "$K"
+    --H_size "$H_SIZE"
+    --W_size "$W_SIZE"
+    --moe_method "$MOEMETHOD"
+    --hidden_channels "$HIDDEN_CHANNELS"
+    --backbone "$BACKBONE"
+    --target_size "$TARGET_SIZE"
+    --enc_channels "$ENC_C"
+    --learning_rate "$LEARNING_RATE"
+    --weight_decay "$WEIGHT_DECAY"
+    --lr_warmup_epochs "$LR_WARMUP"
+    --lr_warmup_factor "$LR_WARMUP_FACTOR"
+    --lr_warmup_method "$LR_WARMUP_METHOD"
+    --lr_scheduler_type "$LR_SCHEDULER_TYPE"
+    --scheduler_gamma "$SCHEDULER_GAMMA"
+    --lr_cosine_tmax_epochs "$LR_COSINE_TMAX_EPOCHS"
+    --lr_cosine_restart_t0_epochs "$LR_COSINE_RESTART_T0_EPOCHS"
+    --lr_cosine_restart_t_mult "$LR_COSINE_RESTART_T_MULT"
+    --lr_cosine_eta_min "$LR_COSINE_ETA_MIN"
+    --accum_steps "$ACCUM_STEPS"
+    --router_type "$ROUTER_TYPE"
+    --band_sharpness "$BAND_SHARPNESS"
+    --freq_affinity_sharpness "$FREQ_AFFINITY_SHARPNESS"
+    --fusion_type "$FUSION_TYPE"
+    --s_processor_type "$S_PROCESSOR_TYPE"
+    --w_processor_type "$W_PROCESSOR_TYPE"
+    --beta "$BETA"
+    --lambda_g1v "$LAMBDA_G1V"
+    --lambda_g2v "$LAMBDA_G2V"
+    --lambda_grad_l1 "$LAMBDA_GRAD_L1"
+    --lambda_fourier_mag_l1 "$LAMBDA_FOURIER_MAG_L1"
+    --lambda_ce "$LAMBDA_CE"
+  )
 
-# 仅在非空时追加，确保真正回退到 parser 默认值
-[[ -n "$DATA_DIR" ]] && ARGS+=( --data_dir "$DATA_DIR" )
-[[ -n "$ZARR_PATH" ]] && ARGS+=( --zarr_path "$ZARR_PATH" )
-[[ -n "$FAMILY" ]] && ARGS+=( --family "$FAMILY" )
-[[ -n "$BATCH_SIZE" ]] && ARGS+=( --batch_size "$BATCH_SIZE" )
-[[ -n "$TEST_BATCH_SIZE" ]] && ARGS+=( --test_batch_size "$TEST_BATCH_SIZE" )
-[[ -n "$EPOCHS" ]] && ARGS+=( --epochs "$EPOCHS" )
-[[ -n "$OUTPUT_DIR" ]] && ARGS+=( --output_dir "$OUTPUT_DIR" )
-[[ -n "$LOG_ROOT" ]] && ARGS+=( --log_root "$LOG_ROOT" )
-[[ -n "$N_TRAIN_SAMPLES" ]] && ARGS+=( --n_train_samples "$N_TRAIN_SAMPLES" )
-[[ -n "$N_TEST_SAMPLES" ]] && ARGS+=( --n_test_samples "$N_TEST_SAMPLES" )
-[[ -n "$CHANNEL_DIM" ]] && ARGS+=( --channel_dim "$CHANNEL_DIM" )
-[[ -n "$MOE_MODE" ]] && ARGS+=( --moe_mode "$MOE_MODE" )
-[[ -n "$ROUTER_HIDDEN_DIM" ]] && ARGS+=( --router_hidden_dim "$ROUTER_HIDDEN_DIM" )
-[[ -n "$ROUTER_ALPHA" ]] && ARGS+=( --router_alpha "$ROUTER_ALPHA" )
-[[ -n "$ROUTING_MODE" ]] && ARGS+=( --routing_mode "$ROUTING_MODE" )
-[[ -n "$USE_EXPERTS_PATH" ]] && ARGS+=( --use_experts_path "$USE_EXPERTS_PATH" )
-[[ -n "$MODEL_PATH" ]] && ARGS+=( --model_path "$MODEL_PATH" )
-[[ -n "$RESUME_PATH" ]] && ARGS+=( --resume_path "$RESUME_PATH" )
-[[ -n "$ENCODER_PATH" ]] && ARGS+=( --encoder_path "$ENCODER_PATH" )
-[[ -n "$V_TYPE_NUM" ]] && ARGS+=( --v_type_num "$V_TYPE_NUM" )
-[[ -n "$EARLY_STOP_PATIENCE" ]] && ARGS+=( --early_stop_patience "$EARLY_STOP_PATIENCE" )
-[[ -n "$EARLY_STOP_MIN_DELTA" ]] && ARGS+=( --early_stop_min_delta "$EARLY_STOP_MIN_DELTA" )
-[[ -n "$EARLY_STOP_WARMUP" ]] && ARGS+=( --early_stop_warmup_epochs "$EARLY_STOP_WARMUP" )
-[[ -n "$EVAL_INTERVAL" ]] && ARGS+=( --eval_interval "$EVAL_INTERVAL" )
+  # 仅在非空时追加，确保真正回退到 parser 默认值
+  [[ -n "$DATA_DIR" ]] && ARGS+=( --data_dir "$DATA_DIR" )
+  [[ -n "$ZARR_PATH" ]] && ARGS+=( --zarr_path "$ZARR_PATH" )
+  [[ -n "$FAMILY" ]] && ARGS+=( --family "$FAMILY" )
+  [[ -n "$BATCH_SIZE" ]] && ARGS+=( --batch_size "$BATCH_SIZE" )
+  [[ -n "$TEST_BATCH_SIZE" ]] && ARGS+=( --test_batch_size "$TEST_BATCH_SIZE" )
+  [[ -n "$EPOCHS" ]] && ARGS+=( --epochs "$EPOCHS" )
+  [[ -n "$OUTPUT_DIR" ]] && ARGS+=( --output_dir "$OUTPUT_DIR" )
+  [[ -n "$LOG_ROOT" ]] && ARGS+=( --log_root "$LOG_ROOT" )
+  [[ -n "$N_TRAIN_SAMPLES" ]] && ARGS+=( --n_train_samples "$N_TRAIN_SAMPLES" )
+  [[ -n "$N_TEST_SAMPLES" ]] && ARGS+=( --n_test_samples "$N_TEST_SAMPLES" )
+  [[ -n "$CHANNEL_DIM" ]] && ARGS+=( --channel_dim "$CHANNEL_DIM" )
+  [[ -n "$MOE_MODE" ]] && ARGS+=( --moe_mode "$MOE_MODE" )
+  [[ -n "$ROUTER_HIDDEN_DIM" ]] && ARGS+=( --router_hidden_dim "$ROUTER_HIDDEN_DIM" )
+  [[ -n "$ROUTER_ALPHA" ]] && ARGS+=( --router_alpha "$ROUTER_ALPHA" )
+  [[ -n "$ROUTING_MODE" ]] && ARGS+=( --routing_mode "$ROUTING_MODE" )
+  [[ -n "$USE_EXPERTS_PATH" ]] && ARGS+=( --use_experts_path "$USE_EXPERTS_PATH" )
+  [[ -n "$MODEL_PATH" ]] && ARGS+=( --model_path "$MODEL_PATH" )
+  [[ -n "$RESUME_PATH" ]] && ARGS+=( --resume_path "$RESUME_PATH" )
+  [[ -n "$ENCODER_PATH" ]] && ARGS+=( --encoder_path "$ENCODER_PATH" )
+  [[ -n "$V_TYPE_NUM" ]] && ARGS+=( --v_type_num "$V_TYPE_NUM" )
+  [[ -n "$EARLY_STOP_PATIENCE" ]] && ARGS+=( --early_stop_patience "$EARLY_STOP_PATIENCE" )
+  [[ -n "$EARLY_STOP_MIN_DELTA" ]] && ARGS+=( --early_stop_min_delta "$EARLY_STOP_MIN_DELTA" )
+  [[ -n "$EARLY_STOP_WARMUP" ]] && ARGS+=( --early_stop_warmup_epochs "$EARLY_STOP_WARMUP" )
+  [[ -n "$EVAL_INTERVAL" ]] && ARGS+=( --eval_interval "$EVAL_INTERVAL" )
 
-# 数组型参数：只有非空时才传，避免把空项传进去
-if [[ ${#CHOOSE_EXPERTS[@]} -gt 0 ]]; then
-  ARGS+=( --choose_experts "${CHOOSE_EXPERTS[@]}" )
-fi
+  # 数组型参数：只有非空时才传，避免把空项传进去
+  if [[ ${#CHOOSE_EXPERTS[@]} -gt 0 ]]; then
+    ARGS+=( --choose_experts "${CHOOSE_EXPERTS[@]}" )
+  fi
 
-if [[ ${#MILESTONES[@]} -gt 0 ]]; then
-  ARGS+=( --milestones "${MILESTONES[@]}" )
-fi
+  if [[ ${#MILESTONES[@]} -gt 0 ]]; then
+    ARGS+=( --milestones "${MILESTONES[@]}" )
+  fi
 
-if [[ ${#MNO_FACTORS[@]} -gt 0 ]]; then
-  ARGS+=( --MNO_scale_factors "${MNO_FACTORS[@]}" )
-fi
+  if [[ ${#MNO_FACTORS[@]} -gt 0 ]]; then
+    ARGS+=( --MNO_scale_factors "${MNO_FACTORS[@]}" )
+  fi
 
-if [[ ${#LNO_MODES[@]} -gt 0 ]]; then
-  ARGS+=( --LNO_n_modes "${LNO_MODES[@]}" )
-fi
+  if [[ ${#LNO_MODES[@]} -gt 0 ]]; then
+    ARGS+=( --LNO_n_modes "${LNO_MODES[@]}" )
+  fi
 
-if [[ ${#DTCWT_TYPE[@]} -eq 2 ]]; then
-  ARGS+=( --dtcwt_type "${DTCWT_TYPE[@]}" )
+  if [[ ${#DTCWT_TYPE[@]} -eq 2 ]]; then
+    ARGS+=( --dtcwt_type "${DTCWT_TYPE[@]}" )
+  fi
 fi
 
 # 布尔开关参数

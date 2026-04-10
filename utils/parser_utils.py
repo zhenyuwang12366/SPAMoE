@@ -1,4 +1,8 @@
 import argparse
+import json
+import sys
+from pathlib import Path
+
 from config.seismic_moe_config import SPECIFIC_TYPE_VARIANTS
 
 # ====== 数据系列（family）可选项构建 ======
@@ -10,13 +14,133 @@ _FAMILY_CHOICES = ['vel', 'style', 'fault', 'all']
 _FAMILY_CHOICES.extend(sorted(_SPECIFIC_BASE_FAMILIES | _SPECIFIC_VARIANT_FAMILIES))
 
 
+def _normalize_argv(argv=None) -> list[str]:
+    if argv is None:
+        return list(sys.argv[1:])
+    return list(argv)
+
+
+def _load_json_payload(file_path: str) -> dict:
+    path = Path(file_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"JSON 文件不存在: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON 文件顶层必须是 object: {path}")
+    return payload
+
+
+def _resolve_payload_defaults(
+    parser: argparse.ArgumentParser,
+    raw_config: dict,
+    *,
+    ignore_unknown_keys: set[str] | None = None,
+) -> tuple[dict, set[str]]:
+    if not raw_config:
+        return {}, set()
+    ignore_unknown_keys = ignore_unknown_keys or set()
+
+    actions_by_dest = {}
+    actions_by_option = {}
+    for action in parser._actions:
+        if not action.dest or action.dest == "help":
+            continue
+        actions_by_dest[action.dest] = action
+        for option_string in action.option_strings:
+            if option_string.startswith("--"):
+                actions_by_option[option_string.lstrip("-")] = action
+
+    normalized = {}
+    specified_dests = set()
+    unknown_keys = []
+
+    for raw_key, value in raw_config.items():
+        key = str(raw_key).lstrip("-")
+        action = actions_by_dest.get(key)
+        from_option_alias = False
+
+        if action is None:
+            action = actions_by_option.get(key)
+            from_option_alias = action is not None
+
+        if action is None:
+            if str(raw_key) in ignore_unknown_keys or key in ignore_unknown_keys:
+                continue
+            unknown_keys.append(str(raw_key))
+            continue
+
+        dest = action.dest
+        if dest in normalized:
+            raise ValueError(f"配置文件中存在重复参数映射到同一字段: {raw_key} -> {dest}")
+
+        if from_option_alias and isinstance(action, argparse._StoreTrueAction):
+            normalized[dest] = bool(value)
+        elif from_option_alias and isinstance(action, argparse._StoreFalseAction):
+            normalized[dest] = not bool(value)
+        else:
+            normalized[dest] = value
+
+        specified_dests.add(dest)
+
+    if unknown_keys:
+        raise ValueError(f"配置文件包含未知参数: {sorted(unknown_keys)}")
+
+    return normalized, specified_dests
+
+
+def _collect_user_specified_args(
+    parser: argparse.ArgumentParser,
+    argv: list[str],
+    config_specified_dests: set[str],
+) -> set[str]:
+    option_to_dest = {}
+    for action in parser._actions:
+        if not action.dest or action.dest == "help":
+            continue
+        for option_string in action.option_strings:
+            option_to_dest[option_string] = action.dest
+
+    specified = set(config_specified_dests)
+    for token in argv:
+        if token == "--":
+            break
+        option = token.split("=", 1)[0]
+        dest = option_to_dest.get(option)
+        if dest is not None:
+            specified.add(dest)
+
+    return specified
+
+
 def build_argparser_and_parse(argv=None) -> argparse.Namespace:
     """
     构建命令行参数解析器：
     - 支持地震数据 FNO/WNO/MNO/LNO + MoE 的训练与推理
     - 大量参数通过配置文件默认给出，这里可以覆盖
     """
+    argv = _normalize_argv(argv)
+
+    bootstrap_parser = argparse.ArgumentParser(add_help=False)
+    bootstrap_parser.add_argument(
+        "--config", type=str, default=None,
+        help="JSON 配置文件路径，文件中的参数会先作为默认值加载，再由命令行显式参数覆盖"
+    )
+    bootstrap_parser.add_argument(
+        "--args", dest="args_file", type=str, default=None,
+        help="args.json 路径，提供后将直接用文件内容构造训练参数，不使用其它命令行参数覆盖"
+    )
+    bootstrap_args, _ = bootstrap_parser.parse_known_args(argv)
+
     parser = argparse.ArgumentParser(description="地震数据 MOE 训练和推理")
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="JSON 配置文件路径，文件中的参数会先作为默认值加载，再由命令行显式参数覆盖"
+    )
+    parser.add_argument(
+        "--args", dest="args_file", type=str, default=None,
+        help="args.json 路径，提供后将直接用文件内容构造训练参数，不使用其它命令行参数覆盖"
+    )
 
     # ------------------------------------------------------------------
     #  A. 运行模式 & 基本设置
@@ -170,7 +294,7 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
         help='基础学习率（可覆盖配置文件）'
     )
     parser.add_argument(
-        '--weight_decay', type=float, default=0.05,
+        '--weight_decay', type=float, default=1e-4,
         help='L2 正则化系数（weight decay）'
     )
     parser.add_argument(
@@ -206,7 +330,7 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
         help='MultiStepLR 的学习率衰减里程碑（按 epoch 计）'
     )
     parser.add_argument(
-        '--scheduler_gamma', type=float, default=0.3,
+        '--scheduler_gamma', type=float, default=0.2,
         help='MultiStepLR 的学习率衰减因子'
     )
 
@@ -560,6 +684,35 @@ def build_argparser_and_parse(argv=None) -> argparse.Namespace:
     # ------------------------------------------------------------------
     #  解析参数并回传 parser
     # ------------------------------------------------------------------
-    args = parser.parse_args(argv)
+    config_specified_dests = set()
+    effective_argv = argv
+    if bootstrap_args.args_file is not None:
+        args_payload = _load_json_payload(bootstrap_args.args_file)
+        args_defaults, config_specified_dests = _resolve_payload_defaults(
+            parser,
+            args_payload,
+            ignore_unknown_keys={"parser", "user_specified_args"},
+        )
+        parser.set_defaults(**args_defaults)
+        args_file_path = str(Path(bootstrap_args.args_file).expanduser())
+        parser.set_defaults(args_file=args_file_path, config=None)
+        # args.json 一旦提供，训练参数完全以 JSON 为准，并优先于 --config。
+        effective_argv = ["--args", args_file_path]
+    elif bootstrap_args.config is not None:
+        config_payload = _load_json_payload(bootstrap_args.config)
+        config_defaults, config_specified_dests = _resolve_payload_defaults(parser, config_payload)
+        parser.set_defaults(**config_defaults)
+        config_path = str(Path(bootstrap_args.config).expanduser())
+        parser.set_defaults(config=config_path)
+        # 配置文件一旦提供，训练参数完全以 JSON 为准，不接受其它 CLI 覆盖。
+        effective_argv = ["--config", config_path]
+
+    args = parser.parse_args(effective_argv)
+    if bootstrap_args.config is not None:
+        args.user_specified_args = sorted(config_specified_dests)
+    else:
+        args.user_specified_args = sorted(
+            _collect_user_specified_args(parser, argv, config_specified_dests)
+        )
     args.parser = parser
     return args

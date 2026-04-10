@@ -141,7 +141,12 @@ def get_seismic_config(args: argparse.Namespace):
     accum_steps = config.accum_steps
     use_amp = config.use_amp
     
-    if '--lr_warmup_epochs' not in sys.argv:
+    user_specified_args = getattr(args, "user_specified_args", set())
+    if isinstance(user_specified_args, str):
+        user_specified_args = set()
+    else:
+        user_specified_args = set(user_specified_args)
+    if 'lr_warmup_epochs' not in user_specified_args:
         config.lr_warmup_epochs = max(1, int(config.epochs * 0.05))
     
     if is_logger:
