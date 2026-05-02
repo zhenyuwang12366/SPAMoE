@@ -93,3 +93,10 @@ marmousi/
 *.pth
 *.npy
 *.safetensors
+pretrain_weight/
+results/
+marmousi/
+*.pt
+*.pth
+*.npy
+*.safetensors
