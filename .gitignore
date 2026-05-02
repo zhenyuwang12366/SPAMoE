@@ -86,3 +86,10 @@ pretrain_weight/
 marmousi/
 
 runs/
+pretrain_weight/
+results/
+marmousi/
+*.pt
+*.pth
+*.npy
+*.safetensors
