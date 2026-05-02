@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ================================
-# 默认参数（以 parser_utils 为准）
+# Defaults (see parser_utils for authoritative CLI defaults)
 # ================================
 MODE="train"                     # train / inference / train_encoder
 NUM_GPUS=2
@@ -30,7 +30,7 @@ N_TEST_SAMPLES=""
 CHANNEL_DIM=""
 CONCAT_CHANNELS=""
 
-# 训练超参
+# Training hyperparameters
 LEARNING_RATE=1e-4
 WEIGHT_DECAY=1e-4
 LR_WARMUP=5
@@ -49,7 +49,7 @@ LAMBDA_GRAD_L1=0.15
 LAMBDA_FOURIER_MAG_L1=0.1
 LAMBDA_CE=0.2
 
-# 预处理与路由/MoE
+# Preprocessing / routing / MoE
 K=1
 TOP_K=1
 CHOOSE_EXPERTS=()
@@ -73,7 +73,7 @@ MNO_LAYERS=3
 LNO_MODES=(16 16)
 LNO_LAYERS=3
 
-# 模型结构 / MoE 融合相关
+# Model structure / MoE fusion
 MOEMETHOD="afmoe"
 HIDDEN_CHANNELS=64
 USE_EXPERTS_PATH=""
@@ -104,12 +104,12 @@ ENCODER_PATH=""
 TARGET_SIZE=70
 ENC_C=128
 
-# 推理/恢复
+# Inference / resume
 MODEL_PATH=""
 RESUME_PATH=""
 LOG_ROOT=""
 
-# 性能统计
+# Profiling
 PROFILE_TIMING=0
 IS_RESIZE=0
 H_SIZE=256
@@ -123,7 +123,7 @@ EVAL_INTERVAL=""
 VERBOSE=""
 
 # ================================
-# 解析命令行参数
+# Parse CLI
 # ================================
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -249,20 +249,20 @@ while [[ $# -gt 0 ]]; do
     --quiet) VERBOSE=0; shift ;;
 
     *)
-      echo "未知参数: $1"
+      echo "Unknown argument: $1"
       exit 1 ;;
   esac
 done
 
 # ================================
-# 目录准备
+# Prepare dirs
 # ================================
 if [[ -z "$CONFIG" && -z "$ARGS_JSON" ]]; then
   mkdir -p "$OUTPUT_DIR"
 fi
 
 # ================================
-# 自动补全逻辑
+# Infer early-stop flags from related options
 # ================================
 if [[ $EARLY_STOP -eq 0 ]]; then
   if [[ -n "$EARLY_STOP_PATIENCE" || -n "$EARLY_STOP_MIN_DELTA" || -n "$EARLY_STOP_WARMUP" ]]; then
@@ -271,7 +271,7 @@ if [[ $EARLY_STOP -eq 0 ]]; then
 fi
 
 # ================================
-# 展示辅助变量
+# Human-readable flags for logging
 # ================================
 if [[ "$CONCAT_CHANNELS" == "1" ]]; then
   CONCAT_DISPLAY="enabled"
@@ -337,55 +337,55 @@ MOE_MODE_DISPLAY="${MOE_MODE:-<parser_default>}"
 ROUTING_MODE_DISPLAY="${ROUTING_MODE:-<parser_default>}"
 
 # ================================
-# 打印配置
+# Print resolved config
 # ================================
-echo "启动分布式训练/推理，配置如下："
+echo "Launching distributed train/infer with:"
 if [[ -n "$ARGS_JSON" && -n "$CONFIG" ]]; then
-echo "Args 模式: enabled"
-echo "Args 路径: $ARGS_JSON"
-echo "Config 路径: $CONFIG"
-echo "GPU数量: $NUM_GPUS"
-echo "--args 与 --config 同时提供时，优先使用 args.json。"
-echo "其余训练参数以 args.json 为准，命令行参数不会覆盖。"
+echo "Args mode: enabled"
+echo "Args path: $ARGS_JSON"
+echo "Config path: $CONFIG"
+echo "Num GPUs: $NUM_GPUS"
+echo "When both --args and --config are set, args.json takes precedence."
+echo "Other training fields come from args.json; CLI does not override."
 elif [[ -n "$ARGS_JSON" ]]; then
-echo "Args 模式: enabled"
-echo "Args 路径: $ARGS_JSON"
-echo "GPU数量: $NUM_GPUS"
-echo "其余训练参数以 args.json 为准，命令行参数不会覆盖。"
+echo "Args mode: enabled"
+echo "Args path: $ARGS_JSON"
+echo "Num GPUs: $NUM_GPUS"
+echo "Training fields come from args.json; CLI does not override."
 elif [[ -n "$CONFIG" ]]; then
-echo "Config 模式: enabled"
-echo "Config 路径: $CONFIG"
-echo "GPU数量: $NUM_GPUS"
-echo "其余训练参数以 JSON 为准，命令行参数不会覆盖。"
+echo "Config mode: enabled"
+echo "Config path: $CONFIG"
+echo "Num GPUs: $NUM_GPUS"
+echo "Training fields come from JSON; CLI does not override."
 else
 echo "Mode: $MODE"
-echo "GPU数量: $NUM_GPUS"
-echo "数据目录: ${DATA_DIR:-<parser_default>}"
-echo "Zarr数据集路径: ${ZARR_PATH:-<parser_default>}"
-echo "数据集统计量json: $STATUS_JSON"
-echo "数据系列: ${FAMILY:-<parser_default>}"
-echo "模型名称: $MODEL_NAME"
-echo "批次大小: ${BATCH_SIZE:-<parser_default>}"
-echo "测试批次大小: ${TEST_BATCH_SIZE:-<parser_default>}"
-echo "训练轮数: ${EPOCHS:-<parser_default>}"
-echo "输出目录: $OUTPUT_DIR"
-echo "TensorBoard 日志根目录: ${LOG_ROOT:-<parser_default>}"
-echo "可视化频率: $VIS_FREQ"
-echo "使用WandB: $USE_WANDB"
-echo "使用AMP: $USE_AMP"
+echo "Num GPUs: $NUM_GPUS"
+echo "Data dir: ${DATA_DIR:-<parser_default>}"
+echo "Zarr path: ${ZARR_PATH:-<parser_default>}"
+echo "Dataset stats JSON: $STATUS_JSON"
+echo "Family: ${FAMILY:-<parser_default>}"
+echo "Model name: $MODEL_NAME"
+echo "Batch size: ${BATCH_SIZE:-<parser_default>}"
+echo "Test batch size: ${TEST_BATCH_SIZE:-<parser_default>}"
+echo "Epochs: ${EPOCHS:-<parser_default>}"
+echo "Output dir: $OUTPUT_DIR"
+echo "TensorBoard log root: ${LOG_ROOT:-<parser_default>}"
+echo "Vis frequency: $VIS_FREQ"
+echo "WandB: $USE_WANDB"
+echo "AMP: $USE_AMP"
 echo "Mixed Precision override: $MIXED_PRECISION_DISPLAY"
-echo "验证集比例: $VAL_RATIO"
+echo "Val ratio: $VAL_RATIO"
 echo "Num Workers: $NUM_WORKERS"
 echo "Seed: $SEED"
-echo "训练/测试子集: train=${N_TRAIN_SAMPLES:-<parser_default>}, test=${N_TEST_SAMPLES:-<parser_default>}"
+echo "Train/test subset: train=${N_TRAIN_SAMPLES:-<parser_default>}, test=${N_TEST_SAMPLES:-<parser_default>}"
 echo "Channel dim override: ${CHANNEL_DIM:-<parser_default>}, concat_channels: $CONCAT_DISPLAY"
-echo "是否Resize输入: $IS_RESIZE, H_size: $H_SIZE, W_size: $W_SIZE"
-echo "梯度累计步数: $ACCUM_STEPS"
-echo "OneCycle 调度: $ONECYCLE_DISPLAY"
-echo "早停: $EARLY_STOP_DISPLAY (patience=${EARLY_STOP_PATIENCE:-<parser_default>}, min_delta=${EARLY_STOP_MIN_DELTA:-<parser_default>}, warmup=${EARLY_STOP_WARMUP:-<parser_default>})"
-echo "验证间隔: ${EVAL_INTERVAL:-<parser_default>}"
-echo "日志输出模式: $VERBOSE_DISPLAY"
-echo "学习率: $LEARNING_RATE"
+echo "Resize input: $IS_RESIZE, H_size: $H_SIZE, W_size: $W_SIZE"
+echo "Gradient accumulation steps: $ACCUM_STEPS"
+echo "OneCycle: $ONECYCLE_DISPLAY"
+echo "Early stop: $EARLY_STOP_DISPLAY (patience=${EARLY_STOP_PATIENCE:-<parser_default>}, min_delta=${EARLY_STOP_MIN_DELTA:-<parser_default>}, warmup=${EARLY_STOP_WARMUP:-<parser_default>})"
+echo "Eval interval: ${EVAL_INTERVAL:-<parser_default>}"
+echo "Log verbosity: $VERBOSE_DISPLAY"
+echo "Learning rate: $LEARNING_RATE"
 echo "WeightDecay: $WEIGHT_DECAY"
 echo "LR Warmup(Epochs): $LR_WARMUP"
 echo "LR Warmup Factor: $LR_WARMUP_FACTOR"
@@ -398,9 +398,9 @@ echo "Cosine Restart T0 (epochs): $LR_COSINE_RESTART_T0_EPOCHS"
 echo "Cosine Restart T_mult: $LR_COSINE_RESTART_T_MULT"
 echo "Cosine Eta Min: $LR_COSINE_ETA_MIN"
 echo "Loss λ_g1v: $LAMBDA_G1V, λ_g2v: $LAMBDA_G2V, λ_grad_l1: $LAMBDA_GRAD_L1, λ_fourier_mag_l1: $LAMBDA_FOURIER_MAG_L1, λ_ce: $LAMBDA_CE"
-echo "数据预处理缩放因子 k: $K"
-echo "Top-K 专家数: $TOP_K"
-echo "专家选择: ${CHOOSE_EXPERTS[*]:-<parser_default>}"
+echo "Input preprocess scale k: $K"
+echo "Top-K experts: $TOP_K"
+echo "Chosen experts: ${CHOOSE_EXPERTS[*]:-<parser_default>}"
 echo "FNO(H,W,layers): ($FNO_H, $FNO_W, $FNO_N_LAYERS)"
 echo "WNO(levels H,W): ($WNO_H, $WNO_W)"
 echo "WNO(n_layers, dropout, wavelet): ($WNO_N_LAYERS, $WNO_DROPOUT_RATE, $WAVELET_TYPE)"
@@ -411,7 +411,7 @@ echo "MoE Method: $MOEMETHOD"
 echo "Hidden Channels: $HIDDEN_CHANNELS"
 echo "Use Experts Path: ${USE_EXPERTS_PATH:-<None>}"
 echo "Use MoE: $USE_MOE"
-echo "MoE 模式: $MOE_MODE_DISPLAY"
+echo "MoE mode: $MOE_MODE_DISPLAY"
 echo "Router Type: $ROUTER_TYPE"
 echo "Router Hidden Dim: ${ROUTER_HIDDEN_DIM:-<parser_default>}"
 echo "Router Alpha (afmoe): ${ROUTER_ALPHA:-<parser_default>}"
@@ -420,7 +420,7 @@ echo "Freq band metrics: $ENABLE_FREQ_METRICS"
 echo "Fusion Type: $FUSION_TYPE"
 echo "Strong-Group Processor: $S_PROCESSOR_TYPE"
 echo "Weak-Group Processor: $W_PROCESSOR_TYPE"
-echo "Beta(强弱激活): $BETA"
+echo "Beta (strong/weak gating): $BETA"
 echo "Noisy gating: $NOISY_GATING_DISPLAY"
 echo "GPU proxy: $GPU_PROXY_DISPLAY"
 echo "Encoder: $USE_ENCODER_DISPLAY"
@@ -430,13 +430,13 @@ echo "Enc channels: $ENC_C"
 echo "Encoder Checkpoint: ${ENCODER_PATH:-<None>}"
 echo "is_specific: $IS_SPECIFIC, is_classifier: $IS_CLASSIFIER"
 echo "v_type_num: ${V_TYPE_NUM:-<parser_default>}"
-echo "Model Path(仅 inference 用): ${MODEL_PATH:-<None>}"
+echo "Model path (inference only): ${MODEL_PATH:-<None>}"
 echo "ResumePath: ${RESUME_PATH:-<None>}"
 echo "Profile Timing: $PROFILE_TIMING"
 fi
 
 # ================================
-# 构建 torchrun 参数
+# Build torchrun argv
 # ================================
 if [[ -n "$ARGS_JSON" ]]; then
   ARGS=(
@@ -514,7 +514,7 @@ else
     --lambda_ce "$LAMBDA_CE"
   )
 
-  # 仅在非空时追加，确保真正回退到 parser 默认值
+  # Append only when set so parser defaults apply
   [[ -n "$DATA_DIR" ]] && ARGS+=( --data_dir "$DATA_DIR" )
   [[ -n "$ZARR_PATH" ]] && ARGS+=( --zarr_path "$ZARR_PATH" )
   [[ -n "$FAMILY" ]] && ARGS+=( --family "$FAMILY" )
@@ -540,7 +540,7 @@ else
   [[ -n "$EARLY_STOP_WARMUP" ]] && ARGS+=( --early_stop_warmup_epochs "$EARLY_STOP_WARMUP" )
   [[ -n "$EVAL_INTERVAL" ]] && ARGS+=( --eval_interval "$EVAL_INTERVAL" )
 
-  # 数组型参数：只有非空时才传，避免把空项传进去
+  # List args: pass only if non-empty
   if [[ ${#CHOOSE_EXPERTS[@]} -gt 0 ]]; then
     ARGS+=( --choose_experts "${CHOOSE_EXPERTS[@]}" )
   fi
@@ -562,7 +562,7 @@ else
   fi
 fi
 
-# 布尔开关参数
+# Boolean toggles
 if [[ "$CONCAT_CHANNELS" == "1" ]]; then
   ARGS+=( --concat_channels )
 elif [[ "$CONCAT_CHANNELS" == "0" ]]; then
@@ -616,8 +616,8 @@ fi
 [[ "$ENABLE_FREQ_METRICS" -eq 1 ]] && ARGS+=( --enable_freq_metrics )
 
 # ================================
-# 启动
+# Launch
 # ================================
 torchrun "${ARGS[@]}"
 
-echo "分布式流程结束！"
+echo "Distributed launcher finished."

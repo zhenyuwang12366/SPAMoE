@@ -1,15 +1,17 @@
-# 从头开始训练流程
+# Train from scratch workflow
 
-这份 README 对应当前仓库的地震数据训练流程，包含 4 个入口：
+Download and arrange raw data from the **OpenFWI** site as documented: **[OpenFWI dataset documentation](https://openfwi-lanl.github.io/docs/data.html)**. The project root [README.md](README.md) links Hugging Face pretrained backbones (DINOv3 ViT / ConvNeXt) and how to place files under `pretrain_weight/`.
 
-- `load_to_zarr.sh`：把 OpenFWI 风格目录转换成 zarr
-- `school.sh`：用 `sbatch` 提交训练
-- `school_local.sh`：不使用 `sbatch`，直接本地启动训练
-- `run_from_scratch.sh`：一键完成“转 zarr + 启动训练”
+This README describes the current seismic training pipeline in this repository: **four entry scripts** (miscellaneous `submit_*.sh` / `ddp_*.sh` wrappers were removed—use the scripts below and edit the Slurm header in `school.sh` when needed):
 
-## 1. 数据目录要求
+- `load_to_zarr.sh`: convert an OpenFWI-style directory to Zarr
+- `school.sh`: submit training with `sbatch` (`#SBATCH` configured in-file)
+- `school_local.sh`: run training locally without `sbatch`
+- `run_from_scratch.sh`: one-shot “convert to Zarr + launch training”
 
-原始数据根目录必须至少满足：
+## 1. Data directory layout
+
+The raw data root must at minimum look like:
 
 ```text
 XXX/
@@ -24,14 +26,14 @@ XXX/
 │   ├── FlatFault_B/
 │   ├── Style_A/
 │   └── Style_B/
-└── test/                  # 可选
+└── test/                  # optional
 ```
 
-重点是 `XXX/train_samples` 必须存在，否则转换脚本会直接报错。
+The key requirement is that `XXX/train_samples` exists; otherwise the conversion script errors out immediately.
 
-## 2. family 命名说明
+## 2. `family` naming
 
-训练脚本内部最终使用这些 family 名称：
+Training ultimately uses these family names:
 
 - `curve_vel_a`
 - `curve_vel_b`
@@ -44,14 +46,14 @@ XXX/
 - `style_style_a`
 - `style_style_b`
 
-为了兼容你的使用习惯，下面这些别名也可以直接传：
+For convenience, these aliases are accepted:
 
-- `style_a` 会自动映射成 `style_style_a`
-- `style_b` 会自动映射成 `style_style_b`
+- `style_a` maps to `style_style_a`
+- `style_b` maps to `style_style_b`
 
-## 3. 第一步：转换成 zarr
+## 3. Step 1: convert to Zarr
 
-最直接的用法：
+Minimal usage:
 
 ```bash
 bash load_to_zarr.sh \
@@ -60,18 +62,18 @@ bash load_to_zarr.sh \
   --family curve_vel_b
 ```
 
-常用附加参数：
+Common extra flags:
 
-- `--include_test 0|1`：单 family 转换时是否把 `test/` 里的无标签样本也写进去，默认 `0`
-- `--remap_single_label 0|1`：单 family 时是否把标签重映射到 `0`，默认 `0`
-- `--chunks 32`：zarr chunk 大小
+- `--include_test 0|1`: when converting a single family, whether to include unlabeled samples from `test/` in the Zarr (default `0`)
+- `--remap_single_label 0|1`: for a single family, whether to remap labels to `0` (default `0`)
+- `--chunks 32`: Zarr chunk size
 - `--dtype float32|float16`
-- `--concat_channels 1`：默认把 `[5,1000,70]` 拼成 `[1,1000,350]`
-- `--conda_env FWINO`：可选，自动激活 conda 环境
+- `--concat_channels 1`: by default concat `[5,1000,70]` into `[1,1000,350]`
+- `--conda_env FWINO`: optional, auto-activate the Conda environment
 
-## 4. 第二步：启动训练
+## 4. Step 2: launch training
 
-### 用 `school.sh` 通过 `sbatch` 启动
+### Submit with `sbatch` via `school.sh`
 
 ```bash
 sbatch school.sh \
@@ -80,7 +82,7 @@ sbatch school.sh \
   --preset preset1
 ```
 
-如果集群要求显式指定分区或 GPU 资源，直接在提交时覆盖即可，例如：
+If your cluster requires an explicit partition or GPU reservation, override at submit time, e.g.:
 
 ```bash
 sbatch --partition=gpu --gres=gpu:2 school.sh \
@@ -89,7 +91,7 @@ sbatch --partition=gpu --gres=gpu:2 school.sh \
   --preset preset1
 ```
 
-### 不使用 `sbatch`，直接本地启动
+### Run locally without `sbatch`
 
 ```bash
 bash school_local.sh \
@@ -98,7 +100,7 @@ bash school_local.sh \
   --preset preset1
 ```
 
-如果要继续加训练参数，用 `--` 之后透传：
+To pass extra training arguments after the script’s own flags, use `--` and forward them:
 
 ```bash
 bash school_local.sh \
@@ -108,9 +110,9 @@ bash school_local.sh \
   -- --eval_interval 2 --early_stop --early_stop_patience 20
 ```
 
-## 5. 一键完整流程
+## 5. End-to-end one-shot
 
-### 本地从头跑
+### Local from scratch
 
 ```bash
 bash run_from_scratch.sh \
@@ -121,7 +123,7 @@ bash run_from_scratch.sh \
   --preset preset1
 ```
 
-### 通过 `sbatch` 从头跑
+### From scratch with `sbatch`
 
 ```bash
 bash run_from_scratch.sh \
@@ -132,11 +134,11 @@ bash run_from_scratch.sh \
   --preset preset1
 ```
 
-## 6. 开始训练的推荐步骤
+## 6. Recommended startup sequence
 
-### 方案 A：分两步执行
+### Plan A: two steps
 
-1. 转 zarr
+1. Convert to Zarr
 
 ```bash
 bash load_to_zarr.sh \
@@ -145,7 +147,7 @@ bash load_to_zarr.sh \
   --family curve_vel_b
 ```
 
-2. 启动训练
+2. Launch training
 
 ```bash
 bash school_local.sh \
@@ -154,7 +156,7 @@ bash school_local.sh \
   --preset preset1
 ```
 
-### 方案 B：一条命令直接跑完
+### Plan B: single command
 
 ```bash
 bash run_from_scratch.sh \
@@ -164,9 +166,9 @@ bash run_from_scratch.sh \
   --preset preset1
 ```
 
-## 7. 默认训练基线
+## 7. Default training baseline
 
-如果你不选 preset，那么 `school.sh` / `school_local.sh` 只会补这几个必要参数：
+If you omit a preset, `school.sh` / `school_local.sh` only inject these essentials:
 
 - `--mode train`
 - `--num_gpus 2`
@@ -177,7 +179,7 @@ bash run_from_scratch.sh \
 - `--seed 0`
 - `--output_dir ./exp/runs/<family>_default_s0`
 
-其余训练参数会回退到仓库默认值，例如：
+Everything else falls back to repository defaults, for example:
 
 - `batch_size=8`
 - `epochs=100`
@@ -188,9 +190,9 @@ bash run_from_scratch.sh \
 - `band_sharpness=20`
 - `freq_affinity_sharpness=10`
 
-## 8. 六个 family 的两组候选增强配置
+## 8. Two preset candidates for six families
 
-下面列出的都是相对于默认参数的“覆盖项”。`preset1` 偏稳妥，`preset2` 偏大模型和更强正则，通常更值得优先尝试，但显存占用也更高。
+The lists below are **overrides** relative to defaults. `preset1` is conservative; `preset2` uses larger models and stronger regularization—often worth trying first if you have headroom—but uses more VRAM.
 
 ### `style_a` / `style_style_a`
 
@@ -408,9 +410,9 @@ bash run_from_scratch.sh \
 - `--lambda_grad_l1 0.14`
 - `--lambda_fourier_mag_l1 0.14`
 
-## 9. 直接套用 preset 的命令
+## 9. Commands applying presets directly
 
-例如 `curve_vel_b`：
+Example for `curve_vel_b`:
 
 ```bash
 bash school_local.sh \
@@ -419,7 +421,7 @@ bash school_local.sh \
   --preset preset1
 ```
 
-例如 `style_a`：
+Example for `style_a`:
 
 ```bash
 bash school_local.sh \
@@ -428,9 +430,9 @@ bash school_local.sh \
   --preset preset2
 ```
 
-## 10. 建议
+## 10. Tips
 
-- 先用 `preset1` 跑通，再尝试 `preset2`
-- `preset2` 显存压力更大，如果 OOM，先降 `batch_size`
-- 如果是本地单机调试，优先 `school_local.sh`
-- 如果是集群正式训练，优先 `school.sh` + `sbatch`
+- Start with `preset1` for a smoke run, then try `preset2`
+- `preset2` uses more VRAM; on OOM, lower `batch_size` first
+- For single-machine debugging, prefer `school_local.sh`
+- For cluster production jobs, prefer `school.sh` + `sbatch`

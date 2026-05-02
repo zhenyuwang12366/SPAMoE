@@ -1,18 +1,19 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-将 LaMO 的六个 PDE 任务数据转换为 HDF5 文件，方便在 FWINO/EMO 里直接使用。
+Convert LaMO's six PDE task datasets to HDF5 for direct use in FWINO/EMO.
 
-支持的任务：
+Supported tasks:
   - pipe        : Pipe_X / Pipe_Y / Pipe_Q.npy -> input[2,H,W], output[1,H,W]
   - airfoil     : NACA_Cylinder_X/Y/Q.npy      -> input[2,221,51], output[1,221,51]
   - darcy       : piececonst_r421_*.mat        -> input/output[1,s,s]
   - navier      : NavierStokes_V1e-5_N1200_T20.mat -> input[T_in,h,h], output[T_out,h,h]
-  - plasticity  : plas_N987_T20.mat -> input[1,H,W], output[4*T,H,W]（时间展平到通道），额外写 pos、time
+  - plasticity  : plas_N987_T20.mat -> input[1,H,W], output[4*T,H,W] (time flattened to channels);
+                  also writes pos and time
 
-注意：
-  - plasticity 改为规则网格 BCHW（时间展平成通道）。
-  - 本脚本生成的 HDF5 至少包含 input/output 两个 dataset，并额外写出 *_stats.json 供归一化使用。
+Notes:
+  - plasticity uses a regular BCHW grid (time flattened into channels).
+  - Output HDF5 files contain at least input/output datasets and a sidecar *_stats.json for normalization.
 """
 
 import argparse
@@ -33,9 +34,9 @@ def _save_h5_with_stats(
     stats: Dict[str, float] | None = None,
 ) -> Dict[str, float]:
     """
-    写入 h5 并保存 min/max 统计到 attrs 和旁边的 json。
-    若传入 stats 则复用同一组（用于全量统计），否则按当前数组计算。
-    返回实际写入的 stats。
+    Write HDF5 and save min/max stats to attrs and a sidecar JSON.
+    If ``stats`` is provided, reuse it (for global statistics); otherwise compute from current arrays.
+    Returns the stats actually written.
     """
     if stats is None:
         stats = {
@@ -66,14 +67,14 @@ def _save_h5_with_stats(
 def _split_indices(N: int, train_ratio: float, val_ratio: float, test_ratio: float, seed: int = 42):
     total = train_ratio + val_ratio + test_ratio
     if not np.isclose(total, 1.0):
-        raise ValueError(f"train/val/test 比例之和必须为 1，目前为 {total:.4f}")
+        raise ValueError(f"train/val/test ratios must sum to 1, got {total:.4f}")
     rng = np.random.default_rng(seed)
     perm = rng.permutation(N)
     n_train = int(N * train_ratio)
     n_val = int(N * val_ratio)
     n_test = N - n_train - n_val
     if n_train <= 0 or n_test <= 0:
-        raise ValueError(f"样本数 N={N} 太小或比例设置不合理: train={n_train}, val={n_val}, test={n_test}")
+        raise ValueError(f"N={N} is too small or ratios are invalid: train={n_train}, val={n_val}, test={n_test}")
     idx_train = perm[:n_train]
     idx_val = perm[n_train:n_train + n_val]
     idx_test = perm[n_train + n_val:]
@@ -92,7 +93,7 @@ def _write_split_files(
     seed: int = 42,
     stats_full: Dict[str, float] | None = None,
 ):
-    """根据比例划分并写出 train/val/test 三个文件，附带 pos/time（若提供），stats 复用全量统计。"""
+    """Split by ratio and write train/val/test files; include pos/time if provided; reuse global stats."""
     idx_train, idx_val, idx_test = _split_indices(input_arr.shape[0], train_ratio, val_ratio, test_ratio, seed)
     splits = {
         "train": idx_train,
@@ -112,7 +113,7 @@ def _write_split_files(
 
 
 def _downsample_hw(arr: np.ndarray, r1: int, r2: int) -> np.ndarray:
-    """按 (r1,r2) 下采样 H、W 维度。"""
+    """Downsample H and W by factors (r1, r2)."""
     return arr[..., ::r1, ::r2]
 
 
@@ -134,7 +135,7 @@ def convert_pipe(data_root: Path, downsamplex: int, downsampley: int) -> Tuple[n
 def convert_airfoil(data_root: Path, downsamplex: int, downsampley: int) -> Tuple[np.ndarray, np.ndarray]:
     x = np.load(data_root / "NACA_Cylinder_X.npy")  # [N,221,51]
     y = np.load(data_root / "NACA_Cylinder_Y.npy")
-    q = np.load(data_root / "NACA_Cylinder_Q.npy")[:, 4]  # 取第 5 个通道
+    q = np.load(data_root / "NACA_Cylinder_Q.npy")[:, 4]  # channel index 4 (5th channel)
 
     if downsamplex != 1 or downsampley != 1:
         x = _downsample_hw(x, downsamplex, downsampley)
@@ -170,7 +171,7 @@ def convert_navier(data_root: Path, downsample: int, t_in: int, t_out: int) -> T
     u = data["u"]  # [N,64,64,20]
 
     h = int(((u.shape[1] - 1) / downsample) + 1)
-    u = u[:, ::downsample, ::downsample, :][:, :h, :h, :]  # 截断到整数网格
+    u = u[:, ::downsample, ::downsample, :][:, :h, :h, :]  # truncate to integer grid
 
     input_arr = u[:, :, :, :t_in].transpose(0, 3, 1, 2)   # [N,T_in,H,W]
     output_arr = u[:, :, :, t_in : t_in + t_out].transpose(0, 3, 1, 2)  # [N,T_out,H,W]
@@ -179,25 +180,25 @@ def convert_navier(data_root: Path, downsample: int, t_in: int, t_out: int) -> T
 
 def convert_plasticity(data_root: Path, downsamplex: int, downsampley: int):
     """
-    塑性问题：一维输入沿 y 方向复制，输出含 4 个 deformation 通道和 T=20 时间步。
-    这里将输出的时间维展平到通道，得到 output [N, 4*T, H, W]，便于直接用 BCHW。
-    额外返回 pos（规则网格）和 time（原始时间序列，供可视化/逆归一化）。
+    Plasticity: 1D input replicated along y; output has 4 deformation channels and T=20 time steps.
+    Time is flattened into channels: output shape [N, 4*T, H, W] for BCHW consumption.
+    Also returns pos (regular grid) and time (original time axis, for viz / inverse normalization).
     """
     data = scio.loadmat(data_root / "plas_N987_T20.mat")
-    inp_raw = data["input"]          # 期望 [N, 101]
-    out_raw = data["output"]         # 期望 [N, 101, 31, T, 4] (LaMO 中通过 transpose(-2,-1) 得到 [N,101,31,4,T])
+    inp_raw = data["input"]          # expected [N, 101]
+    out_raw = data["output"]         # expected [N, 101, 31, T, 4] (LaMO may transpose to [N,101,31,4,T])
 
     s1 = int(((101 - 1) / downsamplex) + 1)
     s2 = int(((31 - 1) / downsampley) + 1)
     T = out_raw.shape[-2] if out_raw.ndim >= 5 else 20
 
-    # 输入：沿 y 方向复制，再裁剪
+    # Input: replicate along y, then crop
     inp = inp_raw[:, ::downsamplex][:, :s1]          # [N, s1]
     inp = np.repeat(inp[:, :, None], s2, axis=2)     # [N, s1, s2]
     input_arr = inp[:, None, :, :]                   # [N,1,H,W]
 
-    # 输出：reorder 成 [N, s1, s2, deform, T]
-    if out_raw.shape[-1] == 4:  # 如果最后一维是 deformation
+    # Output: reorder to [N, s1, s2, deform, T]
+    if out_raw.shape[-1] == 4:  # last dim is deformation
         out_reordered = np.transpose(out_raw, (0, 1, 2, 4, 3))
     else:
         out_reordered = out_raw
@@ -206,7 +207,7 @@ def convert_plasticity(data_root: Path, downsamplex: int, downsampley: int):
     n, c, t, h, w = out_chw.shape
     output_arr = out_chw.reshape(n, c * t, h, w)  # [N, 4*T, H, W]
 
-    # 网格坐标（与 LaMO 一致）：均匀网格 0~1
+    # Grid coords (match LaMO): uniform [0, 1]
     x = np.linspace(0, 1, s1)
     y = np.linspace(0, 1, s2)
     xx, yy = np.meshgrid(x, y, indexing="ij")
@@ -219,24 +220,24 @@ def main():
     parser = argparse.ArgumentParser("Convert LaMO datasets to BCHW HDF5")
     parser.add_argument("--task", type=str, required=True,
                         choices=["pipe", "airfoil", "darcy", "navier", "plasticity"],
-                        help="选择要转换的任务")
+                        help="Task to convert")
     parser.add_argument("--data-root", type=Path, required=True,
-                        help="任务数据所在目录，例如 LaMO/data/Pipe")
+                        help="Directory with task data, e.g. LaMO/data/Pipe")
     parser.add_argument("--output", type=Path, required=True,
-                        help="输出 h5 路径，例如 ./pdebench_data/pipe")
+                        help="Output .h5 path, e.g. ./pdebench_data/pipe")
 
     # pipe / airfoil
     parser.add_argument(
         "--downsamplex",
         type=int,
         default=None,
-        help="X 方向下采样 (pipe/airfoil/plasticity)，默认按任务设定（pipe/airfoil/plasticity=1）",
+        help="X downsampling (pipe/airfoil/plasticity); default 1 for those tasks",
     )
     parser.add_argument(
         "--downsampley",
         type=int,
         default=None,
-        help="Y 方向下采样 (pipe/airfoil/plasticity)，默认按任务设定（pipe/airfoil/plasticity=1）",
+        help="Y downsampling (pipe/airfoil/plasticity); default 1 for those tasks",
     )
 
     # darcy
@@ -244,7 +245,7 @@ def main():
         "--downsample",
         type=int,
         default=None,
-        help="下采样因子（darcy 默认 5，navier 默认 1）",
+        help="Downsample factor (darcy default 5, navier default 1)",
     )
 
     # navier
@@ -252,13 +253,13 @@ def main():
         "--t-in",
         type=int,
         default=None,
-        help="Navier-Stokes 历史步数（默认 10）",
+        help="Navier-Stokes history length (default 10)",
     )
     parser.add_argument(
         "--t-out",
         type=int,
         default=None,
-        help="Navier-Stokes 预测步数（默认 10）",
+        help="Navier-Stokes prediction horizon (default 10)",
     )
     # split
     parser.add_argument("--train-ratio", type=float, default=0.8, help="Train split ratio")
@@ -295,7 +296,7 @@ def main():
     else:
         raise ValueError(f"Unsupported task: {task}")
 
-    # 仅计算全量统计（不写全量文件），将其复用到各 split
+    # Global stats only (no full-dataset file); reuse across splits
     stats_full = {
         "input_min": float(np.min(input_arr)),
         "input_max": float(np.max(input_arr)),
@@ -303,7 +304,7 @@ def main():
         "output_max": float(np.max(output_arr)),
     }
 
-    # 按比例划分并写 train/val/test，plasticity 额外带 pos/time，统计来源于全量
+    # Write train/val/test by ratio; plasticity includes pos/time; stats from full data
     _write_split_files(
         args.output,
         input_arr,

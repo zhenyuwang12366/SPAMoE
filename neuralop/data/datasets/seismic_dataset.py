@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from config.seismic_moe_config import SeismicMOEConfig, SPECIFIC_TYPE_VARIANTS
 
 # ---------------------------
-# SPECIFIC 家族映射（保留你的逻辑）
+# SPECIFIC family mapping (preserves original logic)
 # ---------------------------
 _SPECIFIC_VARIANT_TO_BASE = {
     variant: base
@@ -22,33 +22,33 @@ _SPECIFIC_VARIANT_FAMILIES = set(_SPECIFIC_VARIANT_TO_BASE.keys())
 _ALLOWED_SPECIFIC_FAMILIES = _SPECIFIC_BASE_FAMILIES | _SPECIFIC_VARIANT_FAMILIES
 
 # ---------------------------
-# 目录名规范化 / 提取
+# Directory name normalization / extraction
 # ---------------------------
 def _to_snake_lower(s: str) -> str:
     s = s.strip()
     if not s:
         return s
-    # 先处理驼峰 -> 下划线的边界
+    # CamelCase -> underscore boundaries first
     s = re.sub(r'([A-Z]+)([A-Z][a-z0-9])', r'\1_\2', s)
     s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s)
     s = re.sub(r'[^A-Za-z0-9]+', '_', s)
     s = re.sub(r'_+', '_', s).strip('_').lower()
-    parts = [p for p in s.split('_') if p]  # 去重空片段
+    parts = [p for p in s.split('_') if p]  # drop empty segments
     if not parts:
         return s
     if parts[0] == 'style':
-        # 情况1: style_a -> style_style_a
-        # 情况2: style_style_a -> 保持不变
-        # 其他(如 style_xxx_a) -> 取最后一段作为 a/b 后缀
+        # Case 1: style_a -> style_style_a
+        # Case 2: style_style_a -> unchanged
+        # Other (e.g. style_xxx_a) -> use last segment as a/b suffix
         suffix = parts[-1] if len(parts) >= 2 else 'a'
         if len(parts) >= 3 and parts[1] == 'style':
-            return '_'.join(parts[:3])  # 已经是 style_style_a/b
+            return '_'.join(parts[:3])  # already style_style_a/b
         return f"style_style_{suffix}"
     return '_'.join(parts)
 
 def _infer_type_dir_name_from_input_file(p: str) -> str:
     """
-    从输入文件路径推断类型目录名：
+    Infer the type directory name from an input file path:
       vel/style: .../<TypeDir>/data/dataXX.npy -> <TypeDir>
       fault:     .../<TypeDir>/seis_...npy    -> <TypeDir>
     """
@@ -61,10 +61,10 @@ def _infer_type_dir_name_from_input_file(p: str) -> str:
 
 class SeismicDataset(Dataset):
     """
-    用于地震数据的数据集类
-    - 读取 OpenFWI 风格数据（vel/style: data/model；fault: seis/vel 配对）
-    - 由目录名推断标签（严格只允许 *_a / *_b 结尾），通过 config.type_id_specific 映射为 id
-    - __getitem__ 返回 input/output 以及 v_type/type_name
+    Seismic dataset for OpenFWI-style data.
+    - Reads vel/style (data/model pairs) and fault (seis/vel pairs).
+    - Infers labels from directory names (strict *_a / *_b suffix), mapped via config.type_id_specific.
+    - __getitem__ returns input/output plus v_type and type_name.
     """
     def __init__(
         self,
@@ -73,8 +73,8 @@ class SeismicDataset(Dataset):
         is_specific: bool = False,
         split: str = 'train',
         concat_channels: bool = False,
-        config: Optional[SeismicMOEConfig] = None,   # ★ 新增：用于取 type_id_specific
-        processor: Optional[object] = None,          # ★ 新增：数据处理器（可为 None）
+        config: Optional[SeismicMOEConfig] = None,   # for type_id_specific mapping
+        processor: Optional[object] = None,          # optional data processor
     ):
         self.data_dir = data_dir
         self.family = family.lower()
@@ -86,49 +86,49 @@ class SeismicDataset(Dataset):
         self.concat_channels = bool(concat_channels)
         self._specific_target_family: Optional[str] = None
 
-        # 新增：保存 config / processor / 标签容器
+        # Persist config / processor / label containers
         if config is None:
-            raise ValueError("SeismicDataset 需要传入 config（用于 type_id_specific 小写映射）")
+            raise ValueError("SeismicDataset requires config (for lower-case type_id_specific mapping)")
         self.config: SeismicMOEConfig = config
         self.processor = processor
         self.labels: List[int] = []
         self.type_names: List[str] = []
 
-        # 验证参数（保留你的原逻辑）
+        # Validate parameters (original behavior)
         if not is_specific:
             if self.family not in ['vel', 'style', 'fault', 'all']:
-                raise ValueError(f"不支持的数据集系列: {self.family}")
+                raise ValueError(f"Unsupported dataset family: {self.family}")
         else:
             if self.family not in _ALLOWED_SPECIFIC_FAMILIES:
                 raise ValueError(
-                    f"不支持的细分类系列: {self.family}. 可选项包括: {sorted(_ALLOWED_SPECIFIC_FAMILIES)}"
+                    f"Unsupported specific family: {self.family}. Allowed: {sorted(_ALLOWED_SPECIFIC_FAMILIES)}"
                 )
             self._specific_target_family = _SPECIFIC_VARIANT_TO_BASE.get(self.family, self.family)
 
         if self.split not in ['train', 'test']:
-            raise ValueError(f"不支持的数据集分割: {self.split}")
+            raise ValueError(f"Unsupported split: {self.split}")
 
-        # 加载文件路径
+        # Discover file paths
         self._load_data()
 
-        # 建立 (file_idx, sample_idx) 索引
+        # Build (file_idx, sample_idx) index
         for file_idx, file in enumerate(self.input_files):
             data = np.load(file, mmap_mode='r')  # lazy load
             num_samples = data.shape[0]
             for sample_idx in range(num_samples):
                 self.index_map.append((file_idx, sample_idx))
 
-        # 预加载到内存（同步标签）
+        # Preload into memory (labels aligned)
         self._preload_into_memory()
 
-        # 统计量
+        # Summary statistics
         self._compute_stats()
 
     def _preload_into_memory(self):
-        # 小写键的映射字典
+        # Lower-case key mapping
         type_id_map: Dict[str, int] = getattr(self.config, "type_id_specific", None)
         if not isinstance(type_id_map, dict) or not type_id_map:
-            raise ValueError("config.type_id_specific 必须是非空字典（键全小写）。")
+            raise ValueError("config.type_id_specific must be a non-empty dict (keys lower-case).")
 
         for i, input_path in enumerate(self.input_files):
             try:
@@ -137,19 +137,19 @@ class SeismicDataset(Dataset):
                 if self.output_files[i] is not None:
                     output_array = np.load(self.output_files[i], allow_pickle=True)
 
-                # —— 目录名 → 规范化 → 校验 a/b 结尾 → 映射 id —— #
+                # Directory name -> normalize -> check a/b suffix -> map to id
                 type_dir_raw = _infer_type_dir_name_from_input_file(input_path)   # e.g., FlatFault_a
                 type_key = _to_snake_lower(type_dir_raw)                          # e.g., flat_fault_a
 
                 if not (type_key.endswith('_a') or type_key.endswith('_b')):
                     raise ValueError(
-                        f"目录名 '{type_dir_raw}' 规范化为 '{type_key}'，但未以 '_a' 或 '_b' 结尾。"
-                        "仅允许 a/b 后缀（不允许数字）。"
+                        f"Directory name '{type_dir_raw}' normalizes to '{type_key}' but does not end with '_a' or '_b'. "
+                        "Only a/b suffixes are allowed (no numeric suffixes)."
                     )
                 if type_key not in type_id_map:
                     raise KeyError(
-                        f"目录名 '{type_dir_raw}' → '{type_key}' 不在 config.type_id_specific 中。"
-                        f"（示例键：{list(type_id_map.keys())[:6]} ... 共 {len(type_id_map)} 项）"
+                        f"Directory name '{type_dir_raw}' -> '{type_key}' is missing from config.type_id_specific. "
+                        f"(example keys: {list(type_id_map.keys())[:6]} ... total {len(type_id_map)} entries)"
                     )
                 label_id = int(type_id_map[type_key])
 
@@ -166,22 +166,22 @@ class SeismicDataset(Dataset):
                         output_tensor = torch.from_numpy(output_array[j].astype(np.float32))
                         self.output_tensors.append(output_tensor)
 
-                    # 与样本对齐的标签/类别名
+                    # Per-sample label / class name
                     self.labels.append(label_id)
                     self.type_names.append(type_key)
 
             except Exception as e:
-                print(f"读取第{i}个文件失败: {e}")
+                print(f"Failed to read file {i}: {e}")
 
     def _load_data(self):
         """
-        加载数据文件路径  
+        Load input/output file paths.
         """
         self.input_files = []
         self.output_files = []
 
         def want_family(group: str, variant: Optional[str]) -> bool:
-            """根据 family / is_specific 判定是否保留该目录"""
+            """Return whether this subdirectory should be kept given family / is_specific."""
             target_family = self._specific_target_family or self.family
             if not getattr(self, 'is_specific', False):
                 if self.family == 'all':
@@ -197,7 +197,7 @@ class SeismicDataset(Dataset):
         if self.split == 'train':
             train_dir = os.path.join(self.data_dir, 'train_samples')
             if not os.path.isdir(train_dir):
-                raise RuntimeError(f"训练目录不存在: {train_dir}")
+                raise RuntimeError(f"Training directory not found: {train_dir}")
 
             subdirs = [d for d in os.listdir(train_dir)
                     if os.path.isdir(os.path.join(train_dir, d))]
@@ -205,7 +205,7 @@ class SeismicDataset(Dataset):
             for sub in sorted(subdirs):
                 sub_path = os.path.join(train_dir, sub)
 
-                # 目录名到 (group, variant) 的判定
+                # Map subdirectory name to (group, variant)
                 group = None
                 variant = None
                 if sub.startswith("CurveFault_"):
@@ -219,14 +219,14 @@ class SeismicDataset(Dataset):
                 elif sub.startswith("CurveVel_"):
                     group, variant = 'vel', 'curve'
                 else:
-                    # 未知命名，跳过（也可选择 raise）
+                    # Unknown naming; skip (could raise instead)
                     continue
 
                 if not want_family(group, variant):
                     continue
 
                 if group == 'fault':
-                    # Fault：seis_?{n}_1_{i}.npy ↔ vel_{n}_1_{i}.npy
+                    # Fault: seis_?{n}_1_{i}.npy <-> vel_{n}_1_{i}.npy
                     pattern = re.compile(r"seis_?(\d+)_1_(\d+)\.npy")
                     seis_files = sorted(glob.glob(os.path.join(sub_path, 'seis*.npy')))
                     for seis_file in seis_files:
@@ -236,7 +236,7 @@ class SeismicDataset(Dataset):
                             n = int(m.group(1))
                             i = int(m.group(2))
                         else:
-                            print(f"{stem} 跳过")
+                            print(f"{stem} skipped")
                             continue
                         try:
                             vel_file = os.path.join(sub_path, f"vel_{n}_1_{i}.npy")
@@ -244,11 +244,11 @@ class SeismicDataset(Dataset):
                         except Exception:
                             vel_file = os.path.join(sub_path, f"vel{n}_1_{i}.npy")
                         if os.path.exists(vel_file):
-                            self.input_files.append(seis_file)   # 输入：seis
-                            self.output_files.append(vel_file)   # 输出：vel
+                            self.input_files.append(seis_file)   # input: seis
+                            self.output_files.append(vel_file)   # output: vel
 
                 elif group in ('vel', 'style'):
-                    # Vel/Style：data/{data{i}.npy} ↔ model/{model{i}.npy}
+                    # Vel/Style: data/{data{i}.npy} <-> model/{model{i}.npy}
                     data_dir = os.path.join(sub_path, 'data')
                     model_dir = os.path.join(sub_path, 'model')
                     if not (os.path.isdir(data_dir) and os.path.isdir(model_dir)):
@@ -263,47 +263,47 @@ class SeismicDataset(Dataset):
                         idx = stem.replace('data', '')
                         model_file = os.path.join(model_dir, f"model{idx}.npy")
                         if os.path.exists(model_file):
-                            self.input_files.append(data_file)   # 输入：data
-                            self.output_files.append(model_file) # 输出：model
+                            self.input_files.append(data_file)   # input: data
+                            self.output_files.append(model_file) # output: model
 
         else:
-            # test：只需要输入
+            # test split: inputs only
             test_dir = os.path.join(self.data_dir, 'test')
             if not os.path.isdir(test_dir):
-                raise RuntimeError(f"测试目录不存在: {test_dir}")
+                raise RuntimeError(f"Test directory not found: {test_dir}")
             self.input_files = sorted(glob.glob(os.path.join(test_dir, '*.npy')))
             self.output_files = [None] * len(self.input_files)
 
-        # 校验
+        # Consistency checks
         if not self.input_files:
             raise RuntimeError(
-                f"未找到任何输入文件。请检查路径与过滤条件："
+                f"No input files found. Check path and filters: "
                 f"data_dir={self.data_dir}, split={self.split}, "
                 f"family={self.family}, is_specific={getattr(self, 'is_specific', None)}"
             )
         if self.split == 'train' and len(self.input_files) != len(self.output_files):
             raise RuntimeError(
-                f"输入与输出数量不一致：inputs={len(self.input_files)}, outputs={len(self.output_files)}"
+                f"Input/output file count mismatch: inputs={len(self.input_files)}, outputs={len(self.output_files)}"
             )
     
     def _compute_stats(self):
-        """从已加载的内存数据中计算归一化统计量"""
+        """Compute normalization stats from in-memory tensors."""
         n_total = int(len(self.input_tensors))
         if n_total == 0:
             return
-        n_samples = int(min(max(1, n_total * 0.03), 300))  # 3%最多不超过300个
+        n_samples = int(min(max(1, n_total * 0.03), 300))  # 3% of data, cap at 300
         sample_indices = np.random.choice(n_total, n_samples, replace=False)
 
-        # 计算输入的统计量
+        # Input stats
         input_values = []
         for idx in sample_indices:
             try:
                 input_tensor = self.input_tensors[idx]  # shape: [C, H, W]
-                flat = input_tensor.view(-1)  # 展平为 1D
+                flat = input_tensor.view(-1)  # flatten to 1D
                 sample_points = flat[torch.randperm(flat.numel())[:min(1000, flat.numel())]]
                 input_values.append(sample_points)
             except Exception as e:
-                print(f"警告: 处理输入样本 {idx} 失败: {e}")
+                print(f"Warning: failed to process input sample {idx}: {e}")
 
         if input_values:
             input_all = torch.cat(input_values)
@@ -312,7 +312,7 @@ class SeismicDataset(Dataset):
             self.input_mean = float(torch.mean(input_all))
             self.input_std = float(torch.std(input_all)) or 1.0
 
-        # 计算输出的统计量（仅 train 阶段）
+        # Output stats (train only)
         if self.split == 'train' and hasattr(self, 'output_tensors') and self.output_tensors:
             output_values = []
             for idx in sample_indices:
@@ -322,7 +322,7 @@ class SeismicDataset(Dataset):
                     sample_points = flat[torch.randperm(flat.numel())[:min(1000, flat.numel())]]
                     output_values.append(sample_points)
                 except Exception as e:
-                    print(f"警告: 处理输出样本 {idx} 失败: {e}")
+                    print(f"Warning: failed to process output sample {idx}: {e}")
 
             if output_values:
                 output_all = torch.cat(output_values)
@@ -351,15 +351,15 @@ class SeismicDataset(Dataset):
             file_idx, _  = self.index_map[idx]
             input_filename = os.path.basename(self.input_files[file_idx])
             
-            if self.split == 'train':  # 训练/验证
+            if self.split == 'train':  # train / val with labels
                 sample = {
                     'input': self.input_tensors[idx].clone(),
                     'output': self.output_tensors[idx].clone(),
-                    'v_type': torch.tensor(self.labels[idx], dtype=torch.long),  # ★ 新增：标签
-                    'type_name': self.type_names[idx],                            # ★ 新增：类别名（小写蛇形）
+                    'v_type': torch.tensor(self.labels[idx], dtype=torch.long),  # class id
+                    'type_name': self.type_names[idx],                            # lower_snake class name
                     'input_file': input_filename
                 }
-            else:  # 测试
+            else:  # test
                 sample = {
                     'input': self.input_tensors[idx].clone(),
                     'v_type': torch.tensor(self.labels[idx], dtype=torch.long),
@@ -367,13 +367,13 @@ class SeismicDataset(Dataset):
                     'input_file': input_filename.split('.')[0]
                 }
 
-            # ★ 可选：processor 在这里生效（若你要 resize/规范化等）
+            # Optional processor (resize / normalize, etc.)
             if self.processor is not None:
                 sample = self.processor(sample)
             return sample
             
         except Exception as e:
-            print(f"加载样本 {idx} 失败: {e}")
+            print(f"Failed to load sample {idx}: {e}")
             if idx + 1 < len(self):
                 return self.__getitem__(idx + 1)
             else:
@@ -392,7 +392,7 @@ class SeismicDataset(Dataset):
 
 class SeismicDataProcessor:
     """
-    地震数据处理器：可做通道重排、可选 resize/pad、外部 transform
+    Seismic data processor: channel reordering, optional resize/pad, external transforms.
     """
     def __init__(
         self,
@@ -419,8 +419,8 @@ class SeismicDataProcessor:
         pad_mode: str = "reflect",
     ) -> torch.Tensor:
         """
-        可选自动pad + resize 的统一函数
-        输入 x: (C, H, W)  -> 内部临时变成 (1,C,H,W)
+        Optional auto-pad + resize helper.
+        Input x: (C, H, W)  -> temporarily expanded to (1, C, H, W) internally.
         """
         x = x.unsqueeze(0)
         if keep:
@@ -448,23 +448,23 @@ class SeismicDataProcessor:
         return x.squeeze(0)
     
     def __call__(self, sample: Dict):
-        # 输入
+        # Input branch
         if 'input' in sample and sample['input'] is not None:
             x = sample['input']  # (C,H,W)
             if x.ndim == 2:
                 x = x.unsqueeze(0)
 
-            # 通道重排（如需要）
+            # Channel reorder (extend here if needed)
             if self.channel_dim == 1:
-                # (C,H,W) -> 这里保持不动（如需可自行扩展）
+                # (C,H,W) unchanged here
                 pass
             elif self.channel_dim == -1:
                 pass
-            
+
             if self.input_transform:
                 x = self.input_transform(x)
 
-            # 可选 resize
+            # Optional resize
             resize_enabled = bool(getattr(self.config, 'is_resize', 0))
             target_h = getattr(self.config, 'H_size', None)
             target_w = getattr(self.config, 'W_size', None)
@@ -480,7 +480,7 @@ class SeismicDataProcessor:
                 )
             sample['input'] = x
 
-        # 输出
+        # Output branch
         if 'output' in sample and sample['output'] is not None:
             y = sample['output']
             if y.ndim == 2:

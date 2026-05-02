@@ -1,11 +1,11 @@
 """
-用于地震数据的MOE (Mixture of Experts) 神经算子模型配置
+MOE (Mixture of Experts) neural operator configuration for seismic / OpenFWI-style data.
 """
 
 from .default_config import Default
 from .distributed import DistributedConfig
 
-# 细分类类别与对应变体列表
+# Fine-grained type keys and variants
 SPECIFIC_TYPE_VARIANTS = {
     'curve_vel': ('curve_vel_a', 'curve_vel_b'),
     'curve_fault': ('curve_fault_a', 'curve_fault_b'),
@@ -17,23 +17,23 @@ SPECIFIC_TYPE_VARIANTS = {
 
 
 class SeismicMOEConfig(Default):
-    """地震数据MOE神经算子的配置"""
-    
-    # 基本配置
+    """Configuration for seismic MOE neural operators."""
+
+    # Core model
     model_name = 'MOE'
-    in_channels = 1  # 修正为1，与实际输入通道数一致
-    out_channels = 1  # 根据输出张量形状更新，输出通道数为5
+    in_channels = 1  # Match stacked / single-channel input
+    out_channels = 1  # Velocity map channels (often 1 for OpenFWI)
     is_resize = False
     H_size = 256
     W_size = 256
     concat_channels = True
-    moe_mode = "standard"    # standard: 直接专家模式, group: 分组模式, velocity_type: 速度图类型模式
+    moe_mode = "standard"    # standard | group | velocity_type
     moe_method = "afmoe"
     use_gpu_proxy = False
     train_encoder = False
     use_encoder = True
     backbone = 'vit'
-    enable_freq_metrics = False  # 是否在推理阶段输出分频指标
+    enable_freq_metrics = False  # Log per-band metrics during inference
     # v_type_id dict
     type_id_specific = {
         'curve_vel_a': 0,
@@ -57,23 +57,23 @@ class SeismicMOEConfig(Default):
         'normal': type_id_normal,
     }
 
-    # 数据集配置
+    # Dataset
     dataset_name = 'seismic'
-    data_dir = '/data1/wuruoyu/waveform-inversion'  # 数据目录路径
-    family = 'all'  # 数据集系列，可选 'vel', 'style', 'fault' 或 'all'
-    n_train_samples = None  # None表示使用所有可用训练样本
-    n_test_samples = None  # None表示使用所有可用测试样本
-    channel_dim = 0  # 将num_sources作为通道维度
-    
-    # MOE配置
+    data_dir = '/data1/wuruoyu/waveform-inversion'  # Dataset root
+    family = 'all'  # 'vel' | 'style' | 'fault' | 'all' or fine-grained keys
+    n_train_samples = None  # None = use all train samples
+    n_test_samples = None  # None = use all test samples
+    channel_dim = 0  # Treat num_sources as channel dim when stacking
+
+    # MoE routing
     use_moe = False
     use_experts_path = None
-    top_k = 2  # 选择前k个专家
-    noisy_gating = True  # 是否使用噪声门控
-    fusion_type = 'linear'  # 专家输出融合方式
-    router_hidden_dim = 256  # 路由器隐藏层维度
-    router_type = 'basic' # 路由形式 basic,adamv
-    # AFreqMoE 路由配置 / 消融开关
+    top_k = 2  # Top-k experts
+    noisy_gating = True
+    fusion_type = 'linear'  # Expert fusion style
+    router_hidden_dim = 256
+    router_type = 'basic'  # basic | adamv | ...
+    # AFreqMoE router / ablation toggles
     band_sharpness = 20.0
     freq_affinity_sharpness = 10.0
     use_soft_bands = True
@@ -89,9 +89,9 @@ class SeismicMOEConfig(Default):
     v_type_num = 0
     router_alpha = 0.1
     
-    # 专家配置
+    # Expert templates (shared); per-type overrides live in load_expert_configs
     expert_configs = [
-        # 傅里叶域专家 - 适合捕捉频率特征 FNO
+        # Fourier-domain expert (FNO)
         {
             'type': 'domain',
             'domain_type': 'fourier',
@@ -102,13 +102,13 @@ class SeismicMOEConfig(Default):
             'projection_channel_ratio': 2,
             'n_layers': 4,
         },
-        # # 小波域专家 - 适合处理局部特征和多尺度结构 WNO
+        # # Wavelet-domain expert (WNO) — optional
         # {
         #     'type': 'domain',
         #     'domain_type': 'wavelet',
         #     'n_dim': 2,
-        #     'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-        #     'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+        #     'n_levels_height': 2,
+        #     'n_levels_width': 2,
         #     'conv_kind': 'dwt',
         #     'wavelet': 'db6',
         #     'biort': 'near_sym_b',
@@ -116,28 +116,28 @@ class SeismicMOEConfig(Default):
         #     'n_layers': 4,
         #     'dropout_rate': 0.10,
         # },
-        # 原生多尺度神经算子专家 - 专门处理多尺度地质结构 MNO
+        # Native multiscale expert (MNO)
         {
             'type': 'scale',
-            'scale_expert_type': 'native',  # 更新为scale_expert_type
+            'scale_expert_type': 'native',
             'n_dim': 2,
             'n_scales': 3,
             'scale_factors': [1.0, 0.6, 0.3],
             'fusion_mode': 'hierarchical',
             'n_layers': 4,
         },
-        # # 局部处理专家 - 用于局部细节重建 LNO
+        # Local spectral expert (LNO)
         {
             'type': 'local',
-            'local_type': 'basic',  # 更新为basic类型
+            'local_type': 'basic',
             'n_dim': 2,
             'n_modes': (16, 16),
-            'disco_layers': True,  # 启用DISCO层
-            'diff_layers': True,   # 启用差分层
-            'n_layers': 3,         # 设置层数
-            'default_in_shape': (70, 70),  # 基于输入张量形状设置
+            'disco_layers': True,
+            'diff_layers': True,
+            'n_layers': 3,
+            'default_in_shape': (70, 70),
         },
-        # # 几何感知专家 - GeoFNO
+        # # Geometry-aware expert (GeoFNO) — optional
         # {
         #     'type': 'geometry',
         #     'geometry_type': 'geofno',
@@ -151,7 +151,7 @@ class SeismicMOEConfig(Default):
         # }
     ]
     
-    # 训练配置
+    # Optimization
     batch_size = 8
     test_batch_size = 8
     learning_rate = 1e-4
@@ -181,32 +181,32 @@ class SeismicMOEConfig(Default):
     early_stop_min_delta = 0.001
     early_stop_warmup_epochs = 10
     
-    # 分布式训练配置
+    # Distributed training
     distributed = DistributedConfig(
         use_distributed=False,
         model_parallel_size=1,
         seed=42
     )
     
-    # 混合精度训练
+    # Mixed precision
     mixed_precision = False
     
-    # 评估配置
+    # Evaluation cadence
     eval_interval = 1
     verbose = True
     
-    # 损失函数配置
-    loss_fn = 'mse and mae'  # 均方误差损失
+    # Loss weights
+    loss_fn = 'mse and mae'
     lambda_g1v = 0.6
     lambda_g2v = 0.4
     lambda_grad_l1 = 0.15
     lambda_fourier_mag_l1 = 0.10
     lambda_ce = 0.2
     
-    # 评估指标配置
+    # Metrics to log
     metrics = ['mse', 'mae', 'psnr']
     
-    # WandB配置
+    # Weights & Biases
     wandb = {
         'log': False,
         'project': 'seismic_moe',
@@ -336,8 +336,8 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,
+                'n_levels_width': 3,
                 'conv_kind': 'dwt',
                 'wavelet': 'coif4',
                 'biort': 'near_sym_b',
@@ -350,8 +350,8 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,
+                'n_levels_width': 3,
                 'conv_kind': 'dwt',
                 'wavelet': 'coif4',
                 'biort': 'near_sym_b',
@@ -364,8 +364,8 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,
+                'n_levels_width': 3,
                 'conv_kind': 'dwt',
                 'wavelet': 'coif4',
                 'biort': 'near_sym_b',
@@ -378,8 +378,8 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,
+                'n_levels_width': 3,
                 'conv_kind': 'dwt',
                 'wavelet': 'coif4',
                 'biort': 'near_sym_b',
@@ -392,8 +392,8 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,
+                'n_levels_width': 3,
                 'conv_kind': 'dwt',
                 'wavelet': 'coif4',
                 'biort': 'near_sym_b',
@@ -406,8 +406,8 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,
+                'n_levels_width': 3,
                 'conv_kind': 'dwt',
                 'wavelet': 'coif4',
                 'biort': 'near_sym_b',
@@ -420,8 +420,8 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,
+                'n_levels_width': 3,
                 'conv_kind': 'dwt',
                 'wavelet': 'coif4',
                 'biort': 'near_sym_b',
@@ -434,8 +434,8 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,
+                'n_levels_width': 3,
                 'conv_kind': 'dwt',
                 'wavelet': 'db6',
                 'biort': 'near_sym_b',
@@ -448,8 +448,8 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,
+                'n_levels_width': 3,
                 'conv_kind': 'dwt',
                 'wavelet': 'db6',
                 'biort': 'near_sym_b',
@@ -462,8 +462,8 @@ class SeismicMOEConfig(Default):
                 'type': 'domain',
                 'domain_type': 'wavelet',
                 'n_dim': 2,
-                'n_levels_height': 1,  # 减少级别为2，避免形状不匹配问题
-                'n_levels_width': 3,   # 减少级别为2，避免形状不匹配问题
+                'n_levels_height': 1,
+                'n_levels_width': 3,
                 'conv_kind': 'dwt',
                 'wavelet': 'db6',
                 'biort': 'near_sym_b',

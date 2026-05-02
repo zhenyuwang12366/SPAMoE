@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Wavelet convolution layers with fp32-stable kernels (方案B)
-- 在层内部强制关闭 autocast，并把参与计算的张量统一成 float32，
-  以避免 DeepSpeed/AMP 将参数转为 bf16/fp16 引起的 dtype 冲突。
+Wavelet convolution layers with fp32-stable kernels (option B).
+- Disable autocast inside the layer and cast participating tensors to float32,
+  avoiding dtype conflicts when DeepSpeed/AMP converts parameters to bf16/fp16.
 """
 
 import numpy as np
@@ -44,7 +44,7 @@ class WaveConv1d(nn.Module):
         self.wavelet = wavelet
         self.mode = mode
 
-        # 预热获取 modes
+        # Warm-up run to obtain mode sizes
         self.dwt_ = DWT1D(wave=self.wavelet, J=self.level, mode=self.mode)
         dummy = torch.randn(1, 1, self.size)
         mode_data, _ = self.dwt_(dummy)
@@ -54,7 +54,7 @@ class WaveConv1d(nn.Module):
         self.weights1 = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, self.modes1))
         self.weights2 = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, self.modes1))
 
-    # einsum 之前统一到 fp32
+    # Cast to fp32 before einsum
     def mul1d(self, input: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
         if input.dtype != torch.float32:
             input = input.to(torch.float32)
@@ -63,7 +63,7 @@ class WaveConv1d(nn.Module):
         return torch.einsum("bix,iox->box", input, weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 层内禁用 AMP，保证 DWT/IDWT 与权重计算都在 fp32
+        # Disable AMP in this layer so DWT/IDWT and weights stay in fp32
         with torch.autocast(device_type="cuda", enabled=False):
             if x.dtype != torch.float32:
                 x = x.to(torch.float32)
@@ -317,7 +317,7 @@ class WaveConv3d(nn.Module):
                 else:
                     x_coeff = wavedec3(vol, pywt.Wavelet(self.wavelet), level=self.level, mode=self.mode)
 
-                # 低频 & 7个高频子带
+                # Low-frequency band and seven high-frequency sub-bands
                 x_coeff[0]            = self.mul3d(x_coeff[0].clone(),            self.weights1)
                 x_coeff[1]['aad']     = self.mul3d(x_coeff[1]['aad'].clone(),     self.weights2)
                 x_coeff[1]['ada']     = self.mul3d(x_coeff[1]['ada'].clone(),     self.weights3)
@@ -327,7 +327,7 @@ class WaveConv3d(nn.Module):
                 x_coeff[1]['dda']     = self.mul3d(x_coeff[1]['dda'].clone(),     self.weights7)
                 x_coeff[1]['ddd']     = self.mul3d(x_coeff[1]['ddd'].clone(),     self.weights8)
 
-                # 更高层系数置零（保持结构）
+                # Zero out higher-level coefficients (preserve structure)
                 for jj in range(2, self.level + 1):
                     x_coeff[jj] = {k: torch.zeros_like(x_coeff[jj][k], device=x.device)
                                    for k in x_coeff[jj].keys()}

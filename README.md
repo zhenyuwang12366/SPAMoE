@@ -1,163 +1,137 @@
-# 地震数据MOE (Mixture of Experts) 神经算子指南
+# FWINO: Full-Waveform Inversion (FWI) and Mixture-of-Experts Neural Operators
 
-本指南详细介绍了如何使用、配置和修改seismic_moe代码，以便于处理地震数据的神经算子模型训练和推理。
+This project builds on [NeuralOperator](https://github.com/neuraloperator/neuraloperator) for **velocity model reconstruction** with neural operators on seismic datasets such as **OpenFWI**, and supports training and inference with **AFreqMoE (adaptive frequency-domain mixture of experts)**, DINOv3 **ViT / ConvNeXt** encoders, and related components.
 
-## 目录
+---
 
-0. [工作分配](#工作分配)
-1. [环境配置](#环境配置)
-2. [数据集格式](#数据集格式)
-3. [代码使用方法](#代码使用方法)
-4. [参数说明](#参数说明)
-5. [模型架构](#模型架构)
-6. [修改指南](#修改指南)
-7. [分布式训练](#分布式训练)
-8. [结果评估](#结果评估)
-9. [常见问题]
+## Table of Contents
 
-## 工作分配
+1. [Project layout](#project-layout)
+2. [Data and pretrained weights](#data-and-pretrained-weights)
+3. [Environment setup](#environment-setup)
+4. [Training workflow overview](#training-workflow-overview)
+5. [Encoder backbones (timm / DINOv3)](#encoder-backbones-timm--dinov3)
+6. [MoE training and scripts](#moe-training-and-scripts)
+7. [Parameters and configuration](#parameters-and-configuration)
+8. [Model architecture highlights](#model-architecture-highlights)
+9. [Customization and extensions](#customization-and-extensions)
+10. [Distributed training and evaluation](#distributed-training-and-evaluation)
+11. [Further documentation](#further-documentation)
 
-<a id="工作分配"></a>
+---
 
-第一阶段: 单个专家模型性能测试, 特点分析
+## Project layout
 
-- syx:WNO专家调试
+| Path | Description |
+|------|-------------|
+| `neuralop/` | Neural operator core: layers, models (including `afreqmoe.py`), dataloaders, trainers |
+| `neuralop/models/encoder.py` | DINOv3 ViT / ConvNeXt encoders and `get_encoder()` factory |
+| `scripts/train_seismic_moe.py` | Main entry point for seismic MoE training |
+| `exp/run_afreqmoe_pipeline.py` | Multi-task / multi-backbone experiment orchestration |
+| `config/` | Task-specific configurations |
+| `openfwi/` | OpenFWI-style training entry points (e.g. `train.py`) |
+| Root `*.sh` | Startup scripts kept for the seismic Zarr pipeline only (see table below) |
+| `scripts/*.sh` | Distributed training wrappers for seismic / PDE workloads |
 
-- lpy:MNO专家调试
+### Launcher scripts (repository slimmed)
 
-- wzy:FNO, LNO专家调试
+The root directory only keeps scripts directly tied to **OpenFWI → Zarr → training**. Historical cluster-specific wrappers such as many `submit_*.sh` / `ddp_*.sh` files have been removed; adjust `#SBATCH` lines in `school.sh`, or call the same commands as `school_local.sh` directly with `sbatch`.
 
-- 参数设置: 可以一起思考调试
+| Script | Role |
+|------|------|
+| `load_to_zarr.sh` | Invokes `load_to_zarr.py` to convert a raw directory with `train_samples/` into Zarr |
+| `school_local.sh` | Local or interactive multi-GPU: parses args and presets, calls `scripts/run_distributed_seismic_moe.sh` |
+| `school.sh` | Thin Slurm wrapper with `#SBATCH`; forwards to `school_local.sh` (usage: `sbatch school.sh --family ... --zarr_path ...`) |
+| `run_from_scratch.sh` | Runs `load_to_zarr.sh`, then `school_local.sh` or `sbatch school.sh` |
+| `training_presets.sh` | **Sourced** by `school_local.sh`; supplies `preset1` / `preset2` hyperparameter bundles (not run standalone) |
+| `scripts/bash_helpers.sh` | **Sourced** by the above (conda activation, `normalize_family_name`, etc.) |
+| `scripts/run_distributed_seismic_moe.sh` | Main seismic MoE / Zarr entry; launches `torchrun` + `train_seismic_moe.py` |
+| `scripts/run_distributed_train_pde.sh` | Distributed PDE training (`pde/train_pde.py`), independent of the seismic pipeline |
 
-- 目标: 能运行，效果接近benchmark
+**Marmousi-style inference**: With no dedicated `.sh`, you can run `python scripts/infer_marmousi2.py` directly (see `--help` in the script).
 
-第二阶段: 模型融合与数学方法(待定)
+---
 
-文件命名协议
-normal(未细化):
+## Data and pretrained weights
 
-- 模型分为vel, fault, style三类
-- 命名约定：best\_expert\_{experts\_name}\_{i}\_{vel/fault/style}.pt
-  
-specific(细化)：
+### OpenFWI dataset
 
-- 模型分为 curve_vel/curve_fault/flat_vel/flat_fault/style 五类，每类细分为 _a/_b 共 10 种标签
-- 命名约定：best_expert_{experts_name}\_{i}\_{curve/flat/style}_{vel/fault/style}.pt
+Official descriptions and download links (Vel / Fault / Style / Kimberlina families—input/output shapes and sample counts are documented):
 
-新增功能以及相关参数
+**[OpenFWI dataset documentation](https://openfwi-lanl.github.io/docs/data.html)**
 
-In MOEOperator
+Typical 2D subsets: **inputs** roughly `(5, 1000, 70)` (sources × time × traces), **outputs** roughly `(1, 70, 70)` velocity models, aligned with the Zarr / waveform pipeline in this repository.
 
-1. router_type —— adamv, 自适应专家数量选择 'basic'/'adamv'
-2. fusion_type —— str, 输出融合模式，'linear'/'attention'/'swa', 新增强弱激活模式
-3. s_processor_type —— 强专家输出融合器种类 'linear'/'atten'/'mean'/'sum'
-4. w_processor_type —— 弱专家输出融合器种类
-5. beta —— 强弱激活参数，beta越大，弱激活影响越大
-6. is_specific —— 文件名命名协议选择
-7. is_classifier —— 是否使用分组专家网络 GMoE
+### Pretrained backbones (Hugging Face → timm)
 
-## 环境配置
+Encoders default to **DINOv3 distilled weights** (LVD-1689M). Model cards and weight files:
 
-<a id="环境配置"></a>
+| Backbone | Hugging Face model page |
+|------|----------------------|
+| ViT-S/16 DINOv3 | [timm/vit_small_patch16_dinov3.lvd1689m](https://huggingface.co/timm/vit_small_patch16_dinov3.lvd1689m) |
+| ConvNeXt-Tiny DINOv3 | [timm/convnext_tiny.dinov3_lvd1689m](https://huggingface.co/timm/convnext_tiny.dinov3_lvd1689m) |
 
-### 系统要求
+**Local weights (recommended for offline or pinned versions)**: Place the corresponding `.safetensors` under `pretrain_weight/` at the project root; filenames must match what the code expects (`get_encoder()` prefers local files when present):
 
-- Python 3.10+
-- CUDA 10.2+ (推荐使用GPU进行训练)
-- 充足的存储空间用于数据集
+- `pretrain_weight/vit_small_patch16_dinov3.lvd1689m.safetensors`
+- `pretrain_weight/convnext_tiny.dinov3_lvd1689m.safetensors`
 
-### 安装步骤
+If these files are missing, loading falls back to `timm.create_model(..., pretrained=True)` pulling from Hugging Face (network and `huggingface_hub` required).
 
-1. 克隆仓库并进入项目目录
+---
+
+## Environment setup
+
+### Requirements
+
+- **Python 3.10+** (matches `environment.yml` and `pyproject.toml`)
+- **CUDA** and **PyTorch** versions matched to your GPU (`requirements.txt` shows CUDA 12.x examples as a guide)
+- Sufficient disk space for datasets and Zarr caches
+
+### Installation
 
 ```bash
-git clone https://github.com/GrinchWumath/FWINO.git
-cd neuraloperator
+git clone <your-repo-url> FWINO_wzy
+cd FWINO_wzy
 ```
 
-2. 创建虚拟环境(可选)
+Conda is recommended (example env name `FWINO`):
 
 ```bash
-conda create -n seismic_moe python=3.8
-conda activate seismic_moe
+conda env create -f environment.yml
+conda activate FWINO
+pip install -r requirements.txt
 ```
 
-3. 安装依赖包
+Or directly:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-主要依赖包包括：
+Typical dependencies include `torch`, `timm`, `zarr`, `h5py`, `wandb`, `tensorly`, `tensorly-torch`, etc. (see `requirements.txt`).
 
-- torch >= 1.10.0
-- numpy
-- matplotlib
-- tqdm
-- scikit-image (用于评估指标)
-- wandb (可选，用于实验追踪)
+---
 
-python -m pdb scripts/train_seismic_moe.py --num_workers 32 --data_dir /data1/home/teacher/teacher_s/t108790/FWINO/FWINO_data --family vel                                                 --batch_size 4 --epochs 500 --output_dir ../results/seismic_moe_test                                                 --top_k 1 --choose_experts 0 --FNO_n_modes_height 64 --FNO_n_modes_width 64 --FNO_n_layers 8 --hidden_channels 128                                                 --learning_rate 2e-5 --weight_decay 0.05 --scheduler_gamma 0.2 --accum_steps 1
+## Training workflow overview
 
-## 数据集格式
+### Option A: OpenFWI directory → Zarr → training (recommended for current repo scripts)
 
-<a id="数据集格式"></a>
+Full steps, `family` naming, presets, and usage of `load_to_zarr.sh` / `school_local.sh` / `run_from_scratch.sh`:
 
-### 数据集结构
+**[README_train_from_scratch.md](README_train_from_scratch.md)**
 
-seismic_moe代码支持处理地震数据集，其目录结构应如下：
+The data root must contain `train_samples/` with subfolders such as `CurveVel_A`, `FlatFault_B`, `Style_A`, etc., consistent with OpenFWI releases.
 
-```
-data_dir/
-├── train_samples/
-│   ├── sample_folder_1/
-│   │   ├── model/
-│   │   │   └── model{i}.npy  # 速度模型
-│   │   └── data/
-│   │       └── data{i}.npy   # 对应的地震数据
-│   ├── sample_folder_2/
-│   │   └── ...
-│   └── Fault_A/ or Fault_B/  # 断层数据
-│       ├── vel_{n}_1_{i}.npy # 速度模型
-│       └── seis_{n}_1_{i}.npy # 地震数据
-└── test/
-    └── *.npy  # 测试数据
+### Option B: PDE distributed (not seismic-specific)
+
+```bash
+bash scripts/run_distributed_train_pde.sh --help
 ```
 
-### 数据格式说明
+### Option C: Call the seismic MoE training script directly
 
-1. **训练数据**:
-   - 地震数据，波形数据（输入）: 形状为 `[batch_size, num_sources, time_steps, num_receivers]` 的NumPy数组
-   - 速度模型，速度图（输出）: 形状为 `[batch_size, height, width]` 的NumPy数组
-   - 通常 `num_sources=5`, `time_steps=1000`, `num_receivers=70`
-
-2. **数据集系列**:
-   - `vel`: 速度模型数据
-   - `style`: 风格化数据
-   - `fault`: 断层数据
-   - `all`: 使用所有可用数据
-
-### 自定义数据集
-
-如需使用自定义数据集，应确保：
-
-1. 遵循上述目录结构
-2. 数据格式为NumPy `.npy`文件
-3. 数据维度与上述描述一致
-
-如果数据格式不同，需要修改`neuralop/data/datasets/seismic_dataset.py`文件中的`_load_data`和`__getitem__`方法。
-
-## 代码使用方法
-
-<a id="代码使用方法"></a>
-
-### MoE架构训练
-
-当且仅当命令行中给出了 `--use_moe` `--use_experts_path` 且 `--top_k` > 1 且 `--choose_experts` 选择了多个专家，才会进行专家模型参数的冻结, 否则都是重新训练
-
-当单个专家模型训练好后, 将其放入一个专门的文件夹, 文件夹内, 四个专家四个pt文件, 将文件夹路径作为参数输入命令行
-
-### 单GPU训练
+Single-GPU example (replace data paths):
 
 ```bash
 python scripts/train_seismic_moe.py \
@@ -168,11 +142,7 @@ python scripts/train_seismic_moe.py \
     --output_dir ./results/seismic_moe
 ```
 
-```bash
-python scripts/train_seismic_moe.py --data_dir .\FWINO_data --family vel --batch_size 2 --epochs 100 --output_dir ./results/seismic_moe
-```
-
-### 分布式训练
+For distributed runs:
 
 ```bash
 bash scripts/run_distributed_seismic_moe.sh \
@@ -184,13 +154,28 @@ bash scripts/run_distributed_seismic_moe.sh \
     --output_dir ./results/distributed_seismic_moe
 ```
 
-```bash
-sbatch submit_FWINO_XXX.sh
-```
+On clusters with Slurm, **`sbatch school.sh`** is recommended (edit partition, GPU count, and other `#SBATCH` directives at the top of `school.sh`), consistent with the Zarr workflow docs.
 
-现在代码训练的结果存储中增加了使用的专家信息，同时如果是单一专家训练，会在单独的文件夹存储可能会用到的专家模型
+---
 
-### 模型推理
+## Encoder backbones (timm / DINOv3)
+
+Training scripts choose the backbone via CLI flags (exact names follow `choices` in `utils/parser_utils.py`), for example:
+
+- `vit` → `vit_small_patch16_dinov3.lvd1689m`
+- `convnext_tiny` → `convnext_tiny.dinov3_lvd1689m`
+
+Implementation: `Encoder_Dino`, `Encoder_ConvNeXt`, and **`get_encoder()`** in `neuralop/models/encoder.py`.
+
+---
+
+## MoE training and scripts
+
+- **Frozen experts**: When `--use_moe` and `--use_experts_path` are set, `--top_k > 1`, and multiple `--choose_experts` are selected, loaded expert weights are frozen by design; otherwise experts are typically trained from scratch.
+- **Expert checkpoint directory**: Place each expert’s `.pt` in one directory and pass that path via `--use_experts_path`.
+- **Experiment orchestration**: `python exp/run_afreqmoe_pipeline.py` batches seismic / PDE tasks, router types, `top_k`, `backbone`, etc. (see in-script docs and `--help`).
+
+### Inference example
 
 ```bash
 python scripts/train_seismic_moe.py \
@@ -200,272 +185,105 @@ python scripts/train_seismic_moe.py \
     --output_dir ./results/predictions
 ```
 
-### 模型评估
+---
 
-```bash
-python scripts/evaluate_moe.py \
-    --model_path ./results/seismic_moe/best_model.pt \
-    --dataset_type seismic \
-    --data_path /path/to/your/data \
-    --family all \
-    --output_dir ./evaluation_results
-```
+## Parameters and configuration
 
-## 参数说明
+### Common CLI flags (excerpt)
 
-<a id="参数说明"></a>
+| Flag | Description |
+|------|------|
+| `--mode` | `train` / `inference` |
+| `--data_dir` | Dataset root directory |
+| `--family` | Data subgroup, e.g. `vel`, `fault`, `style`, `all`, or finer names like `curve_vel_b` (must match layout) |
+| `--batch_size`, `--epochs` | Batch size and number of epochs |
+| `--top_k`, `--choose_experts` | MoE routing: in `choose_experts`, `0=FNO, 1=WNO, 2=MNO, 3=LNO` (confirm in current scripts) |
+| `--use_moe`, `--use_experts_path` | Enable MoE and expert checkpoint directory |
+| `--FNO_n_modes_height/width`, `--MNO_n_scales`, ... | Per-expert architecture hyperparameters |
 
-<!-- 设置跳转目标锚点 -->
-<h3 id="args-table">训练脚本参数</h3>
+A fuller table and defaults documented in **`config/seismic_moe_config.py`** appear in the “Work split and naming” section and historical docs.
 
-| 参数名 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `--mode` | str | train | 运行模式: 训练或推理 |
-| `--data_dir` | str | None | 数据目录路径 |
-| `--family` | str | all | 数据集系列: vel, style, fault 或 all |
-| `--batch_size` | int | 8 | 批次大小 |
-| `--epochs` | int | 100 | 训练轮数 |
-| `--num_workers` | int | 4 | 数据加载工作进程数 |
-| `--seed` | int | 42 | 随机种子 |
-| `--output_dir` | str | ./results | 结果保存目录 |
-| `--model_path` | str | None | 推理模式下使用的模型路径 |
-| `--vis_freq` | int | 5 | 可视化频率（每隔多少个epoch） |
-| `--distributed` | bool | False | 是否使用分布式训练 |
-| `--use_wandb` | bool | False | 是否使用WandB记录训练过程 |
-| `--val_ratio` | float | 0.2 | 验证集比例 |
-| `--top_k` | int | 1 | 选择前k个专家 |
-| `--choose_experts` | int nargs | [0] | 选择一个或多个专家，FNO:0，WNO:1，MNO:2，LNO:3 |
-| `--FNO_n_modes_height` | int | 16 | 高度傅里叶变换后保留的模态数量 |
-| `--FNO_n_modes_width` | int | 16 | 宽度傅里叶变换后保留的模态数量 |
-| `--WNO_n_levels_height` | int | 2 | 高度减少级别 |
-| `--WNO_n_levels_width` | int | 2 | 宽度减少级别 |
-| `--MNO_n_scales` | int | 3 | 总共使用的尺度 |
-| `--MNO_scale_factors` | float nargs | [1.0, 0.5, 0.25] | 每个尺度的缩放因子 |
-| `--MNO_n_layers` | int | 3 | 每个尺度使用的神经网络层数 |
-| `--LNO_n_modes` | int nargs | (16, 16) | 局部变换后保留的模态数量 |
-| `--LNO_n_layers` | int | 3 | 每个尺度使用的神经网络层数 |
-| `--k` | int | 1 | 数据预处理缩放尺度|
-| `--lambda_g1v` | float | 1.0 | L1损失函数的加权系数 |
-| `--lambda_g2v` | float | 1.0 | L2损失函数的加权系数 |
-| `--use_experts_path` | str | None | moe使用的专家模型存放路径 |
-| `--use_moe` | bool | False | 是否使用moe, 使用会冻结专家模型 |
+### MoE-related extended parameters (`MOEOperator`, etc.)
+
+- `router_type`: e.g. `basic`, `adamv`, and other adaptive routing policies  
+- `fusion_type`: `linear`, `attention`, `swa`, etc., for merging expert outputs  
+- `s_processor_type` / `w_processor_type`: fusion blocks for strong / weak expert outputs  
+- `beta`: strength of weak-activation influence  
+- `is_specific`: whether checkpoint names use fine-grained subclasses (curve/flat/style and A/B)  
+- `is_classifier`: whether to use grouped expert networks (GMoE)
 
 ---
 
-### 配置文件参数 (config/seismic_moe_config.py)
+## Model architecture highlights
 
-| 参数类别 | 参数名 | 默认值 | 说明 |
-|----------|--------|--------|------|
-| 基本配置 | model_name | MOE | 模型名称 |
-|  | in_channels | 1 | 输入通道数 |
-|  | out_channels | 5 | 输出通道数 |
-|  | hidden_channels | 64 | 隐藏层通道数 |
-| 数据集配置 | dataset_name | seismic | 数据集名称 |
-|  | data_dir | /data1/... | 数据目录路径 |
-|  | family | all | 数据集系列 |
-|  | normalize_inputs | True | 是否归一化输入 |
-|  | normalize_outputs | True | 是否归一化输出 |
-|  | channel_dim | 1 | 通道维度 |
-| MOE配置 | top_k | 2 | 选择前k个专家 |
-|  | noisy_gating | True | 是否使用噪声门控 |
-|  | fusion_type | linear | 专家输出融合方式 |
-|  | router_hidden_dim | 256 | 路由器隐藏层维度 |
-| 训练配置 | batch_size | 8 | 批次大小 |
-|  | learning_rate | 1e-3 | 学习率 |
-|  | weight_decay | 1e-4 | 权重衰减 |
-|  | epochs | 100 | 训练轮数 |
-|  | milestones | [30, 60, 90] | 学习率调整点 |
-|  | scheduler_gamma | 0.5 | 学习率衰减系数 |
-| 分布式配置 | use_distributed | False | 是否使用分布式训练 |
-|  | model_parallel_size | 1 | 模型并行大小 |
-|  | seed | 42 | 随机种子 |
+The seismic MoE model follows a **mixture-of-experts neural operator** design; main pieces:
 
-## 模型架构
+1. **Router**: Assigns inputs to experts; may include task-aware routing (e.g. `TaskAwareRouter`).  
+2. **Experts**: Defaults include FNO, WNO, MNO, LNO as frequency / multiscale / local experts.  
+3. **Fusion**: Merges expert outputs via linear layers, attention, etc.  
+4. **Encoder**: Optional DINOv3 ViT or ConvNeXt mapping observed waveforms to representations for downstream operators (see `encoder.py`).
 
-<a id="模型架构"></a>
+---
 
-seismic_moe模型是基于混合专家神经算子（Mixture of Experts Neural Operator）架构，包含以下主要组件：
+## Customization and extensions
 
-1. **Router（路由器）**: 负责将输入分配给最合适的专家。
-   - 支持基本路由器和任务感知路由器(TaskAwareRouter)
+- **Expert hyperparameters**: Prefer CLI overrides (see table above); for complex combos edit `expert_configs` in `config/seismic_moe_config.py`.  
+- **Loss or optimizer**: Adjust `criterion`, `optimizer`, `scheduler` in `scripts/train_seismic_moe.py`.  
+- **Data pipeline**: Custom data should match dimensions and keys expected by `SeismicDataset` / `SeismicDataProcessor`; Zarr details in `neuralop/data/dataloader/zarr_seismic_dataloader.py` and `README_train_from_scratch.md`.
 
-2. **Experts（专家）**: 默认配置包含四种专家:
-   - 傅里叶域专家: 捕捉频率特征
-   - 小波域专家: 处理局部特征和多尺度结构
-   - 多尺度专家: 处理多尺度地质结构
-   - 本地处理专家: 用于局部细节重建
+---
 
-3. **Fusion Layer（融合层）**: 整合各专家输出
-   - 支持线性融合和注意力融合
+## Distributed training and evaluation
 
-4. **Time-to-Space Projection（时间-空间转换）**: 将时间-偏移表示表示转换为空间表示，适用于输入为速度模型数据。
+### Distributed tips
 
-## 修改指南
+- Scale `batch_size` and `num_workers` appropriately  
+- Enable mixed precision when supported (e.g. `--use_amp` if present in the current `train_seismic_moe.py`)
 
-<a id="修改指南"></a>
+### Validation and metrics
 
-### 修改网络架构
+During training, `train_seismic_moe.py` and `utils/train_process.py` compute validation loss and related metrics; for standalone inference use `--mode inference` with `--model_path` (see `run_inference` and argparse in the script). The repo also has `openfwi/train.py` and other standalone entry points for experiments.
 
-1. **调整专家配置**:
+---
 
-- 基本参数调整
-    
-    直接通过修改脚本中的命令参数来调整，详细参数设置可以参考上方<a href="#args-table">训练脚本参数表格</a>
+## Further documentation
 
-    实例：
+- **[README_train_from_scratch.md](README_train_from_scratch.md)**: Zarr conversion, `family` aliases, `preset1`/`preset2`, Slurm vs local one-shot workflows.  
+- **OpenFWI**: [dataset page](https://openfwi-lanl.github.io/docs/data.html).  
+- **Pretrained backbones**: [ViT-S/16 DINOv3](https://huggingface.co/timm/vit_small_patch16_dinov3.lvd1689m), [ConvNeXt-Tiny DINOv3](https://huggingface.co/timm/convnext_tiny.dinov3_lvd1689m).
 
-    ```bash
-    bash scripts/run_distributed_seismic_moe.sh --num_gpus 2 --data_dir ../FWINO_data --family all --batch_size 1000 --epochs 100 --output_dir ../results/seismic_moe_${SLURM_JOB_NAME}_${SLURM_JOB_ID}  --top_k 2 --choose_experts 0 2 --MNO_n_scales 5
-    ```
-    解释: 使用FNO和MNO两个专家，调整MNO的n_scales参数为5
+---
 
-- 更多参数修改
-  
-    不推荐，如果需要修改更多参数，可以提交issue，直接增加命令行参数设置
+## Work split and checkpoint naming (team notes)
 
-    修改`config/seismic_moe_config.py`中的`expert_configs`列表：
+**Phase one**: Single-expert behavior and characterization (debugging division of labor among WNO / MNO / FNO / LNO), aiming for stable runs near public baselines.
 
-```python
-expert_configs = [
-    # 傅里叶域专家
-    {
-        'type': 'domain',
-        'domain_type': 'fourier',
-        'n_dim': 2,
-        'n_modes_height': 16,  # 调整模式数
-        'n_modes_width': 16,   # 调整模式数
-        # 添加或修改参数
-    },
-    # 添加更多专家...
-]
+**Checkpoint naming**
+
+- **normal**: Three coarse families `vel` / `fault` / `style`: `best_expert_{experts_name}_{i}_{vel|fault|style}.pt`  
+- **specific**: Finer splits `curve_vel`, `curve_fault`, `flat_vel`, `flat_fault`, `style` with `_a`/`_b` suffixes where applicable: `best_expert_{experts_name}_{i}_{curve|flat|style}_{vel|fault|style}.pt`
+
+---
+
+## Dataset directory example (legacy / NumPy workflow)
+
+Some scripts expect a layout like this when not using Zarr (otherwise follow the actual `SeismicDataset` contract):
+
+```text
+data_dir/
+├── train_samples/
+│   └── <subset_name>/
+│       ├── model/model{i}.npy    # velocity model
+│       └── data/data{i}.npy      # seismic waveforms
+└── test/
 ```
 
-1. **修改路由器**:
-   调整`MOEOperator`初始化参数：
+Typical tensor shapes: waveforms `[B, 5, 1000, 70]`, velocity `[B, 70, 70]` or `[B, 1, 70, 70]`.
 
-```python
-model = MOEOperator(
-    experts=experts,
-    in_channels=config.in_channels,
-    out_channels=config.out_channels,
-    hidden_channels=128,  # 增加隐藏层通道数
-    top_k=3,  # 增加选择的专家数量
-    router_type='task_aware',  # 使用任务感知路由器
-    task_dim=8,  # 设置任务特征维度
-    routing_mode='both'  # 设置路由模式
-)
-```
+---
 
-3. **自定义专家**:
-   创建自定义专家并添加到`expert_factory.py`中。
+## License and acknowledgments
 
-### 修改训练过程
-
-1. **调整损失函数**:
-   修改`scripts/train_seismic_moe.py`中的`criterion`：
-
-```python
-# 使用带权重的MSE损失
-criterion = lambda pred, target: F.mse_loss(pred, target) * weight_factor
-```
-
-2. **添加正则化**:
-   修改优化器配置：
-
-```python
-optimizer = torch.optim.Adam(
-    model.parameters(),
-    lr=config.learning_rate,
-    weight_decay=1e-3,  # 增加权重衰减
-)
-```
-
-3. **修改学习率调度**:
-   调整学习率调度器：
-
-```python
-scheduler = torch.optim.CosineAnnealingLR(  # 使用余弦退火调度
-    optimizer,
-    T_max=config.epochs,
-    eta_min=1e-6
-)
-```
-
-### 修改数据处理
-
-修改`SeismicDataProcessor`类中的数据处理逻辑：
-
-```python
-def __call__(self, sample):
-    # 获取输入和输出
-    if 'input' in sample:
-        x = sample['input']
-        
-        # 添加数据增强
-        if self.training:
-            # 随机裁剪
-            x = random_crop(x, size=(64, 64))
-            
-            # 随机翻转
-            if random.random() > 0.5:
-                x = torch.flip(x, dims=(2,))
-                
-        sample['input'] = x
-    # ...其余代码保持不变
-```
-
-## 分布式训练
-<a id="分布式训练"></a>
-
-### 配置分布式训练
-
-1. 修改配置文件启用分布式训练：
-
-```python
-# config/seismic_moe_config.py
-distributed = DistributedConfig(
-    use_distributed=True,
-    model_parallel_size=1,
-    seed=42
-)
-```
-
-2. 使用`run_distributed_seismic_moe.sh`脚本启动分布式训练：
-
-```bash
-bash scripts/run_distributed_seismic_moe.sh \
-    --num_gpus 4 \
-    --data_dir /path/to/data \
-    --batch_size 16 \
-    --epochs 100
-```
-
-### 分布式训练性能优化
-
-1. 增加每个GPU的批大小
-2. 启用混合精度训练：`mixed_precision=True`
-3. 调整数据加载工作进程数：`--num_workers 8`
-
-## 结果评估
-<a id="结果评估"></a>
-
-使用`evaluate_moe.py`脚本评估训练模型的性能：
-
-```bash
-python scripts/evaluate_moe.py \
-    --model_path ./results/seismic_moe/best_model.pt \
-    --dataset_type seismic \
-    --data_path /path/to/validation/data \
-    --batch_size 16 \
-    --output_dir ./evaluation
-```
-
-该脚本输出以下指标：
-- MSE (均方误差)
-- MAE (平均绝对误差)
-- PSNR (峰值信噪比)
-- 相对L2误差
-- SSIM (结构相似性指数，需安装scikit-image)
-
-同时生成可视化结果，包括输入、目标和预测对比图。
-
+- Follow **OpenFWI** and LANL licensing/terms for datasets.  
+- Follow each model card’s **License** on Hugging Face for DINOv3 / timm weights (e.g. DINOv3 license).  
+- Neural operators and scientific stack: respect each dependency’s open-source license.

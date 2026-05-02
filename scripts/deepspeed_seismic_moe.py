@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-DeepSpeed 版训练脚本（精简命令行：用 config JSON 覆盖 config 类，或用 setting_path 恢复）
-- 不使用 DeepSpeed 自带 MoE；保留你的自定义 MoE/路由/专家实现
-- ds_config 管理 ZeRO/offload/activation checkpointing（bf16/fp16 全局关闭）
-- Encoder 仅在 autocast(bf16) 下运行；MoE/主干全程 FP32（禁用 AMP）
-- 使用 DeepSpeed Adam(adam_w_mode=True) + 内置 WarmupCosineLR（比例参数由本地 config 推导）
-- engine.backward()/engine.step() & engine.save/load_checkpoint()
+DeepSpeed training script (minimal CLI: override config class via JSON, or restore via setting_path).
+- Does not use DeepSpeed built-in MoE; keeps custom MoE/router/expert implementation.
+- ds_config controls ZeRO/offload/activation checkpointing (bf16/fp16 globally disabled).
+- Encoder runs under autocast(bf16) only; MoE/backbone stay FP32 (AMP disabled).
+- Uses DeepSpeed Adam (adam_w_mode=True) + built-in WarmupCosineLR (ratios derived from local config).
+- engine.backward()/engine.step() & engine.save/load_checkpoint().
 """
 
 import sys
@@ -27,9 +27,9 @@ from torchvision.transforms import Compose
 import deepspeed
 from deepspeed import zero
 
-# 进度条与绘图工具导入
+# tqdm progress bar
 from tqdm.auto import tqdm
-# ===== 你的工程内模块（保持原结构）=====
+# ===== In-repo modules (unchanged layout) =====
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from neuralop.data.datasets.seismic_dataset import SeismicDataProcessor
 from scripts import transforms as T
@@ -45,7 +45,7 @@ from neuralop.losses import L1L2Loss, SobelLoss, FourierMag_L1
 from neuralop.layers.spectral_convolution import SpectralConv
 from tltorch.factorized_tensors.core import FactorizedTensor
 from neuralop.utils import count_model_params
-from utils import *  # 包含：get_seismic_config / EarlyStopping / SeismicMetrics / load_moe_experts / load_encoder_weights / plot_loss_curve / safe_random_split
+from utils import *  # get_seismic_config, EarlyStopping, SeismicMetrics, load_moe_experts, load_encoder_weights, plot_loss_curve, safe_random_split
 
 try:
     import wandb  # noqa: F401
@@ -53,9 +53,9 @@ except Exception:
     wandb = None
 
 
-# ---------------- 工具：用 JSON 递归覆盖 config ----------------
+# ---------------- Utils: recursively apply JSON onto config ----------------
 def _recursive_update(obj, payload):
-    """将 dict 递归写回到 config 对象（含嵌套子对象）"""
+    """Recursively write dict fields onto config object (including nested sub-objects)."""
     for k, v in payload.items():
         if isinstance(v, dict) and hasattr(obj, k):
             child = getattr(obj, k)
@@ -67,7 +67,7 @@ def _recursive_update(obj, payload):
             setattr(obj, k, v)
 
 
-# ---------------- 工具：把 batch 递归搬到指定设备（不做 dtype 强制转换！交给 forward 内部控制） ----------------
+# ---------------- Utils: move batch recursively to device (no dtype coercion; forward controls dtypes) ----------------
 def _to_device(x, device):
     if torch.is_tensor(x):
         return x.to(device, non_blocking=True)
@@ -81,23 +81,23 @@ def _to_device(x, device):
 
 def _load_args_and_config(args):
     """
-    返回：merged_args(Namespace), config(dict or obj-like), runtime_ctx
-    - 若提供 --setting_path：读取 setting_path/args.json 与 config.json，然后用当前 CLI 覆盖
-    - 否则使用 --config_path 读取配置，并按 CLI 传参覆盖 config 类
+    Returns: merged_args (Namespace), config (dict or obj-like), runtime_ctx.
+    - If --setting_path: load setting_path/args.json and config.json, then overlay current CLI.
+    - Else use --config_path JSON and overlay CLI onto the config class.
     """
     base_args = args
 
-    # setting_path 模式
+    # setting_path mode
     if args.setting_path is not None:
         setting_dir = Path(args.setting_path)
         if not setting_dir.exists():
-            raise ValueError(f"配置目录不存在: {setting_dir}")
+            raise ValueError(f"Setting directory does not exist: {setting_dir}")
         args_path = setting_dir / "args.json"
         config_path = setting_dir / "config.json"
         if not args_path.exists():
-            raise ValueError(f"缺少训练时保存的参数文件: {args_path}")
+            raise ValueError(f"Missing saved training args file: {args_path}")
         if not config_path.exists():
-            raise ValueError(f"缺少训练时保存的配置文件: {config_path}")
+            raise ValueError(f"Missing saved training config file: {config_path}")
 
         with open(args_path, "r", encoding="utf-8") as f:
             stored_args_dict = json.load(f)
@@ -114,12 +114,12 @@ def _load_args_and_config(args):
         _recursive_update(config, stored_config_dict)
         return runtime_args, config, runtime_ctx
 
-    # config_path 模式
+    # config_path mode
     if args.config_path is None:
-        raise ValueError("需要提供 --config_path 或 --setting_path 其中之一")
+        raise ValueError("Provide either --config_path or --setting_path")
     config_path = Path(args.config_path)
     if not config_path.exists():
-        raise ValueError(f"缺少训练时保存的配置文件: {config_path}")
+        raise ValueError(f"Missing config file: {config_path}")
 
     config, runtime_ctx = get_seismic_config(base_args)
     with open(config_path, "r", encoding="utf-8") as f:
@@ -128,32 +128,32 @@ def _load_args_and_config(args):
     return base_args, config, runtime_ctx
 
 
-# ---------------- SpectralConv dtype/device 修复补丁 ----------------
+# ---------------- SpectralConv dtype/device patch ----------------
 def patch_spectral_conv_dtype_fix(module, verbose=True):
     """
-    给 module（包含若干 SpectralConv）打补丁：
-    - 若权重为 FactorizedTensor，先 .to_tensor()
-    - 若 x 为 complex 而权重非 complex，则将权重提升为 complex
-    - 将权重对齐到 x 的 dtype 与 device
-    - 之后调用原先的 _contract 做真正的频域乘法
+    Patch module (may contain several SpectralConv):
+    - If weight is FactorizedTensor, call .to_tensor() first.
+    - If x is complex and weight is not, promote weight to complex.
+    - Align weight dtype/device to x.
+    - Then call original _contract for actual frequency-domain multiply.
     """
     total = 0
     for m in module.modules():
         if isinstance(m, SpectralConv):
             total += 1
             if not hasattr(m, "_contract_impl"):
-                m._contract_impl = m._contract  # 保存原函数
+                m._contract_impl = m._contract  # save original
 
                 def _wrapped_contract(x, weight, separable=False, _m=m):
                     # 1) factorized -> dense
                     if isinstance(weight, FactorizedTensor):
                         weight = weight.to_tensor()
-                    # 2) 复/实对齐
+                    # 2) complex/real alignment
                     if torch.is_complex(x) and not torch.is_complex(weight):
                         weight = torch.complex(weight, torch.zeros_like(weight))
-                    # 3) dtype/device 对齐（以 x 为准）
+                    # 3) dtype/device alignment (follow x)
                     weight = weight.to(dtype=x.dtype, device=x.device)
-                    # 4) 交回原实现
+                    # 4) delegate to original impl
                     return _m._contract_impl(x, weight, separable=separable)
 
                 m._contract = _wrapped_contract
@@ -166,15 +166,15 @@ def _autocast_device_str(device: torch.device) -> str:
 
 
 def run_training_deepspeed(args):
-    """DeepSpeed 版本训练：Encoder 用 bf16(autocast)，MoE/主干 FP32；DS 优化器/调度器由 ds-config 决定"""
-    # -------- 基础设置 --------
+    """DeepSpeed training: encoder bf16 (autocast), MoE/backbone FP32; DS optimizer/scheduler from ds-config."""
+    # -------- Basics --------
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    # 1) 合并/加载 args 与 config
+    # 1) Merge/load args and config
     args, config, runtime_ctx = _load_args_and_config(args)
 
-    # runtime 信息
+    # runtime
     device = runtime_ctx["device"]
     is_logger = runtime_ctx["is_logger"]
     world_size = runtime_ctx["world_size"]
@@ -182,13 +182,13 @@ def run_training_deepspeed(args):
     experts_name = runtime_ctx["experts_name"]
     experts_name_str = runtime_ctx["experts_name_str"]
 
-    # -------- 数据准备（与你原逻辑一致）--------
+    # -------- Data (same as original) --------
     data_dict = None
     if getattr(args, "zarr_path", None) or getattr(config, "zarr_path", None):
         zarr_path = getattr(args, "zarr_path", None) or getattr(config, "zarr_path", None)
         json_path = getattr(args, "status_json", None) or getattr(config, "status_json", None)
-        assert zarr_path is not None, "使用zarr数据格式时需要 zarr_path"
-        assert json_path is not None, "使用zarr数据集格式，需要指定归一化统计量 json（status_json）"
+        assert zarr_path is not None, "zarr_path is required when using Zarr data"
+        assert json_path is not None, "For Zarr dataset, provide normalization stats JSON (status_json)"
 
         with open(json_path, "r") as f:
             data_dict_raw = json.load(f)
@@ -207,7 +207,7 @@ def run_training_deepspeed(args):
         output_transform = Compose([
             T.MinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
         ])
-        # 反归一化（如需可视化）
+        # Inverse transforms (for visualization)
         input_inverse_transform = Compose([
             T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k)),
             T.InverseLogTransform(k=args.k)
@@ -242,7 +242,7 @@ def run_training_deepspeed(args):
             world_size=world_size, local_rank=local_rank
         )
     else:
-        # family → 验证比例
+        # family -> val split ratio
         if config.family in ['curve_vel_a', 'curve_vel_b', 'flat_vel_a', 'flat_vel_b']:
             val_ratio = 6 / 30
         elif config.family in ['curve_fault_a', 'curve_fault_b', 'flat_fault_a', 'flat_fault_b']:
@@ -250,7 +250,7 @@ def run_training_deepspeed(args):
         elif config.family in ['style_a', 'style_b', 'style_style_a', 'style_style_b']:
             val_ratio = 7 / 67
         else:
-            raise ValueError("不支持的 family")
+            raise ValueError("Unsupported family")
 
         full_dataset = SeismicDataset(
             data_dir=config.data_dir, family=config.family,
@@ -261,7 +261,7 @@ def run_training_deepspeed(args):
         dataset_size = len(full_dataset)
         train_size, val_size = safe_random_split(dataset_size, [1 - val_ratio, val_ratio])
         if is_logger:
-            print(f"数据集总大小: {dataset_size} | 训练: {train_size} | 验证: {val_size}")
+            print(f"Dataset size: {dataset_size} | train: {train_size} | val: {val_size}")
 
         train_dataset, val_dataset = random_split(
             full_dataset, [train_size, val_size],
@@ -278,7 +278,7 @@ def run_training_deepspeed(args):
         output_transform = Compose([
             T.MinMaxNormalize(data_dict['output_min'], data_dict['output_max'])
         ])
-        # 反归一化（如需可视化）
+        # Inverse transforms (for visualization)
         input_inverse_transform = Compose([
             T.InverseMinMaxNormalize(T.log_transform(data_dict['input_min'], k=args.k), T.log_transform(data_dict['input_max'], k=args.k)),
             T.InverseLogTransform(k=args.k)
@@ -332,7 +332,7 @@ def run_training_deepspeed(args):
         if prefetch is not None:
             print(f"prefetch_factor={prefetch}")
 
-    # -------- 形状探测 / in_channels --------
+    # -------- Shape probe / in_channels --------
     sample_batch = next(iter(train_loader))
     config.in_channels = sample_batch['input'].shape[1]
     if is_logger:
@@ -340,7 +340,7 @@ def run_training_deepspeed(args):
         print(f"[Config] in={config.in_channels}, out={config.out_channels}, hidden={config.hidden_channels}")
         print(f"[Experts] num={len(config.expert_configs)}")
 
-    # -------- 可选 encoder --------
+    # -------- Optional encoder --------
     encoder_model = None
     encoder_freeze = False
     if config.use_encoder:
@@ -393,7 +393,7 @@ def run_training_deepspeed(args):
 
     config.moe_in_channels = moe_in_channels
 
-    # -------- 专家与 MoE 主干（保持你的实现）--------
+    # -------- Experts and MoE backbone (unchanged implementation) --------
     if config.use_moe and config.use_experts_path:
         experts = load_moe_experts(
             experts_config=config.load_expert_configs,
@@ -418,10 +418,10 @@ def run_training_deepspeed(args):
         batch_size=config.batch_size, v_type_num=config.v_type_num, use_expert_memory_proxy=config.use_gpu_proxy
     )
 
-    # -------- 在 DeepSpeed 初始化之前，打 SpectralConv 修复补丁 --------
+    # -------- Apply SpectralConv patch before DeepSpeed init --------
     patch_spectral_conv_dtype_fix(moe_model, verbose=is_logger)
 
-    # -------- 组合模型（与 train_seismic_moe.py 一致）--------
+    # -------- Combined model (matches train_seismic_moe.py) --------
     emo_model = EMO(
         encoder_model if config.use_encoder else None,
         moe_model,
@@ -475,9 +475,9 @@ def run_training_deepspeed(args):
     )
     model_for_engine = DeepSpeedEMOWrapper(emo_model, device=device, train_encoder=train_encoder_flag)
 
-    # ======================= DeepSpeed：AdamW+WarmupCosineLR（比例），并强制关闭全局 AMP =======================
+    # ======================= DeepSpeed: AdamW + WarmupCosineLR (ratios); global AMP forced off =======================
 
-    # 步数（供 WarmupCosineLR 使用）
+    # Step counts for WarmupCosineLR
     steps_per_epoch = max(1, len(train_loader))
     total_num_steps = int(getattr(config, "epochs", 100) * steps_per_epoch)
 
@@ -495,19 +495,19 @@ def run_training_deepspeed(args):
     warmup_type = "linear" if "lin" in warmup_method else ("log" if "log" in warmup_method else "linear")
 
     if not args.deepspeed_config:
-        raise ValueError("需提供 --deepspeed_config")
+        raise ValueError("Provide --deepspeed_config")
     ds_cfg_path = Path(args.deepspeed_config)
     if not ds_cfg_path.exists():
-        raise ValueError(f"DeepSpeed 配置文件不存在: {ds_cfg_path}")
+        raise ValueError(f"DeepSpeed config file not found: {ds_cfg_path}")
 
     with open(ds_cfg_path, "r", encoding="utf-8") as f:
         ds_cfg = json.load(f)
 
-    # 强制关闭全局 AMP，避免 DS 把全模型参数转 bf16/fp16
+    # Force global AMP off so DS does not cast whole model to bf16/fp16
     ds_cfg["bf16"] = {"enabled": False}
     ds_cfg["fp16"] = {"enabled": False}
 
-    # 优化器：DeepSpeed 通用 Adam + AdamW 模式
+    # Optimizer: DeepSpeed Adam + AdamW mode
     ds_cfg["optimizer"] = {
         "type": "Adam",
         "params": {
@@ -519,7 +519,7 @@ def run_training_deepspeed(args):
         }
     }
 
-    # 调度器：WarmupCosineLR（比例入参）
+    # Scheduler: WarmupCosineLR (ratio params)
     ds_cfg["scheduler"] = {
         "type": "WarmupCosineLR",
         "params": {
@@ -532,7 +532,7 @@ def run_training_deepspeed(args):
         }
     }
 
-    # ZeRO Offload（若原文件未给出，则补默认）
+    # ZeRO offload defaults if missing in file
     zero_cfg = ds_cfg.get("zero_optimization", {})
     off_cfg = zero_cfg.get("offload_optimizer", {})
     if isinstance(off_cfg, dict):
@@ -541,14 +541,14 @@ def run_training_deepspeed(args):
     zero_cfg["offload_optimizer"] = off_cfg
     ds_cfg["zero_optimization"] = zero_cfg
 
-    # DeepSpeed 初始化：交由 ds_cfg 创建优化器/调度器
+    # DeepSpeed init: optimizer/scheduler from ds_cfg
     engine, _, _, _ = deepspeed.initialize(
         model=model_for_engine,
         model_parameters=(p for p in model_for_engine.parameters() if p.requires_grad),
         config=ds_cfg
     )
 
-    # -------- Loss/Metric/早停 --------
+    # -------- Loss / metrics / early stopping --------
     lambda_grad_l1 = float(getattr(config, "lambda_grad_l1", 0.0))
     lambda_fourier_mag_l1 = float(getattr(config, "lambda_fourier_mag_l1", 0.0))
     lambda_ce = float(getattr(config, "lambda_ce", 0.0))
@@ -557,7 +557,7 @@ def run_training_deepspeed(args):
     grad_loss_module = SobelLoss() if lambda_grad_l1 > 0 else None
     fourier_loss_module = FourierMag_L1() if lambda_fourier_mag_l1 > 0 else None
 
-    # 把 loss 模块搬到当前 rank 的设备，避免 conv2d 权重/输入 device 不一致
+    # Move loss modules to this rank's device to avoid conv2d weight/input device mismatch
     if base_loss is not None:
         base_loss = base_loss.to(engine.device)
     if grad_loss_module is not None:
@@ -565,7 +565,7 @@ def run_training_deepspeed(args):
     if fourier_loss_module is not None:
         fourier_loss_module = fourier_loss_module.to(engine.device)
 
-    # 统一在损失处转 FP32，避免 dtype 不一致
+    # Cast to FP32 in loss for dtype consistency
     if train_encoder_flag:
         def criterion(pred: torch.Tensor, gt: torch.Tensor, logits: torch.Tensor, labels: torch.Tensor):
             pred = pred.float(); gt = gt.float()
@@ -594,7 +594,7 @@ def run_training_deepspeed(args):
     metrics = SeismicMetrics()
     use_wandb = bool(getattr(args, "use_wandb", False) and wandb is not None)
 
-    # -------- 输出目录 / 日志（修复：rank0 创建，所有 rank barrier）--------
+    # -------- Output dirs / logging (rank0 creates; all ranks barrier) --------
     def _slugify(text: str) -> str:
         return "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in str(text))
 
@@ -616,16 +616,16 @@ def run_training_deepspeed(args):
     tb_dir = tb_root / run_group / run_name
     tb_writer: Optional[SummaryWriter] = None
 
-    # 仅 rank0 创建目录
+    # rank0 only creates dirs
     if deepspeed.comm.get_rank() == 0:
         results_dir.mkdir(parents=True, exist_ok=True)
         tb_dir.mkdir(parents=True, exist_ok=True)
 
-    # 全员等待目录就绪
+    # All ranks wait for dirs
     if deepspeed.comm.get_world_size() > 1:
         deepspeed.comm.barrier()
 
-    # rank0 写入日志/配置；非 logger 也持有路径字符串
+    # rank0 writes logs/config; non-loggers still hold path strings
     if is_logger:
         tb_writer = SummaryWriter(log_dir=str(tb_dir))
         config.experiment_dir = str(results_dir)
@@ -646,7 +646,7 @@ def run_training_deepspeed(args):
         config.experiment_dir = str(results_dir)
         config.tensorboard_dir = str(tb_dir)
 
-    # -------- 早停 & 恢复 --------
+    # -------- Early stopping & resume --------
     best_val_loss = float("inf")
     best_epoch_metrics = None
     best_epoch_index = None
@@ -668,7 +668,7 @@ def run_training_deepspeed(args):
             print(f"[DeepSpeed] resume from {args.resume_path} | load_path={load_path}")
         start_epoch = 0
 
-    # -------- 训练/验证循环（DeepSpeed 托管）--------
+    # -------- Train/val loop (DeepSpeed-managed) --------
     try:
         for epoch in range(start_epoch, config.epochs):
             engine.train()
@@ -712,7 +712,7 @@ def run_training_deepspeed(args):
                     raise RuntimeError(f"Encountered non-finite loss at step {step}: {total_loss.item()}")
 
                 engine.backward(total_loss)
-                engine.step()      # 调度器由 DeepSpeed 内部推进
+                engine.step()      # scheduler stepped inside DeepSpeed
 
                 step_total = float(total_loss.detach().item())
                 train_total += step_total
@@ -749,7 +749,7 @@ def run_training_deepspeed(args):
             # ---------- Val ----------
             engine.eval()
             with torch.no_grad():
-                # 累加“和”方便跨卡规约
+                # Accumulate sums for cross-rank reduction
                 sum_loss = 0.0
                 sum_l1 = 0.0
                 sum_l2 = 0.0
@@ -786,7 +786,7 @@ def run_training_deepspeed(args):
                             psnr=f"{float(res.get('psnr', 0.0)):.2f}"
                         )
 
-                # 本 rank 的求和与计数
+                # This rank's sums and count
                 if train_encoder_flag:
                     local_sums = torch.tensor(
                         [sum_loss, sum_l1, sum_l2, sum_psnr, sum_rmse, sum_ssim, sum_ce],
@@ -799,12 +799,12 @@ def run_training_deepspeed(args):
                     )
                 local_cnt = torch.tensor([cnt_batches], dtype=torch.float64, device=engine.device)
 
-                # 跨 rank 规约：SUM
+                # Cross-rank reduce: SUM
                 if deepspeed.comm.get_world_size() > 1:
                     deepspeed.comm.all_reduce(local_sums, op=deepspeed.comm.ReduceOp.SUM)
                     deepspeed.comm.all_reduce(local_cnt,  op=deepspeed.comm.ReduceOp.SUM)
 
-                # 全局一致的均值
+                # Globally consistent means
                 denom = max(1.0, float(local_cnt.item()))
                 val_loss = float(local_sums[0].item() / denom)
                 val_mae  = float(local_sums[1].item() / denom)
@@ -843,7 +843,7 @@ def run_training_deepspeed(args):
                 if type_weight_hist_sample is not None:
                     tb_writer.add_histogram("encoder/type_logits", type_weight_hist_sample, epoch_step)
 
-            # ---------- 记录到日志（仅 logger 打印/落盘）----------
+            # ---------- Log file (logger only prints/writes) ----------
             if is_logger:
                 if train_encoder_flag:
                     row = f"{epoch_step:>8d} | {avg_train_loss:>14.6f} | {val_loss:>12.6f} | {val_mae:>8.6f} | {val_mse:>8.6f} | {val_psnr:>8.4f} | {val_rmse:>8.6f} | {val_ssim:>8.6f} | {val_ce:>8.6f} |\n"
@@ -936,7 +936,7 @@ def run_training_deepspeed(args):
                 epoch_metrics["learning_rate"] = float(lr_this_epoch)
             epoch_metrics["router_top_k"] = int(getattr(engine.module.moe, "top_k", 0))
 
-            # ---------- 全局同步 best，并在同一把尺子上判定 improved ----------
+            # ---------- Global best sync; improved on same scale ----------
             if deepspeed.comm.get_world_size() > 1:
                 best_t = torch.tensor([best_val_loss], dtype=torch.float64, device=engine.device)
                 deepspeed.comm.all_reduce(best_t, op=deepspeed.comm.ReduceOp.MIN)
@@ -946,19 +946,19 @@ def run_training_deepspeed(args):
 
             improved = (val_loss < (best_val_loss_global - 1e-12))
 
-            # ====== 保存 checkpoint：所有 rank 必须一致进入 ======
+            # ====== Save checkpoint: all ranks must enter together ======
             if improved:
-                # 先把 best 更新为全局一致的新值
+                # Update best to globally consistent new value first
                 best_val_loss = val_loss
                 save_tag = f"best_e{epoch+1}"
 
-                # 兼容不同 DS 版本：老版本没有 save_zero_checkpoint_only
+                # Older DS versions lack save_zero_checkpoint_only
                 try:
                     engine.save_checkpoint(results_dir.as_posix(), tag=save_tag, save_zero_checkpoint_only=True)
                 except TypeError:
                     engine.save_checkpoint(results_dir.as_posix(), tag=save_tag)
 
-                # 保存后 barrier，避免竞态
+                # Barrier after save to avoid races
                 if deepspeed.comm.get_world_size() > 1:
                     deepspeed.comm.barrier()
 
@@ -970,9 +970,9 @@ def run_training_deepspeed(args):
                 if is_logger:
                     with open(results_dir / "best_metrics.json", "w", encoding="utf-8") as f:
                         json.dump(best_epoch_metrics, f, indent=2)
-            # ====== 改动点结束 ======
+            # ====== End save-best block ======
 
-            # 保存最近一次 checkpoint
+            # Save latest checkpoint
             try:
                 engine.save_checkpoint(results_dir.as_posix(), tag="last", save_zero_checkpoint_only=True)
             except TypeError:
@@ -989,7 +989,7 @@ def run_training_deepspeed(args):
                     f"val_loss={val_loss:.6f} psnr={val_psnr:.4f} mae={val_mae:.6f}"
                 )
 
-            # 可视化（仅 logger；指标提升或到达周期）
+            # Visualization (logger only; on improvement or every vis_every epochs pattern)
             if is_logger and (improved or ((epoch + 1) % int(getattr(config, "vis_every", 5)) == 0)):
                 try:
                     vis_batch = next(iter(val_loader))
@@ -1002,7 +1002,7 @@ def run_training_deepspeed(args):
                         else:
                             vis_pred, vis_y, vis_logits = vis_out[0], vis_out[1], None
 
-                    # 反归一化
+                    # Denormalize
                     vis_in = vis_batch['input']
                     vis_in_v = input_inverse_transform(vis_in)
                     vis_pred_v = output_inverse_transform(vis_pred)
@@ -1041,7 +1041,7 @@ def run_training_deepspeed(args):
 
             if early_stopper is not None and early_stopper.step(val_loss, epoch):
                 if is_logger:
-                    print("[EarlyStop] 触发提前停止。")
+                    print("[EarlyStop] Early stopping triggered.")
                 break
 
         if is_logger:
@@ -1071,12 +1071,12 @@ def run_training_deepspeed(args):
                     if "train_ce" in best_epoch_metrics:
                         metric_summary["best/train_ce"] = best_epoch_metrics.get("train_ce", float("nan"))
                 tb_writer.add_hparams(hparam_summary, metric_summary)
-                print("已写入hparams")
+                print("Wrote hparams to TensorBoard")
     finally:
         if tb_writer is not None:
             tb_writer.flush()
             tb_writer.close()
-        # 正常收尾
+        # Clean shutdown
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             try:
                 torch.distributed.destroy_process_group()
@@ -1091,24 +1091,24 @@ def build_arg_parser():
     import argparse
     p = argparse.ArgumentParser("DeepSpeed training for seismic MoE (config JSON driven or setting_path restored)")
 
-    # 互斥：setting_path 或 config_path 二选一
+    # Mutually exclusive: setting_path OR config_path
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--setting_path", type=str, default=None,
-                   help="指向包含 args.json & config.json 的目录（从已有实验恢复配置）")
+                   help="Directory with args.json & config.json (restore experiment config)")
     g.add_argument("--config_path", type=str, default=None,
-                   help="直接使用配置 JSON 路径（覆盖 config 类）")
+                   help="Path to config JSON (overrides config class)")
 
     p.add_argument("--deepspeed_config", type=str, default="scripts/ds_zero3_bf16_offload.json", help="Path to ds_config.json")
 
-    # 可能需要的运行时数据路径
+    # Optional runtime data paths
     p.add_argument("--zarr_path", type=str, default=None)
     p.add_argument("--status_json", type=str, default=None)
 
     # resume / encoder
     p.add_argument("--resume_path", type=str, default=None, help="DeepSpeed checkpoint dir to resume")
-    p.add_argument("--encoder_path", type=str, default=None, help="预训练 encoder 权重（可选）")
+    p.add_argument("--encoder_path", type=str, default=None, help="Pretrained encoder weights (optional)")
 
-    # get_seismic_config 可能用到的参数（保留少量）
+    # Minimal args for get_seismic_config
     p.add_argument("--distributed", action="store_true", default=True)
     p.add_argument("--num_workers", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
@@ -1120,17 +1120,17 @@ def build_arg_parser():
 
 def main():
     args = build_arg_parser().parse_args()
-    # 常见加速/稳定环境变量（按需保留）
+    # Common accel/stability env vars (keep as-is)
     os.environ.setdefault("NCCL_P2P_LEVEL", "SYS")
     os.environ.setdefault("NCCL_IB_DISABLE", "1")
     os.environ.setdefault("OMP_NUM_THREADS", "8")
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-    # 可选：避免 Triton autotune 缓存在 NFS 导致退出卡顿（根据你机器目录调整）
+    # Optional: avoid Triton autotune cache on NFS slowing shutdown (adjust path per machine)
     cache_dir = os.environ.setdefault("TRITON_CACHE_DIR", os.path.expanduser("~/.triton_cache"))
     os.makedirs(cache_dir, exist_ok=True)
 
-    # 规范化路径
+    # Normalize paths
     if args.config_path:
         args.config_path = Path(args.config_path)
     if args.setting_path:

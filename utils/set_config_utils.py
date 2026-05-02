@@ -40,7 +40,7 @@ def _build_runtime_context(
     }
 
 def get_seismic_config(args: argparse.Namespace):
-    # 加载配置
+    # Load base config
     config = SeismicMOEConfig()
     if getattr(args, "model_name", None):
         config.model_name = args.model_name
@@ -48,13 +48,12 @@ def get_seismic_config(args: argparse.Namespace):
     if args.mode == 'train_encoder':
         config.train_encoder = True
     
-    # 更新配置
-    # 代码解释：如果用户在命令行中传入了参数 --data_dir，那就用用户的这个路径；否则，就使用默认路径 "/data1/wuruoyu/waveform-inversion"。
+    # Merge CLI into config: if --data_dir is passed, use it; otherwise use default below.
     
-    # 设置随机种子
+    # Random seed
     config.distributed.seed = args.seed
     
-    # 启用分布式训练
+    # Distributed training
     if args.distributed:
         config.distributed.use_distributed = True
         device, is_logger = setup(config)
@@ -68,13 +67,11 @@ def get_seismic_config(args: argparse.Namespace):
     if args.data_dir:
         config.data_dir = args.data_dir
     else:
-        # 设置默认数据目录为新路径
+        # Default data directory when --data_dir is omitted
         config.data_dir = r"/root/autodl-tmp/FWINO/FWINO_data"
     config.output_dir = args.output_dir
     if getattr(args, "log_root", None):
         config.log_root = args.log_root
-
-        #解释见onenote1
     if args.family:
         config.family = to_snake_lower(args.family)
     if args.batch_size:
@@ -156,10 +153,10 @@ def get_seismic_config(args: argparse.Namespace):
         print(f'learning_rate:{config.learning_rate}')
         print(f'hidden_channels:{config.hidden_channels}')
 
-    # 设置验证集比例
+    # Validation split ratio
     val_ratio = args.val_ratio if args.val_ratio is not None else 0.2
     
-    # 设置WandB日志记录
+    # WandB logging
     if args.use_wandb and is_logger:
         wandb.login(key=get_wandb_api_key())
         wandb_name = f"seismic_moe_{config.family}"
@@ -195,43 +192,31 @@ def get_seismic_config(args: argparse.Namespace):
     print(f'FNO:n_modes_width:{config.expert_configs[0]["n_modes_width"]}')
     print(f'FNO:n_layers:{config.expert_configs[0]["n_layers"]}')
     
-    # 设置专家数
-    config.top_k = args.top_k
-    # 选择专家，这里后面的config.expert_configs就是config文件中所创建的字典列表，
-    # 当你从命令行输入choose——experts之后，这里的for循环会根据你给定的序号找到对应的专家的字典，并将这个字典放入
-    #config.expert_configs列表中
+    # MoE top-k and expert selection: config.expert_configs is the list of expert dicts from config.
+    # When --choose_experts is set, keep only those indices in config.expert_configs.
     if args.choose_experts is not None and len(args.choose_experts) > 0:
         config.expert_configs = [config.expert_configs[i] for i in args.choose_experts]
     else:
         args.choose_experts = list(range(len(config.expert_configs)))
-    #这里的config.expert_configs就是seismic_moe_config中的“字典列表”，关于“字典列表”结构的解释详见OneNote3
-    
-    # 训练moe架构
-         #下面两段代码的解释见OneNote2,意义是：
-         # 在使用 Mixture of Experts 模型时，如果用户已经训练并保存了若干个“专家模型”（模型文件保存在某个文件夹中），那么这两段代码就是要：
-         #读取那些 .pt 文件（即每个专家的模型参数）；
-         #按照文件名中的编号提取出专家编号；
-         #做一致性校验（文件数量、编号是否跟配置匹配）；
+    # MOE with pretrained experts: when top_k>1, use_moe, and use_experts_path, scan expert checkpoints.
     experts_name = []
     if config.top_k > 1 and args.use_moe and args.use_experts_path:
-        # 模型文件夹中的专家 best_expert_{experts_name}_{i}_{curve/flat/style}_{vel/fault/style}.pt
+        # Expert filenames: best_expert_{name}_{i}_{curve/flat/style}_{vel/fault/style}.pt
         save_experts = [
             int(f.split('_')[3]) for f in os.listdir(args.use_experts_path)
             if f.split('_')[1] == 'expert' and f.endswith('.pt')
         ]
         save_experts = list(set(save_experts))
-        #注意，这里输出的save_experts是一个代表专家组模型序号的整数列表。详见OneNote2
 
-        print(f"选择了 {len(save_experts)} 个专家, 分别为 {save_experts}")
+        print(f"Selected {len(save_experts)} experts: {save_experts}")
 
         config.use_moe = True
         config.use_experts_path = args.use_experts_path
 
         experts_name.append("all")
         experts_name_str = "all"
-    # 这两行代码解释见OneNote3，不过我想知道为什么这两段代码在我们单个模型训练过程中没有起作用
-    # 修复：使用enumerate来获取正确的索引，因为config.expert_configs已经被重新排序
     else:
+        # Single-expert or non-all mode: name each expert from config + choose_experts index
         for idx, expert_config in enumerate(config.expert_configs):
             if 'domain_type' in expert_config:
                 experts_name.append(f"{expert_config['domain_type']}_{args.choose_experts[idx]}")
@@ -241,7 +226,7 @@ def get_seismic_config(args: argparse.Namespace):
     
     config.output_dir = os.path.join(config.output_dir, experts_name_str)   
     
-    # 设置损失函数加权系数
+    # Loss term weights
     config.lambda_g1v = args.lambda_g1v
     config.lambda_g2v = args.lambda_g2v
     if hasattr(args, "lambda_grad") and args.lambda_grad is not None:
@@ -255,11 +240,11 @@ def get_seismic_config(args: argparse.Namespace):
     if hasattr(args, "lambda_ce"):
         config.lambda_ce = args.lambda_ce
     
-    # 设置 MOE 模式
+    # MoE mode
     if hasattr(args, "moe_mode") and args.moe_mode:
         config.moe_mode = args.moe_mode
     
-    # 设置路由形式
+    # Router settings
     if args.router_type:
         config.router_type = args.router_type
     if hasattr(args, "router_hidden_dim") and args.router_hidden_dim is not None:
@@ -281,31 +266,31 @@ def get_seismic_config(args: argparse.Namespace):
     if hasattr(args, "enable_freq_metrics"):
         config.enable_freq_metrics = bool(args.enable_freq_metrics)
     
-    # 设置专家组间融合方式
+    # Inter-group fusion
     if args.fusion_type:
         config.fusion_type = args.fusion_type
     
-    # 设置强弱专家组内融合方式
+    # Intra-group (strong/weak) fusion
     if args.s_processor_type:
         config.s_processor_type = args.s_processor_type
     if args.w_processor_type:
         config.w_processor_type = args.w_processor_type
         
-    # 设置强弱激活参数
+    # Strong/weak gating strength
     if args.beta:
         config.beta = args.beta
     if args.use_gpu_proxy:
         config.use_gpu_proxy = True
     
-    # 设置细化种类
+    # Fine-grained subtype flag
     if args.is_specific:
         config.is_specific = args.is_specific
     
-    # 设置是否使用分组专家网络
+    # Classifier / grouped-expert MoE
     if args.is_classifier:
         config.is_classifier = args.is_classifier
 
-    # 设置速度类型数量（分类数）
+    # Number of velocity types (classification head)
     if hasattr(args, "v_type_num") and args.v_type_num is not None:
         config.v_type_num = args.v_type_num
     else:
@@ -317,10 +302,10 @@ def get_seismic_config(args: argparse.Namespace):
             if mapped_types:
                 config.v_type_num = len(mapped_types)
 
-    # 判断is_specific与选择family是否匹配
+    # Ensure is_specific matches chosen family
     if config.is_specific and config.family not in _SPECIFIC_ALLOWED_FAMILIES:
         raise ValueError(
-            f"{config.family} 与细分类配置不匹配，可选细分类包括: {sorted(_SPECIFIC_ALLOWED_FAMILIES)}"
+            f"{config.family} does not match specific-type config; allowed families: {sorted(_SPECIFIC_ALLOWED_FAMILIES)}"
         )
     
     if args.is_resize:
@@ -331,7 +316,7 @@ def get_seismic_config(args: argparse.Namespace):
     
     config.moe_method = args.moe_method
     
-    #-------------- 设置完毕 -----------#
+    #-------------- config merge complete -----------#
     runtime_ctx = _build_runtime_context(
         device=device,
         is_logger=is_logger,

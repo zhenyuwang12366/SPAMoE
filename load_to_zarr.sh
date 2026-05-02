@@ -8,23 +8,23 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
 usage() {
   cat <<'EOF'
-用法:
-  bash load_to_zarr.sh --data_dir /path/to/XXX --zarr_out /path/to/out.zarr [选项]
+Usage:
+  bash load_to_zarr.sh --data_dir /path/to/XXX --zarr_out /path/to/out.zarr [options]
 
-要求:
-  data_dir 必须是 OpenFWI 根目录，并且其中必须存在 train_samples/
+Requirements:
+  data_dir must be an OpenFWI-style root containing train_samples/
 
-选项:
-  --data_dir PATH              原始数据根目录，必须包含 train_samples/
-  --zarr_out PATH              输出 zarr 目录
-  --family FAMILY              默认 all；也支持 curve_vel_a / style_a 等单 family
-  --include_test 0|1           默认 0
-  --remap_single_label 0|1     默认 0
-  --chunks N                   默认 32
-  --dtype TYPE                 float32 / float16，默认 float32
-  --seed N                     默认 42
-  --concat_channels 0|1        默认 1
-  --conda_env NAME             可选，自动激活指定 conda 环境
+Options:
+  --data_dir PATH              raw data root (must contain train_samples/)
+  --zarr_out PATH              output Zarr directory
+  --family FAMILY              default all; or a single family e.g. curve_vel_a / style_a
+  --include_test 0|1           default 0
+  --remap_single_label 0|1     default 0
+  --chunks N                   default 32
+  --dtype TYPE                 float32 / float16, default float32
+  --seed N                     default 42
+  --concat_channels 0|1        default 1
+  --conda_env NAME             optional: activate this conda env
 EOF
 }
 
@@ -53,7 +53,7 @@ while [[ $# -gt 0 ]]; do
     --conda_env) CONDA_ENV_NAME="$2"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *)
-      echo "未知参数: $1" >&2
+      echo "Unknown argument: $1" >&2
       usage
       exit 1
       ;;
@@ -61,13 +61,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${DATA_DIR}" || -z "${ZARR_OUT}" ]]; then
-  echo "必须提供 --data_dir 和 --zarr_out。" >&2
+  echo "Both --data_dir and --zarr_out are required." >&2
   usage
   exit 1
 fi
 
 if [[ ! -d "${DATA_DIR}/train_samples" ]]; then
-  echo "数据目录必须包含 train_samples/: ${DATA_DIR}/train_samples" >&2
+  echo "Data root must contain train_samples/: ${DATA_DIR}/train_samples" >&2
   exit 1
 fi
 
@@ -89,7 +89,7 @@ CMD=(
   --concat_channels "${CONCAT_CHANNELS}"
 )
 
-printf '执行命令:'
+printf 'Running:'
 printf ' %q' "${CMD[@]}"
 printf '\n'
 "${CMD[@]}"

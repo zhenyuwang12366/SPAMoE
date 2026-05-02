@@ -48,7 +48,7 @@ class Conv2DwithBN(nn.Module):
         ]
         if bn:
             layers.append(nn.BatchNorm2d(num_features=out_fea))
-        # ❗WGAN-GP 需要二阶梯度，这里统一关闭 inplace
+        # WGAN-GP needs second-order gradients; disable inplace everywhere here
         layers.append(nn.LeakyReLU(relu_slop, inplace=False))
         if dropout:
             layers.append(nn.Dropout2d(0.8))
@@ -72,7 +72,7 @@ class ResizeConv2DwithBN(nn.Module):
             )
         )
         layers.append(nn.BatchNorm2d(num_features=out_fea))
-        # ❗同样关闭 inplace
+        # Same: disable inplace
         layers.append(nn.LeakyReLU(0.2, inplace=False))
         self.ResizeConv2DwithBN = nn.Sequential(*layers)
 
@@ -124,7 +124,7 @@ class ConvBlock(nn.Module):
         ]
         if norm in NORM_LAYERS and norm is not None:
             layers.append(NORM_LAYERS[norm](out_fea))
-        # ❗统一 inplace=False
+        # Use inplace=False consistently
         layers.append(nn.LeakyReLU(relu_slop, inplace=False))
         if dropout:
             layers.append(nn.Dropout2d(0.8))
@@ -181,7 +181,7 @@ class DeconvBlock(nn.Module):
         ]
         if norm in NORM_LAYERS and norm is not None:
             layers.append(NORM_LAYERS[norm](out_fea))
-        # ❗统一 inplace=False
+        # Use inplace=False consistently
         layers.append(nn.LeakyReLU(0.2, inplace=False))
         self.layers = nn.Sequential(*layers)
 
@@ -204,7 +204,7 @@ class ResizeBlock(nn.Module):
         )
         if norm in NORM_LAYERS and norm is not None:
             layers.append(NORM_LAYERS[norm](out_fea))
-        # ❗统一 inplace=False
+        # Use inplace=False consistently
         layers.append(nn.LeakyReLU(0.2, inplace=False))
         self.layers = nn.Sequential(*layers)
 
@@ -213,7 +213,7 @@ class ResizeBlock(nn.Module):
 
 
 # ---------------------------------------------------------
-#  Generator：InversionNet / FCN4_Deep_Resize_2（基本不变）
+# Generator: InversionNet / FCN4_Deep_Resize_2 (largely unchanged)
 # ---------------------------------------------------------
 
 
@@ -298,7 +298,7 @@ class InversionNet(nn.Module):
         x = self.deconv4_2(x)
         x = self.deconv5_1(x)
         x = self.deconv5_2(x)
-        # F.pad 不是 inplace，这里保留
+        # F.pad is not inplace; keep as-is
         x = F.pad(x, [-5, -5, -5, -5], mode="constant", value=0)
         x = self.deconv6(x)
         return x
@@ -400,7 +400,7 @@ class FCN4_Deep_Resize_2(nn.Module):
 
 
 # ---------------------------------------------------------
-#  Discriminator：去掉 BatchNorm，全部非 inplace，适配 WGAN-GP
+# Discriminator: no BatchNorm, no inplace activations (WGAN-GP)
 # ---------------------------------------------------------
 
 
@@ -409,7 +409,7 @@ class Discriminator(nn.Module):
         self, dim1=32, dim2=64, dim3=128, dim4=256, **kwargs
     ):
         super(Discriminator, self).__init__()
-        # ❗这里全部 norm=None，不用 BN，避免 WGAN-GP 的二阶导问题
+        # norm=None: no BN (avoids second-derivative issues with WGAN-GP)
         self.convblock1_1 = ConvBlock(1, dim1, stride=2, norm=None)
         self.convblock1_2 = ConvBlock(dim1, dim1, norm=None)
         self.convblock2_1 = ConvBlock(dim1, dim2, stride=2, norm=None)
@@ -418,7 +418,7 @@ class Discriminator(nn.Module):
         self.convblock3_2 = ConvBlock(dim3, dim3, norm=None)
         self.convblock4_1 = ConvBlock(dim3, dim4, stride=2, norm=None)
         self.convblock4_2 = ConvBlock(dim4, dim4, norm=None)
-        # 最后一层输出 1 通道，不加 BN，只做线性+LeakyReLU
+        # Final 1-channel output: no BN, LeakyReLU only
         self.convblock5 = ConvBlock(
             dim4, 1, kernel_size=5, padding=0, norm=None
         )
@@ -438,7 +438,7 @@ class Discriminator(nn.Module):
 
 
 # ---------------------------------------------------------
-#  HPGNN 部分（和 GAN 无关，这里保留，只保证非 inplace）
+# HPGNN blocks (unrelated to GAN; kept with non-inplace activations)
 # ---------------------------------------------------------
 
 

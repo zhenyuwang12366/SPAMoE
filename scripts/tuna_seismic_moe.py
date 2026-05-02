@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Optuna 调参外层调度器（单进程）
-- 每个 trial 调用你的多卡 bash 启动器（内部再 torchrun 吃满 2 卡）
-- 通过流式解析 stdout 的 REPORT/VAL_LOSS 实现实时上报与剪枝
+Optuna hyperparameter tuning outer scheduler (single process).
+- Each trial invokes your multi-GPU bash launcher (which internally uses torchrun to use 2 GPUs).
+- Streams stdout to parse REPORT / VAL_LOSS for live reporting and pruning.
 """
 import os
 import json
@@ -20,9 +20,9 @@ import math
 import time
 
 def suggest_params(trial: optuna.Trial):
-    """在这里集中定义要搜索的超参空间"""
+    """Central definitions for the hyperparameter search space."""
     return {
-        # -------- 优化/训练 --------
+        # -------- Optimization / training --------
         "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
         "weight_decay":  trial.suggest_float("weight_decay", 0.0, 0.1),
         "batch_size":    trial.suggest_categorical("batch_size", [4, 6]),
@@ -30,7 +30,7 @@ def suggest_params(trial: optuna.Trial):
         "accum_steps":   trial.suggest_categorical("accum_steps", [1, 2]),
         "scheduler_gamma": trial.suggest_float("scheduler_gamma", 0.2, 0.5),
 
-        # -------- 模型容量/结构 --------
+        # -------- Model capacity / architecture --------
         "hidden_channels": trial.suggest_categorical("hidden_channels", [96, 128, 160]),
         "FNO_n_layers":  trial.suggest_categorical("FNO_n_layers", [4, 6, 8]),
         "WNO_n_layers":  trial.suggest_int("WNO_n_layers", 5, 8),
@@ -41,7 +41,7 @@ def suggest_params(trial: optuna.Trial):
         "WNO_n_levels_height": trial.suggest_int("WNO_n_levels_height", 3, 5),
         "WNO_n_levels_width":  trial.suggest_int("WNO_n_levels_width", 3, 5),
 
-        # -------- Loss 权重 --------
+        # -------- Loss weights --------
         "lambda_g1v": trial.suggest_float("lambda_g1v", 0.3, 1.5, log=True),
         "lambda_g2v": trial.suggest_float("lambda_g2v", 0.3, 1.5, log=True),
         "lambda_grad_l1": trial.suggest_float("lambda_grad_l1", 0.15, 0.20, log=True),
@@ -50,8 +50,8 @@ def suggest_params(trial: optuna.Trial):
 
 def build_bash_cmd(args, trial_number: int, hp: dict) -> list:
     """
-    返回 list 形式的 argv（不再用 shell=True 拼接大字符串）。
-    通过 stdbuf 强制行缓冲，确保 stdout/stderr 实时刷新。
+    Return argv as a list (no shell=True string for the full command).
+    Uses stdbuf for line buffering so stdout/stderr flush promptly.
     """
     out_dir = os.path.join(args.output_dir, f"trial_{trial_number}")
     os.makedirs(out_dir, exist_ok=True)
@@ -59,8 +59,8 @@ def build_bash_cmd(args, trial_number: int, hp: dict) -> list:
     choose_exp = list(map(str, args.choose_experts))
 
     argv = [
-        "stdbuf", "-oL", "-eL",                 # 关键：行缓冲
-        "bash", args.bash_launcher,             # 显式用 bash 调用
+        "stdbuf", "-oL", "-eL",                 # Key: line buffering
+        "bash", args.bash_launcher,             # Invoke via bash explicitly
         "--mode", "train",
         "--num_gpus", str(args.num_gpus),
         "--data_dir", args.data_dir,
@@ -95,7 +95,7 @@ def build_bash_cmd(args, trial_number: int, hp: dict) -> list:
     if args.is_specific:
         argv.append("--is_specific")
 
-    # 超参部分
+    # Hyperparameters from the trial
     argv += [
         "--batch_size", str(hp["batch_size"]),
         "--epochs", str(hp["epochs"]),
@@ -120,20 +120,20 @@ def build_bash_cmd(args, trial_number: int, hp: dict) -> list:
     return argv
 
 def main():
-    ap = argparse.ArgumentParser(description="Optuna 调参（外层单进程）")
-    # ---- Optuna 基本参数 ----
+    ap = argparse.ArgumentParser(description="Optuna hyperparameter tuning (outer single-process driver)")
+    # ---- Optuna basics ----
     ap.add_argument("--n_trials", type=int, default=30)
     ap.add_argument("--timeout", type=int, default=None)
     ap.add_argument("--study_name", type=str, default="seismic_moe_tune")
     ap.add_argument("--storage", type=str, default="sqlite:///../results/optuna/moe_flatvel_tpe.db")
     ap.add_argument("--seed", type=int, default=42)
 
-    # ---- 你的多卡 bash 启动器路径/资源 ----
+    # ---- Multi-GPU bash launcher path / resources ----
     ap.add_argument("--bash_launcher", type=str, default="scripts/run_distributed_seismic_moe.sh")
     ap.add_argument("--num_gpus", type=int, default=2)
     ap.add_argument("--cuda_visible_devices", type=str, default="0,1")
 
-    # ---- 训练固定参数（非搜索） ----
+    # ---- Fixed training args (not searched) ----
     ap.add_argument("--data_dir", type=str, required=True)
     ap.add_argument("--family", type=str, required=True)
     ap.add_argument("--output_dir", type=str, required=True)
@@ -142,42 +142,42 @@ def main():
     ap.add_argument("--choose_experts", nargs="+", type=int, default=[0])
     ap.add_argument("--is_specific", action="store_true")
     ap.add_argument('--wavelet_type', type=str, default='haar', choices=['coif4','db4','db8','sym4','coif5','sym8'],
-                        help='小波类型')
+                        help='Wavelet type')
     ap.add_argument('--dtcwt_type', nargs=2, type=str, default=None,
-                        help='双树复小波类型')
+                        help='Dual-tree complex wavelet type')
     ap.add_argument('--WNO_pad_mode', type=str, default=None, choices=['constant', 'reflect', 'replicate', 'circular'],
-                        help='WNO填充模式')
+                        help='WNO padding mode')
     ap.add_argument('--WNO_ensure_even_shapes', dest='WNO_ensure_even_shapes', action='store_true', default=None,
-                        help='启用WNO偶数形状约束')
+                        help='Enable WNO even-shape constraint')
     ap.add_argument('--WNO_disable_ensure_even_shapes', dest='WNO_ensure_even_shapes', action='store_false',
-                        help='禁用WNO偶数形状约束')
+                        help='Disable WNO even-shape constraint')
     ap.add_argument('--WNO_adaptive_padding', dest='WNO_adaptive_padding', action='store_true', default=None,
-                        help='启用WNO自适应填充')
+                        help='Enable WNO adaptive padding')
     ap.add_argument('--WNO_disable_adaptive_padding', dest='WNO_adaptive_padding', action='store_false',
-                        help='禁用WNO自适应填充')
+                        help='Disable WNO adaptive padding')
     ap.add_argument('--WNO_use_channel_mlp', dest='WNO_use_channel_mlp', action='store_true', default=None,
-                        help='启用WNO通道MLP')
+                        help='Enable WNO channel MLP')
     ap.add_argument('--WNO_disable_channel_mlp', dest='WNO_use_channel_mlp', action='store_false',
-                        help='禁用WNO通道MLP')
+                        help='Disable WNO channel MLP')
     ap.add_argument('--WNO_channel_mlp_dropout', type=float, default=None,
-                        help='WNO通道MLP的dropout比例')
+                        help='Dropout rate for WNO channel MLP')
     ap.add_argument('--WNO_channel_mlp_expansion', type=float, default=None,
-                        help='WNO通道MLP的扩展倍率')
+                        help='Expansion factor for WNO channel MLP')
     
     args = ap.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
     sampler = TPESampler(
-        multivariate=True,   # 利用参数相关性
-        group=True,          # 共同采样一组参数（维度更高→需要更多试验）
-        n_startup_trials=40, # 30–50 之间更稳
+        multivariate=True,   # Exploit parameter correlations
+        group=True,          # Joint group sampling (higher dim → more trials needed)
+        n_startup_trials=40, # 40 in the 30–50 range is often stable
         seed=args.seed
     )
 
     pruner = MedianPruner(
-        n_startup_trials=8,                     # 前几个 trial 完全不剪枝
-        n_warmup_steps=15,# 跑到 10% 再比较
-        interval_steps=5                        # 每 5 个 epoch 比较一次
+        n_startup_trials=8,                     # No pruning for the first few trials
+        n_warmup_steps=15,                        # Compare after warmup period
+        interval_steps=5                        # Compare every 5 steps
     )
 
     study = optuna.create_study(
@@ -201,17 +201,17 @@ def main():
         stdout_path = os.path.join(trial_dir, "child_stdout.txt")
         stderr_path = os.path.join(trial_dir, "child_stderr.txt")
 
-        # 环境变量：把 CUDA 设备放到 env，而不是命令行前缀
+        # CUDA devices via env, not as a CLI prefix
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
-        # （可选）进一步确保 Python 无缓冲
+        # (Optional) force unbuffered Python I/O
         env.setdefault("PYTHONUNBUFFERED", "1")
 
         final_val = None
         start_ts = time.time()
 
         with open(stdout_path, "w", encoding="utf-8") as fout, open(stderr_path, "w", encoding="utf-8") as ferr:
-            # 建立新进程组，便于整组杀掉（torchrun 的子进程一并终止）
+            # New process group so we can terminate torchrun and its children together
             proc = subprocess.Popen(
                 argv,
                 stdout=subprocess.PIPE,
@@ -220,10 +220,10 @@ def main():
                 bufsize=1,
                 universal_newlines=True,
                 env=env,
-                preexec_fn=os.setsid,   # Linux 下新建进程组
+                preexec_fn=os.setsid,   # New session / process group on Linux
             )
             
-            # 后台线程：持续转储 stderr，防止阻塞
+            # Background thread: drain stderr so the pipe does not block
             def _drain_stderr():
                 try:
                     for eline in proc.stderr:
@@ -239,7 +239,7 @@ def main():
                     fout.write(line)
                     s = line.strip()
 
-                    # 解析 REPORT:<loss>:<step>
+                    # Parse REPORT:<loss>:<step>
                     m = REPORT_RE.match(s)
                     if m:
                         loss_val = float(m.group(1))
@@ -247,14 +247,14 @@ def main():
                         if math.isfinite(loss_val):
                             trial.report(loss_val, step=step_val)
                             if trial.should_prune():
-                                # 剪枝：整组 kill
+                                # Pruning: kill entire process group
                                 try:
                                     os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                                 except Exception:
                                     pass
                                 raise optuna.TrialPruned("Pruned by median rule")
 
-                    # 解析 VAL_LOSS:<best_val_loss>
+                    # Parse VAL_LOSS:<best_val_loss>
                     m2 = VAL_RE.match(s)
                     if m2:
                         try:
@@ -264,28 +264,28 @@ def main():
 
                 retcode = proc.wait(timeout=5)
             except optuna.TrialPruned:
-                # 写个标记文件，便于回溯
+                # Marker file for post-mortem review
                 with open(os.path.join(trial_dir, "PRUNED"), "w") as f:
                     f.write("pruned\n")
                 raise
             except Exception as e:
-                # 异常：整组强杀
+                # On error: force-kill the whole group
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except Exception:
                     pass
-                # 标记异常原因
+                # Record error reason
                 with open(os.path.join(trial_dir, "ERROR"), "w") as f:
                     f.write(str(e))
                 return float("inf")
 
-        # 子进程非零退出码，直接判 inf（把原因留在 child_stderr）
+        # Non-zero child exit → inf (details in child_stderr)
         if retcode != 0:
             with open(os.path.join(trial_dir, "NONZERO_EXIT"), "w") as f:
                 f.write(f"retcode={retcode}\n")
             return float("inf")
 
-        # 没有拿到最终指标：通常是缓冲/0 batch/日志没打印到
+        # No final metric: often buffering, empty batch, or missing log line
         if final_val is None:
             with open(os.path.join(trial_dir, "NO_FINAL_VAL"), "w") as f:
                 f.write("No VAL_LOSS parsed. Check buffering / dataset / val loop.\n")
@@ -306,7 +306,7 @@ def main():
 
     study.optimize(objective, n_trials=args.n_trials, timeout=args.timeout)
 
-    print("\n===== Optuna 调参完成 =====")
+    print("\n===== Optuna tuning finished =====")
     print(f"Best trial: #{study.best_trial.number}")
     print(f"Best val_loss: {study.best_value:.6f}")
 

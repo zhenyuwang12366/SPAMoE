@@ -205,7 +205,7 @@ class RelativeL2(nn.Module):
     Relative L2 loss:
         rel_L2 = ||pred - gt||_2 / (||gt||_2 + eps)
 
-    - 默认对 batch 求 mean，适合作为 PDEBench / Neural Operator 的主损失。
+    - By default reduces over the batch with mean; suitable as the primary loss for PDEBench / Neural Operator.
     """
 
     def __init__(self, eps: float = 1e-8, reduction: str = "mean"):
@@ -237,18 +237,18 @@ class RelativeL2(nn.Module):
 
 class PDECombinedLoss(nn.Module):
     """
-    专为 PDE / Neural Operator 设计的组合损失：
+    Combined loss for PDE / Neural Operator training:
 
         loss = λ_rel * RelativeL2
-             + λ_grad * GradL1(∇pred, ∇gt)         (可选)
-             + λ_fourier * FourierMagL1(|F(pred)|, |F(gt)|) (可选)
+             + λ_grad * GradL1(∇pred, ∇gt)         (optional)
+             + λ_fourier * FourierMagL1(|F(pred)|, |F(gt)|) (optional)
 
-    返回字典，方便训练脚本做日志记录：
+    Returns a dict for convenient logging in training scripts:
         {
             "loss":    total_loss,
             "rel":     rel_l2.detach(),
-            "grad":    grad_val.detach(),     # 若未启用为 0 标量
-            "fourier": fourier_val.detach(),  # 若未启用为 0 标量
+            "grad":    grad_val.detach(),     # zero scalar if grad term disabled
+            "fourier": fourier_val.detach(),  # zero scalar if Fourier term disabled
         }
     """
 
@@ -257,12 +257,12 @@ class PDECombinedLoss(nn.Module):
         lambda_rel: float = 1.0,
         lambda_grad: float = 0.0,
         lambda_fourier: float = 0.0,
-        # grad 配置
+        # Grad term settings
         grad_kernel: str = "sobel",
         grad_reduction: str = "mean",
         grad_padding_mode: str = "replicate",
         grad_spacing: Optional[Sequence[float]] = None,
-        # fourier 配置
+        # Fourier term settings
         fourier_dims: Sequence[int] = (-2, -1),
         fourier_reduction: str = "mean",
         fourier_fft_norm: Optional[str] = "ortho",
@@ -274,10 +274,10 @@ class PDECombinedLoss(nn.Module):
         self.lambda_grad = float(lambda_grad)
         self.lambda_fourier = float(lambda_fourier)
 
-        # 主损失：Relative L2
+        # Primary loss: Relative L2
         self.rel_loss = RelativeL2(reduction="mean")
 
-        # 可选梯度损失
+        # Optional gradient loss
         self.grad_loss = (
             SobelLoss(
                 kernel=grad_kernel,
@@ -289,7 +289,7 @@ class PDECombinedLoss(nn.Module):
             else None
         )
 
-        # 可选频域损失
+        # Optional frequency-domain loss
         self.fourier_loss = (
             FourierMag_L1(
                 dims=fourier_dims,
@@ -303,11 +303,11 @@ class PDECombinedLoss(nn.Module):
         )
 
     def forward(self, pred: torch.Tensor, gt: torch.Tensor):
-        # 主损失：Relative L2
+        # Primary loss: Relative L2
         rel_val = self.rel_loss(pred, gt)
         total = self.lambda_rel * rel_val
 
-        # 梯度损失
+        # Gradient loss
         if self.grad_loss is not None:
             grad_dict = self.grad_loss(pred, gt)
             grad_val = grad_dict["loss"]
@@ -315,7 +315,7 @@ class PDECombinedLoss(nn.Module):
         else:
             grad_val = pred.new_zeros(())
 
-        # 频域损失
+        # Fourier-domain loss
         if self.fourier_loss is not None:
             fourier_dict = self.fourier_loss(pred, gt)
             fourier_val = fourier_dict["loss"]

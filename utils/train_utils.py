@@ -2,8 +2,8 @@ import math
 
 class EarlyStopping:
     """
-    监控 val 指标，当连续 patience 次没有超过 min_delta 的改善时，触发早停。
-    mode='min'：指标越小越好（如 val_loss）
+    Track a validation metric; stop after `patience` steps without `min_delta` improvement.
+    mode='min': lower is better (e.g. val_loss).
     """
     def __init__(self, patience=20, min_delta=0.0, warmup_epochs=0, mode='min'):
         assert mode in ('min', 'max')
@@ -25,9 +25,9 @@ class EarlyStopping:
 
     def step(self, value, epoch):
         """
-        返回是否应停止（仅供主进程用于判定）。内部更新最佳值和坏轮计数。
+        Return whether training should stop (main process only). Updates best and bad-epoch count.
         """
-        # warmup 阶段不计入早停
+        # Warmup: do not apply early stopping
         if epoch < self.warmup_epochs:
             return False
 
@@ -42,20 +42,20 @@ class EarlyStopping:
         return self.should_stop
     
 def safe_random_split(dataset_size, ratios : list):
-        assert abs(sum(ratios) - 1.0) < 1e-6, "ratios必须加起来为1"
+        assert abs(sum(ratios) - 1.0) < 1e-6, "ratios must sum to 1"
 
         total = dataset_size
         raw_sizes = [r * total for r in ratios]
         sizes = [int(x) for x in raw_sizes]
         deficit = total - sum(sizes)
 
-        # 第一步：确保每个 size 至少为 1
+        # Step 1: ensure each size is at least 1 when possible
         for i in range(len(sizes)):
             if sizes[i] == 0 and deficit > 0:
                 sizes[i] += 1
                 deficit -= 1
 
-        # 第二步：按最大小数部分补充剩余样本
+        # Step 2: distribute remaining samples by largest fractional parts
         frac_with_index = sorted(
             [(raw - int(raw), i) for i, raw in enumerate(raw_sizes)],
             reverse=True
@@ -67,7 +67,7 @@ def safe_random_split(dataset_size, ratios : list):
             deficit -= 1
             i += 1
 
-        assert sum(sizes) == total, "最终样本数量不一致"
+        assert sum(sizes) == total, "final sample count mismatch"
         train_size = sizes[0]
         val_size = sizes[1]
         return train_size, val_size

@@ -7,8 +7,8 @@ from dataclasses import dataclass
 
 class SeismicMetrics:
     """
-    地震数据评估指标
-    约定：所有指标在 CPU + float32 下计算，避免 AMP/bfloat16 导致的 dtype 冲突。
+    Evaluation metrics for seismic data.
+    Convention: all metrics are computed in CPU + float32 to avoid dtype issues from AMP/bfloat16.
     """
     DEFAULT_BANDS = ((0.0, 0.30), (0.30, 0.65), (0.65, 1.01))
 
@@ -45,7 +45,7 @@ class SeismicMetrics:
     def calculate_relative_l2(pred, target, eps=1e-12):
         """
         Relative L2 = ||pred - target||_2 / ||target||_2
-        CPU + fp32 统一计算
+        Computed uniformly in CPU + fp32.
         """
         pred = SeismicMetrics._to_cpu_f32(pred)
         target = SeismicMetrics._to_cpu_f32(target)
@@ -53,7 +53,7 @@ class SeismicMetrics:
         numerator = torch.norm(pred - target, p=2)
         denominator = torch.norm(target, p=2)
 
-        # 避免除零
+        # Avoid division by zero
         denom = max(float(denominator.item()), eps)
 
         return float((numerator.item() / denom))
@@ -102,15 +102,15 @@ class SeismicMetrics:
         eps: float = 1e-12,
     ):
         """
-        在频域按照半径划分的 band 评估误差（默认 low/mid/high 三段）：
-          - 对 pred/target 做 2D FFT + fftshift
-          - 使用圆环 mask 做 band-pass，ifft 回空间域计算相对 L2 / MAE
-          - 额外返回目标/预测在该频段的能量占比
+        Frequency-band error by radial bins in Fourier space (default low/mid/high):
+          - 2D FFT + fftshift on pred/target
+          - Annular masks for band-pass, ifft to spatial domain for relative L2 / MAE
+          - Also returns energy fraction of target/pred in each band
         """
         pred = SeismicMetrics._to_cpu_f32(pred)
         target = SeismicMetrics._to_cpu_f32(target)
         if pred.shape != target.shape:
-            raise ValueError(f"pred/target 形状不一致: {pred.shape} vs {target.shape}")
+            raise ValueError(f"pred/target shape mismatch: {pred.shape} vs {target.shape}")
 
         _, _, H, W = pred.shape
         device = pred.device
@@ -163,7 +163,7 @@ class SeismicMetrics:
             }
         return metrics
 
-    # ==== 统一指标计算接口 ====
+    # ==== Unified metric computation API ====
     def __call__(self, pred, target):
         mse  = self.calculate_mse(pred, target)
         mae  = self.calculate_mae(pred, target)
@@ -184,7 +184,7 @@ class SeismicMetrics:
         
 def _radius_grid(H: int, W: int) -> np.ndarray:
     """
-    返回 fftshift 后频谱中心为原点的归一化半径网格 r in [0,1]，shape [H,W]
+    Normalized radius grid r in [0,1] with spectrum center at origin after fftshift, shape [H,W].
     """
     cy = H // 2
     cx = W // 2
@@ -248,19 +248,19 @@ def _pearson_corr(a: np.ndarray, b: np.ndarray, eps: float = 1e-12) -> float:
 @dataclass
 class SpectralAccumulator:
     """
-    用于“假设检验”的全 batch 统计器。
+    Full-batch statistics for hypothesis-style checks.
 
-    每个 sample 记录：
-      - 对 u_front（encoder读出 / 插值输入）计算 E_H, E_L, HF(u_front)
-      - 对 y_pred, y_gt 计算 E_H/E_L/HF
-      - 计算若干“可用来验证 A1-A3 的代理量”
+    Per sample:
+      - E_H, E_L, HF(u_front) for u_front (encoder output / interpolated input)
+      - E_H/E_L/HF for y_pred, y_gt
+      - Proxy quantities useful for checking assumptions A1–A3
     """
     name: str = "exp"
     eps: float = 1e-12
     low_band: Tuple[float, float] = (0.05, 0.30)
     high_band: Tuple[float, float] = (0.40, 0.85)
 
-    # 每条是 dict
+    # Each entry is a dict
     records: List[Dict[str, Any]] = None
 
     def __post_init__(self):
@@ -269,7 +269,7 @@ class SpectralAccumulator:
 
     def add_sample(
         self,
-        u_front: Optional[np.ndarray],  # encoder读出 or 插值结果；允许 None（比如没encoder时）
+        u_front: Optional[np.ndarray],  # Encoder output or interpolation; None allowed (e.g. no encoder)
         y_pred: np.ndarray,
         y_gt: np.ndarray,
         sample_id: Optional[int] = None,
@@ -306,17 +306,17 @@ class SpectralAccumulator:
             HF_u = float("nan")
             corr_u_gt_spec = float("nan")
 
-        # ====== 假设检验用的“代理量” ======
-        # A1（高频非收缩）：希望 E_H(u_front) / E_H(gt) 不小（接近 1）
+        # ====== Proxy quantities for hypothesis checks ======
+        # A1 (high-frequency non-contraction): want E_H(u_front) / E_H(gt) not small (~1)
         a1_ratio_h = (E_H_u / (E_H_gt + self.eps)) if np.isfinite(E_H_u) else float("nan")
 
-        # A2（低频可控）：希望 E_L(u_front) / E_L(gt) 在同一数量级（~1）
+        # A2 (low-frequency control): want E_L(u_front) / E_L(gt) on same order (~1)
         a2_ratio_l = (E_L_u / (E_L_gt + self.eps)) if np.isfinite(E_L_u) else float("nan")
 
-        # A3（下游有界响应）：我们无法直接拿到理论 m,M
-        # 但可用“前端到输出的频带增益”作为经验界：
+        # A3 (bounded downstream response): theory m,M not available directly
+        # Use empirical band gains front-to-output:
         #   gH = E_H(pred)/E_H(u_front), gL = E_L(pred)/E_L(u_front)
-        # 若 gH,gL 在数据集上“波动范围有限”，就支撑 A3。
+        # If gH,gL have limited spread on the dataset, that supports A3.
         if np.isfinite(E_H_u) and E_H_u > 0:
             gH = float(E_H_pr / (E_H_u + self.eps))
         else:
@@ -326,7 +326,7 @@ class SpectralAccumulator:
         else:
             gL = float("nan")
 
-        # 额外：预测与GT频谱相关
+        # Extra: pred vs GT spectral correlation
         corr_pr_gt_spec = _pearson_corr(np.log(ps_pr + 1.0), np.log(ps_gt + 1.0))
 
         rec = {
@@ -350,9 +350,9 @@ class SpectralAccumulator:
 
     def summary(self) -> Dict[str, Any]:
         """
-        输出：
-          - 每个关键指标的 mean/p05/p50/p95
-          - 用于 A3 的经验 m_hat/M_hat（基于增益分位数）
+        Returns:
+          - mean/p05/p50/p95 for each key metric
+          - Empirical m_hat/M_hat for A3 (from gain quantiles)
         """
         keys = [
             "a1_ratio_h", "a2_ratio_l",
@@ -369,8 +369,8 @@ class SpectralAccumulator:
                 **_quantiles(vals, qs=(0.05, 0.50, 0.95)),
             }
 
-        # A3：经验下界/上界（把 m,M 理解为增益的某种“保守界”）
-        # 例如用 5% 分位当 m_hat，95% 分位当 M_hat（仅作经验佐证）
+        # A3: empirical lower/upper bounds (treat m,M as conservative bounds on gains)
+        # e.g. m_hat = 5th percentile, M_hat = 95th (evidence only)
         gH_vals = [r["gain_H_pred_over_u"] for r in self.records if np.isfinite(r["gain_H_pred_over_u"])]
         gL_vals = [r["gain_L_pred_over_u"] for r in self.records if np.isfinite(r["gain_L_pred_over_u"])]
 

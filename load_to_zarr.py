@@ -11,14 +11,14 @@ from numcodecs import Blosc
 from config.seismic_moe_config import SeismicMOEConfig
 
 # ---------------------------
-# 命名与类别推断
+# Naming and type inference
 # ---------------------------
 
 def to_snake_lower(s: str) -> str:
     s = s.strip()
     if not s:
         return s
-    # 驼峰 -> 下划线边界
+    # CamelCase -> snake_case boundaries
     s = re.sub(r'([A-Z]+)([A-Z][a-z0-9])', r'\1_\2', s)
     s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s)
     s = re.sub(r'[^A-Za-z0-9]+', '_', s)
@@ -27,7 +27,7 @@ def to_snake_lower(s: str) -> str:
     if not parts:
         return s
     if parts[0] == 'style':
-        # 与原脚本一致：合并 style 子类型，仅区分 a/b
+        # Match legacy naming: collapse style subtypes; only a/b differ
         suffix = parts[-1] if len(parts) >= 2 else 'a'
         if len(parts) >= 3 and parts[1] == 'style':
             return '_'.join(parts[:3])  # style_style_a/b
@@ -35,7 +35,7 @@ def to_snake_lower(s: str) -> str:
     return '_'.join(parts)
 
 def infer_group_and_variant(subdir_name: str):
-    # 返回 (group, variant, norm_type_key)
+    # Returns (group, variant, norm_type_key)
     # group ∈ {'vel','style','fault'} ; variant ∈ {'flat','curve','style'}
     name = subdir_name
     if name.startswith("CurveFault_"):
@@ -58,22 +58,22 @@ def family_from_type_key(type_key: str) -> str:
         return 'fault'
     if tk.startswith('style'):
         return 'style'
-    raise ValueError(f"无法从 type_key='{type_key}' 推断 family")
+    raise ValueError(f"Cannot infer family from type_key='{type_key}'")
 
-# fault 正则
+# Fault seismogram filename regex
 FAULT_SEIS_RE = re.compile(r"seis_?(\d+)_1_(\d+)\.npy$")
 
 
 # ---------------------------
-# 扫描 train_samples 生成 “样本清单”
-# 每条记录： (input_path, output_path or None, type_key, input_file_tag)
+# Scan train_samples/ into a manifest of tuples:
+#   (input_path, output_path or None, type_key, input_file_tag)
 # ---------------------------
 
 def collect_supervised_samples(train_dir: str,
                                type_id_map: Dict[str, int],
                                expect_ch: int = 5) -> List[Tuple[str, Optional[str], str, str]]:
     if not os.path.isdir(train_dir):
-        raise RuntimeError(f"训练目录不存在: {train_dir}")
+        raise RuntimeError(f"Training directory does not exist: {train_dir}")
 
     subdirs = [d for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))]
     records = []
@@ -83,9 +83,9 @@ def collect_supervised_samples(train_dir: str,
         if group is None:
             continue
         if not (type_key.endswith('_a') or type_key.endswith('_b')):
-            raise ValueError(f"目录 '{sub}' 规范化为 '{type_key}'，但未以 _a/_b 结尾。")
+            raise ValueError(f"Directory '{sub}' normalizes to '{type_key}' but must end with _a/_b.")
         if type_key not in type_id_map:
-            raise KeyError(f"type_key '{type_key}' 不在映射表中。")
+            raise KeyError(f"type_key '{type_key}' is missing from type_id_map.")
 
         sub_path = os.path.join(train_dir, sub)
 
@@ -118,7 +118,7 @@ def collect_supervised_samples(train_dir: str,
             continue
 
     if not records:
-        raise RuntimeError("未在 train_samples/ 下找到可监督样本。")
+        raise RuntimeError("No supervised samples found under train_samples/.")
     return records
 
 def collect_test_inputs(test_dir: str) -> List[str]:
@@ -128,7 +128,7 @@ def collect_test_inputs(test_dir: str) -> List[str]:
 
 
 # ---------------------------
-# 统计总样本数（文件内 shape[0] 之和）
+# Total sample count (sum of leading dimension per file)
 # ---------------------------
 
 def count_total_samples_records(records: List[Tuple[str, Optional[str], str, str]]) -> int:
@@ -147,7 +147,7 @@ def count_total_samples_files(file_list: List[str]) -> int:
 
 
 # ---------------------------
-# 子类型固定比例划分（核心）
+# Per-subtype fixed train/val split ratios
 # ---------------------------
 
 def get_val_ratio_for_family(family: str) -> float:
@@ -158,7 +158,7 @@ def get_val_ratio_for_family(family: str) -> float:
         return 6.0 / 54.0
     if family == 'style':
         return 7.0 / 67.0
-    raise ValueError(f"未知 family: {family}")
+    raise ValueError(f"Unknown family: {family}")
 
 def split_fixed_ratio_indices(
     idxs: np.ndarray, val_ratio: float, seed: int = 42
@@ -179,7 +179,7 @@ def split_fixed_ratio_indices(
     return train_idx, val_idx
 
 def split_by_subtype_fixed_ratio(
-    type_names: np.ndarray,  # 前 sup_end 段的 type_name（字符串数组）
+    type_names: np.ndarray,  # type_name strings for supervised rows only
     seed: int = 42
 ) -> Tuple[np.ndarray, np.ndarray]:
     subtype_to_indices: Dict[str, list] = {}
@@ -202,28 +202,27 @@ def split_by_subtype_fixed_ratio(
 
 
 # ---------------------------
-# 主流程：写 Zarr
+# Main entry: materialize Zarr
 # ---------------------------
 
 def main():
     ap = argparse.ArgumentParser(description="Build seismic_moe.zarr from OpenFWI-style folders")
-    ap.add_argument('--data_dir', required=True, help='根数据目录，含 train_samples/ 与(可选) test/')
-    ap.add_argument('--zarr_out', required=True, help='输出 Zarr 目录（不存在会创建）')
-    ap.add_argument('--chunks', type=int, default=32, help='样本维 chunk 大小')
-    ap.add_argument('--dtype', type=str, default='float32', choices=['float32','float16'], help='存盘 dtype')
+    ap.add_argument('--data_dir', required=True, help='Dataset root with train_samples/ and optional test/')
+    ap.add_argument('--zarr_out', required=True, help='Output Zarr directory (created if missing)')
+    ap.add_argument('--chunks', type=int, default=32, help='Chunk size along sample dimension')
+    ap.add_argument('--dtype', type=str, default='float32', choices=['float32','float16'], help='Storage dtype')
     ap.add_argument('--seed', type=int, default=42)
 
-    # family/单类型控制
+    # Single-family controls
     ap.add_argument('--family', type=str, default='all',
-                    help="可选 'all' 或指定单类型（如 curve_vel_a / flat_vel_b / curve_fault_a / style_a）")
+                    help="'all' or a fine-grained key (e.g. curve_vel_a / flat_vel_b / style_a)")
     ap.add_argument('--include_test', type=int, default=0,
-                    help="当 family != 'all' 时是否并入 test/ 无标签输入（0/1，默认0）。family='all'时忽略。")
+                    help="If family != 'all', include label-free test/*.npy rows (0/1). Ignored when family='all'.")
     ap.add_argument('--remap_single_label', type=int, default=1,
-                    help="当 family != 'all' 时是否把该类的 label 重映射为 0（0/1，默认1）")
+                    help="If family != 'all', remap that class label to 0 (0/1, default 1).")
 
-    # ===== 新增：是否拼接 5 个通道到最后一维 =====
     ap.add_argument('--concat_channels', type=int, default=1,
-                    help="是否将 [5,1000,70] 沿最后一维拼接为 [1,1000,350]（1=是, 0=否）")
+                    help="Concatenate [5,1000,70] -> [1,1000,350] along last dim (1=yes, 0=no)")
 
     args = ap.parse_args()
 
@@ -235,33 +234,33 @@ def main():
     config = SeismicMOEConfig()
     type_id_map = config.type_id_specific
 
-    # family 解析
+    # Resolve family string
     family_arg = to_snake_lower(args.family) if args.family.lower() != 'all' else 'all'
     if family_arg != 'all':
         if not (family_arg.endswith('_a') or family_arg.endswith('_b')):
-            raise ValueError(f"--family '{args.family}' 需要以 _a/_b 结尾（如 curve_vel_a / style_a）")
+            raise ValueError(f"--family '{args.family}' must end with _a/_b (e.g. curve_vel_a / style_a).")
         if family_arg not in type_id_map:
-            raise KeyError(f"--family '{args.family}' 规范化为 '{family_arg}'，但不在 type_id_map 中。")
+            raise KeyError(f"--family '{args.family}' normalizes to '{family_arg}' but is absent from type_id_map.")
 
     train_dir = os.path.join(data_dir, 'train_samples')
     test_dir  = os.path.join(data_dir, 'test')
 
-    print("扫描有监督样本……")
+    print("Scanning supervised samples...")
     sup_records_all = collect_supervised_samples(train_dir, type_id_map)
 
-    # family 过滤
+    # Filter by family
     if family_arg == 'all':
         sup_records = sup_records_all
     else:
         sup_records = [rec for rec in sup_records_all if rec[2] == family_arg]
         if not sup_records:
-            raise RuntimeError(f"未找到 family='{family_arg}' 的有监督样本。")
+            raise RuntimeError(f"No supervised samples for family='{family_arg}'.")
 
     N_sup_files = len(sup_records)
     N_sup = count_total_samples_records(sup_records)
-    print(f"family = {family_arg} | 监督文件对 {N_sup_files} 个，总样本数 ≈ {N_sup}")
+    print(f"family = {family_arg} | supervised file pairs: {N_sup_files}, total samples ≈ {N_sup}")
 
-    # test 行为
+    # Optional unlabeled test split
     if family_arg == 'all':
         test_files = collect_test_inputs(test_dir)
         N_test = count_total_samples_files(test_files) if test_files else 0
@@ -269,22 +268,22 @@ def main():
         if args.include_test:
             test_files = collect_test_inputs(test_dir)
             N_test = count_total_samples_files(test_files) if test_files else 0
-            print(f"[include_test=1] 发现无标签测试输入 {len(test_files)} 个文件，总样本数 ≈ {N_test}")
+            print(f"[include_test=1] unlabeled test inputs: {len(test_files)} files, total samples ≈ {N_test}")
         else:
             test_files = []
             N_test = 0
 
-    # 预创建 Zarr
+    # Allocate Zarr datasets
     compressor = Blosc(cname="zstd", clevel=4, shuffle=Blosc.SHUFFLE)
     root = zarr.open_group(zarr_out, mode='w')
     target_dtype = np.float32 if dtype_str == 'float32' else np.float16
 
-    # 计算总量
+    # Total rows
     N_total = N_sup + N_test
     if N_total == 0:
-        raise RuntimeError("没有可写入的样本。")
+        raise RuntimeError("No samples to write.")
 
-    # === 根据 concat 设置数据集形状 ===
+    # Input tensor layout
     if do_concat:
         inputs_shape = (N_total, 1, 1000, 350)
         inputs_chunks = (args.chunks, 1, 1000, 350)
@@ -294,7 +293,7 @@ def main():
         inputs_chunks = (args.chunks, 5, 1000, 70)
         inputs_note = "Inputs kept as [5,1000,70] (no concatenation)"
 
-    # === 数据集定义 ===
+    # Create datasets
     inputs_ds = root.create_dataset(
         'inputs', shape=inputs_shape, chunks=inputs_chunks,
         dtype=target_dtype, compressor=compressor
@@ -305,27 +304,27 @@ def main():
     )
     labels_ds = root.create_dataset('labels', shape=(N_total,), chunks=(max(1,args.chunks),), dtype='int64', compressor=compressor)
 
-    # 字符串字段：使用可变长 UTF-8（保持与你原始实现一致）
+    # Variable-length UTF-8 metadata
     type_name_ds = root.create_dataset('type_name', shape=(N_total,), dtype=object, object_codec=zarr.codecs.VLenUTF8())
     input_file_ds = root.create_dataset('input_file', shape=(N_total,), dtype=object, object_codec=zarr.codecs.VLenUTF8())
 
-    # 写入 supervised
+    # Write supervised rows
     write_ptr = 0
-    print("写入有监督样本到 Zarr ……")
+    print("Writing supervised rows to Zarr...")
     for in_path, out_path, type_key, tag in tqdm(sup_records):
-        x_arr = np.load(in_path, mmap_mode='r')   # 期望 [M, 5, 1000, 70] 或已拼接 [M, 1, 1000, 350]
-        y_arr = np.load(out_path, mmap_mode='r')  # [M, 70, 70] 或 [M, 1, 70, 70]
+        x_arr = np.load(in_path, mmap_mode='r')   # expected [M,5,1000,70] or stacked [M,1,1000,350]
+        y_arr = np.load(out_path, mmap_mode='r')  # [M,70,70] or [M,1,70,70]
 
         M = int(x_arr.shape[0])
 
-        # === 输入规范化 ===
+        # Normalize input layout
         if x_arr.ndim != 4:
-            raise ValueError(f"{in_path} 维度应为 4，实际 {x_arr.shape}")
+            raise ValueError(f"{in_path} expected 4D tensor, got shape {x_arr.shape}")
 
         if do_concat:
-            # 目标： [M,1,1000,350]
+            # target [M,1,1000,350]
             if x_arr.shape[1:] == (5, 1000, 70):
-                # 按要求逐样本使用 np.concatenate([x_arr[j][k] for k in range(5)], axis=1)
+                # per-sample concat along receiver axis
                 concatenated = np.empty((M, 1000, 350), dtype=target_dtype)
                 for j in range(M):
                     input_data = np.concatenate([x_arr[j][k] for k in range(5)], axis=1)  # [1000,350]
@@ -334,30 +333,30 @@ def main():
             elif x_arr.shape[1:] == (1, 1000, 350):
                 x_cat = x_arr.astype(target_dtype, copy=False)
             else:
-                raise ValueError(f"{in_path} 的 inputs 形状不支持：{x_arr.shape[1:]}, 期望 [5,1000,70] 或 [1,1000,350]")
+                raise ValueError(f"{in_path} unsupported input shape {x_arr.shape[1:]}; expect [5,1000,70] or [1,1000,350]")
         else:
-            # 目标： [M,5,1000,70]（不拼接）
+            # target [M,5,1000,70]
             if x_arr.shape[1:] == (5, 1000, 70):
                 x_cat = x_arr.astype(target_dtype, copy=False)
             elif x_arr.shape[1:] == (1, 1000, 350):
-                # 若给的是已拼接的，尝试拆回 5 通道（按宽度70分块）
+                # split stacked tensor back to 5 sources
                 if x_arr.shape[3] != 350:
-                    raise ValueError(f"{in_path} 的拼接宽度不是 350，无法拆分为 5×70：{x_arr.shape}")
+                    raise ValueError(f"{in_path} width {x_arr.shape[3]} cannot reshape to 5×70")
                 # [M,1,1000,350] -> [M,5,1000,70]
                 reshaped = x_arr.reshape(M, 1, 1000, 5, 70)   # [M,1,1000,5,70]
                 x_cat = reshaped[:, 0].transpose(0, 1, 2, 3).astype(target_dtype, copy=False)  # [M,5,1000,70]
             else:
-                raise ValueError(f"{in_path} 的 inputs 形状不支持：{x_arr.shape[1:]}, 期望 [5,1000,70] 或 [1,1000,350]")
+                raise ValueError(f"{in_path} unsupported input shape {x_arr.shape[1:]}; expect [5,1000,70] or [1,1000,350]")
 
-        # === 输出规范化到 [M, 1, 70, 70] ===
+        # Normalize velocity maps to [M,1,70,70]
         if y_arr.ndim == 4 and y_arr.shape[1:] == (1, 70, 70):
             y_cat = y_arr.astype(target_dtype, copy=False)
         elif y_arr.ndim == 3 and y_arr.shape[1:] == (70, 70):
             y_cat = y_arr[:, None, :, :].astype(target_dtype, copy=False)  # [M,1,70,70]
         else:
-            raise ValueError(f"{out_path} 的 outputs 形状不支持：{y_arr.shape}, 期望 [M,70,70] 或 [M,1,70,70]")
+            raise ValueError(f"{out_path} unsupported label shape {y_arr.shape}; expect [M,70,70] or [M,1,70,70]")
 
-        # label：全体时用全局 id；单类型可选重映射为 0
+        # Integer labels: global id for multi-family; optional remap for single-family runs
         if family_arg == 'all':
             lab_val = int(type_id_map[type_key])
         else:
@@ -368,7 +367,7 @@ def main():
         outputs_ds[sl] = y_cat
         labels_ds[sl] = lab_val
 
-        # ===== 关键修复：标量广播，避免 list 长度与 chunk 选区不匹配 =====
+        # Broadcast scalars so Zarr chunk writes stay aligned
         type_name_ds[sl] = type_key
         input_file_ds[sl] = tag
         # =================================================================
@@ -377,11 +376,11 @@ def main():
 
     sup_end = write_ptr
 
-    # 写入无标签 test（只写 inputs 与元信息；labels=-1; type_name="test"）
+    # Append unlabeled test rows (labels = -1, type_name = "test")
     if N_test > 0:
-        print("写入无标签测试样本到 Zarr ……")
+        print("Writing unlabeled test rows to Zarr...")
         for in_path in tqdm(test_files):
-            x_arr = np.load(in_path, mmap_mode='r')  # [M,5,1000,70] 或 [M,1,1000,350]
+            x_arr = np.load(in_path, mmap_mode='r')  # [M,5,1000,70] or [M,1,1000,350]
             M = int(x_arr.shape[0])
 
             if do_concat:
@@ -394,23 +393,23 @@ def main():
                 elif x_arr.shape[1:] == (1, 1000, 350):
                     x_cat = x_arr.astype(target_dtype, copy=False)
                 else:
-                    raise ValueError(f"{in_path} 的 inputs 形状不支持：{x_arr.shape[1:]}, 期望 [5,1000,70] 或 [1,1000,350]")
+                    raise ValueError(f"{in_path} unsupported input shape {x_arr.shape[1:]}; expect [5,1000,70] or [1,1000,350]")
             else:
                 if x_arr.shape[1:] == (5, 1000, 70):
                     x_cat = x_arr.astype(target_dtype, copy=False)
                 elif x_arr.shape[1:] == (1, 1000, 350):
                     if x_arr.shape[3] != 350:
-                        raise ValueError(f"{in_path} 的拼接宽度不是 350，无法拆分为 5×70：{x_arr.shape}")
+                        raise ValueError(f"{in_path} width {x_arr.shape[3]} cannot reshape to 5×70")
                     reshaped = x_arr.reshape(M, 1, 1000, 5, 70)
                     x_cat = reshaped[:, 0].transpose(0, 1, 2, 3).astype(target_dtype, copy=False)
                 else:
-                    raise ValueError(f"{in_path} 的 inputs 形状不支持：{x_arr.shape[1:]}, 期望 [5,1000,70] 或 [1,1000,350]")
+                    raise ValueError(f"{in_path} unsupported input shape {x_arr.shape[1:]}; expect [5,1000,70] or [1,1000,350]")
 
             sl = slice(write_ptr, write_ptr + M)
             inputs_ds[sl] = x_cat
             labels_ds[sl] = -1
 
-            # ===== 关键修复：标量广播 =====
+            # Scalar broadcast for metadata
             type_name_ds[sl] = "test"
             input_file_ds[sl] = f"test/{os.path.basename(in_path)}"
             # =================================
@@ -419,16 +418,16 @@ def main():
 
     assert write_ptr == N_total
 
-    # —— 划分 train / val （每个子类型固定比例），不做 test —— #
+    # Train/val indices (fixed ratio per subtype); no held-out test split here
     sup_types = np.asarray(type_name_ds[:sup_end], dtype=object)
 
     if family_arg == 'all':
-        # 每个子类型各自按其 family 的固定比例划分，再合并
+        # Each subtype uses its family-specific val ratio, then indices are merged
         train_idx, val_idx = split_by_subtype_fixed_ratio(
             type_names=sup_types, seed=args.seed
         )
     else:
-        # 单一子类型：直接按其 family 的固定比例划分
+        # Single subtype: apply that family's val ratio directly
         fam = family_from_type_key(family_arg)
         val_ratio = get_val_ratio_for_family(fam)
         all_sup_indices = np.arange(sup_end, dtype=np.int64)
@@ -436,19 +435,19 @@ def main():
             all_sup_indices, val_ratio=val_ratio, seed=args.seed
         )
 
-    test_idx = np.array([], dtype=np.int64)  # 不划分 test
+    test_idx = np.array([], dtype=np.int64)  # supervised test split unused here
 
     splits = root.create_group('splits')
     splits.create_dataset('train_idx', data=train_idx.astype(np.int64), compressor=compressor)
     splits.create_dataset('val_idx',   data=val_idx.astype(np.int64),   compressor=compressor)
     splits.create_dataset('test_idx',  data=test_idx.astype(np.int64),  compressor=compressor)
 
-    # 若存在“无标签 test 区间”，另外保存它们的索引段（可选）
+    # Optional index range for appended unlabeled test rows
     if N_test > 0:
         unsup_idx = np.arange(sup_end, N_total, dtype=np.int64)
         splits.create_dataset('unsup_test_idx', data=unsup_idx, compressor=compressor)
 
-    # 元信息写到 .zattrs
+    # Serialize metadata to root attrs
     type_id_map_attr = {str(k): int(v) for k, v in type_id_map.items()}
     id_type_map_attr = {int(v): str(k) for k, v in type_id_map.items()}
 
@@ -482,8 +481,8 @@ def main():
         "concat_channels": do_concat
     })
 
-    print(f"  完成：Zarr 写入 {zarr_out}")
-    print(f"  family: {family_arg} | 监督样本: {sup_end}  | 无标签测试样本: {N_test}")
+    print(f"  Done writing Zarr to {zarr_out}")
+    print(f"  family: {family_arg} | supervised rows: {sup_end} | unlabeled test rows: {N_test}")
     print(f"  splits/train: {len(train_idx)}, val: {len(val_idx)}, test: {len(test_idx)}")
     if N_test > 0:
         print(f"  splits/unsup_test_idx: {len(unsup_idx)}")

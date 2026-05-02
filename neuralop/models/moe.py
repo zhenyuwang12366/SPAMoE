@@ -123,7 +123,7 @@ class MOEOperator(BaseModel, name='MOE'):
             self.v_type_num = len(experts)
 
         self.experts = nn.ModuleList(experts)
-        # >>> 显存管理透明代理（开关可由 config 控制）
+        # Optional transparent GPU memory proxy (toggle via config)
         use_proxy = self.config.get('use_expert_memory_proxy', False)
         self.expert_proxy: Optional[ExpertMemoryProxy] = None
         if use_proxy:
@@ -134,16 +134,16 @@ class MOEOperator(BaseModel, name='MOE'):
                 amp_dtype=torch.bfloat16,
             )
         
-        # 派生属性
+        # Derived attributes
         if self.moe_mode == 'velocity_type':
             self.num_experts = len(experts)
             self.types_per_group = 0
         elif self.moe_mode == 'group':
             self.types_per_group = int(self.v_type_num)
             if self.types_per_group <= 0:
-                raise ValueError("group 模式需要正整数的 v_type_num。")
+                raise ValueError("group mode requires a positive integer v_type_num.")
             if len(experts) % self.types_per_group != 0 and is_logger:
-                print(f"[WARN] 专家数量 {len(experts)} 不能被每组类型数 {self.types_per_group} 整除，将按整除结果截断。")
+                print(f"[WARN] Number of experts {len(experts)} is not divisible by types_per_group {self.types_per_group}; truncating.")
             self.num_experts = max(1, len(experts) // self.types_per_group)
         else:
             self.num_experts = len(experts)
@@ -167,7 +167,7 @@ class MOEOperator(BaseModel, name='MOE'):
                 self.alpha: float = 0.0
 
             if self.router_type == 'task_aware' and self.fusion_type == 'swa':
-                raise ValueError("task_aware 路由当前不支持 'swa' 融合。")
+                raise ValueError("task_aware router does not support 'swa' fusion.")
 
             if router_type == 'basic':
                 self.router = Router(
@@ -198,7 +198,7 @@ class MOEOperator(BaseModel, name='MOE'):
                     alpha=self.alpha,
                 )
             else:
-                raise ValueError(f"不支持的路由器类型: {router_type}")
+                raise ValueError(f"Unsupported router type: {router_type}")
 
             # s_processor / w_processor
             for t in ['s_processor', 'w_processor']:
@@ -219,7 +219,7 @@ class MOEOperator(BaseModel, name='MOE'):
                     module = SumMix(self.out_channels)
                 setattr(self, t, module)
 
-            # 融合层
+            # fusion modules
             if fusion_type == 'linear':
                 self.fusion = LinearMix(self.top_k, self.out_channels)
             elif fusion_type == 'attention':
@@ -235,7 +235,7 @@ class MOEOperator(BaseModel, name='MOE'):
             elif fusion_type == 'basic':
                 self.fusion = SumMix(self.out_channels)
             else:
-                raise ValueError(f"未支持的融合类型: {fusion_type}")
+                raise ValueError(f"Unsupported fusion type: {fusion_type}")
         else:
             self.top_k = 0
             self.w_k = 0
@@ -259,14 +259,14 @@ class MOEOperator(BaseModel, name='MOE'):
             if class_weights is None:
                 type_weights = None
                 if self.is_logger and not self._type_weight_warned:
-                    print("[WARN] 未提供类型权重，分组模式将退化为普通专家模式。")
+                    print("[WARN] No type weights provided; group mode falls back to vanilla experts.")
                     self._type_weight_warned = True
             else:
                 type_weights = class_weights
         else:
             type_weights = None
             if class_weights is not None and self.is_logger and not self._type_weight_warned:
-                print("[WARN] 当前 moe_mode 非 'group'，忽略 encoder 的类型权重。")
+                print("[WARN] moe_mode is not 'group'; ignoring encoder type weights.")
                 self._type_weight_warned = True
 
         x_flat = x.mean(dim=(2, 3)).view(batch_size, -1)
@@ -310,7 +310,7 @@ class MOEOperator(BaseModel, name='MOE'):
             w_combined = torch.stack(w_outputs, dim=1)
 
         if self.fusion_type == 'swa':
-            # 这里传已经 stack 好的 Tensor（而不是 list）
+            # pass stacked Tensor (not list)
             s_combined = self.s_act(s_combined)
             w_combined = self.w_act(w_combined)
             combined_output = self.sw_act(s_combined, w_combined)
@@ -328,8 +328,8 @@ class MOEOperator(BaseModel, name='MOE'):
         default_shape: Optional[Tuple[int, ...]] = None
     ) -> Tuple[int, ...]:
         """
-        从收集到的空间形状中选出 target_shape。
-        若 all_shapes 为空则回退到 default_shape（若提供）或 x 的空间形状。
+        Pick target_shape from collected spatial shapes.
+        If all_shapes is empty, use default_shape when provided, else x.spatial shape.
         """
         if not all_shapes:
             return tuple(default_shape)
@@ -358,7 +358,7 @@ class MOEOperator(BaseModel, name='MOE'):
                 mode = 'linear'
             return F.interpolate(out, size=target_shape, mode=mode, align_corners=True)
         except Exception as e:
-            print(f"[ERROR] 插值失败: {e}；用零张量兜底。in={tuple(out.shape)} target={target_shape}")
+            print(f"[ERROR] Interpolation failed: {e}; using zeros. in={tuple(out.shape)} target={target_shape}")
             return torch.zeros(out.shape[0], out.shape[1], *target_shape, device=out.device, dtype=out.dtype)
     
     def _forward_velocity_type(self, x: torch.Tensor, class_weights: Optional[torch.Tensor], **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -367,12 +367,12 @@ class MOEOperator(BaseModel, name='MOE'):
 
         num_available = len(self.experts)
         if num_available == 0:
-            raise RuntimeError("velocity_type 模式需要至少一个专家。")
+            raise RuntimeError("velocity_type mode needs at least one expert.")
 
         weights = class_weights
         if weights is None:
             if self.is_logger:
-                print("[WARN] type_weights 未提供，使用均匀权重。")
+                print("[WARN] type_weights missing; using uniform weights.")
             num_types = min(self.v_type_num or num_available, num_available)
             weights = torch.ones(batch_size, num_types, device=device, dtype=x.dtype) / float(num_types)
         else:
@@ -381,7 +381,7 @@ class MOEOperator(BaseModel, name='MOE'):
             elif weights.dim() == 2 and weights.size(0) == 1 and batch_size > 1:
                 weights = weights.expand(batch_size, -1)
             elif weights.dim() == 2 and weights.size(0) != batch_size:
-                raise ValueError(f"type_weights batch 大小 {weights.size(0)} 与输入 {batch_size} 不匹配")
+                raise ValueError(f"type_weights batch size {weights.size(0)} does not match input batch {batch_size}")
             elif weights.dim() != 2:
                 raise ValueError(f"Unsupported type_weights shape: {tuple(weights.shape)}")
             weights = weights.to(device=device, dtype=x.dtype)
@@ -390,9 +390,9 @@ class MOEOperator(BaseModel, name='MOE'):
         total_experts = num_available
         num_types = min(expected_types, weights.size(1), total_experts)
         if num_types <= 0:
-            raise ValueError("velocity_type 模式需要至少一个专家与对应类型权重。")
+            raise ValueError("velocity_type mode needs at least one expert and matching type weights.")
         if num_types < weights.size(1) and self.is_logger:
-            print(f"[WARN] type_weights 列数 {weights.size(1)} 超过可用专家数量 {total_experts}，仅使用前 {num_types} 个。")
+            print(f"[WARN] type_weights has {weights.size(1)} columns but only {total_experts} experts; using first {num_types}.")
 
         weights = weights[:, :num_types]
         C = self.out_channels if self.out_channels > 0 else x.shape[1]
@@ -414,12 +414,12 @@ class MOEOperator(BaseModel, name='MOE'):
                     raise RuntimeError("expert returned None")
             except Exception as exc:
                 if self.is_logger:
-                    print(f"[WARN] 速度类型专家 {idx} 前向失败: {exc}")
+                    print(f"[WARN] velocity-type expert {idx} forward failed: {exc}")
                 out = _zeros_like()
 
             if not torch.is_tensor(out):
                 if self.is_logger:
-                    print(f"[WARN] 速度类型专家 {idx} 返回非张量，使用零张量代替。")
+                    print(f"[WARN] velocity-type expert {idx} returned non-tensor; using zeros.")
                 out = _zeros_like()
 
             if out.dim() == 3: out = out.unsqueeze(1)
@@ -428,7 +428,7 @@ class MOEOperator(BaseModel, name='MOE'):
             elif out.dim() > 4: out = out.view(out.size(0), out.size(1), out.size(2), -1)
             if out.size(0) != batch_size:
                 if self.is_logger:
-                    print(f"[WARN] 专家 {idx} 输出 batch 大小 {out.size(0)} 异常，使用零张量替换。")
+                    print(f"[WARN] expert {idx} output batch size {out.size(0)} mismatch; replacing with zeros.")
                 out = _zeros_like()
 
             outputs.append(out)
@@ -449,14 +449,14 @@ class MOEOperator(BaseModel, name='MOE'):
         
         return combined, None
 
-    # ---------------- 工具：按专家聚合 & 回填 ----------------
+    # ---------------- Pack by expert & scatter back ----------------
     def _pack_by_expert(self, indices_1d: torch.Tensor, x: torch.Tensor):
         """
-        indices_1d: [B] 每个样本的 expert_idx（已是 experts 的直接索引）
+        indices_1d: [B] per-sample expert_idx (indices into self.experts)
         x:          [B, C, H, W]
-        返回:
+        Returns:
           routed: {expert_idx -> x_sub_cat [n_e, C, H, W]}
-          meta  : {expert_idx -> (positions_list, sizes_list)}  # 回填需要
+          meta  : {expert_idx -> (positions_list, sizes_list)}  # for scatter_back
         """
         routed, meta = {}, {}
         for pos, eid in enumerate(indices_1d.tolist()):
@@ -482,8 +482,8 @@ class MOEOperator(BaseModel, name='MOE'):
                       dtype):
         """
         y_by_expert: {expert_idx: y_sub_cat [n_e, C, H, W]}
-        meta       : _pack_by_expert 返回的 meta
-        返回: y_full [B, C, H, W]
+        meta       : meta from _pack_by_expert
+        Returns: y_full [B, C, H, W]
         """
         H, W = shape_hw
         y_full = torch.zeros(B, C, H, W, device=device, dtype=dtype)
@@ -493,44 +493,44 @@ class MOEOperator(BaseModel, name='MOE'):
                 y_full[pos:pos+1] = y_sub[i:i+1]
         return y_full
 
-    # ---------------- 核心：批处理版激活组计算 ----------------
+    # ---------------- Batched activation-group processing ----------------
     def _process_activation_group(
         self,
         x: torch.Tensor,
         expert_indices: torch.Tensor,   # [B, top_k]
-        routing_weights: torch.Tensor,  # [B, top_k] 或 None
+        routing_weights: torch.Tensor,  # [B, top_k] or None
         k: int,
         batch_size: int,
         device,
-        type_weights: Optional[torch.Tensor] = None,  # [B, T] 或 None
+        type_weights: Optional[torch.Tensor] = None,  # [B, T] or None
         **kwargs,
     ) -> List[torch.Tensor]:
         """
-        要点：
-        1) 按专家聚合，一次前向（forward_many 或 per-expert 批处理）；
-        2) 像老版本一样：把“形状对齐 + 按样本路由加权”放在最后统一执行；
-        3) 提示信息与老版本一致，且 print(..., flush=True) 及时打印。
-        返回：长度为 top_k 的列表，每个 [B,C,H,W]。
+        Summary:
+        1) Batch by expert, one forward (forward_many or per-expert).
+        2) Match legacy: defer shape alignment + per-sample routing weights to the end.
+        3) Logging matches legacy with print(..., flush=True).
+        Returns: list of length top_k, each [B,C,H,W].
         """
-        # ------------------ 打印封装（及时 flush） ------------------
+        # ------------------ logging helper (flush) ------------------
         def _log(msg: str):
             if getattr(self, "is_logger", False):
                 print(msg, flush=True)
 
-        # ------------------ 基本校验与准备 ------------------
+        # ------------------ validation & setup ------------------
         top_k = int(k)
         if top_k <= 0:
             return []
 
         if expert_indices is None:
-            raise ValueError("expert_indices 为空，无法获取路由结果。")
+            raise ValueError("expert_indices is empty; cannot route.")
         if expert_indices.size(1) < top_k:
-            raise ValueError(f"expert_indices 的列数不足以支持 top_k={top_k}")
+            raise ValueError(f"expert_indices has fewer columns than top_k={top_k}")
 
         if routing_weights is None:
             routing_weights = torch.ones(batch_size, top_k, device=device, dtype=x.dtype)
         elif routing_weights.size(1) < top_k:
-            raise ValueError(f"routing_weights 的列数不足以支持 top_k={top_k}")
+            raise ValueError(f"routing_weights has fewer columns than top_k={top_k}")
         else:
             routing_weights = routing_weights.to(device=device, dtype=x.dtype)
 
@@ -538,20 +538,20 @@ class MOEOperator(BaseModel, name='MOE'):
         total_experts = len(self.experts)
         grouped_mode = (getattr(self, "moe_mode", None) == "group") and (type_weights is not None)
 
-        # ---- 分组一致性与类型权重准备 ----
+        # ---- Grouping checks & type weights ----
         if grouped_mode:
             if type_weights.dim() == 1:
                 type_weights = type_weights.view(1, -1).expand(batch_size, -1)
             if type_weights.size(0) != batch_size:
-                raise ValueError(f"type_weights batch 维度不一致: {type_weights.size(0)} vs {batch_size}")
+                raise ValueError(f"type_weights batch dim mismatch: {type_weights.size(0)} vs {batch_size}")
 
             T = getattr(self, "types_per_group", None)
             if T is None:
-                _log("[WARN] 未设置 types_per_group，降级为直接模式。")
+                _log("[WARN] types_per_group unset; falling back to direct mode.")
                 grouped_mode = False
                 type_weights = None
             elif type_weights.size(1) != T:
-                _log(f"[WARN] type_weights 列={type_weights.size(1)} 与组内专家数 T={T} 不一致，降级为直接模式。")
+                _log(f"[WARN] type_weights columns={type_weights.size(1)} != in-group experts T={T}; falling back to direct mode.")
                 grouped_mode = False
                 type_weights = None
             else:
@@ -559,13 +559,13 @@ class MOEOperator(BaseModel, name='MOE'):
                 experts_per_group = total_experts // max(1, self.num_experts)
                 if (expected_total == 0 or total_experts < expected_total
                     or total_experts % T != 0 or experts_per_group != T):
-                    _log(f"[WARN] 专家数量 {total_experts} 与分组结构不匹配（期望 {expected_total}），降级为直接模式。")
+                    _log(f"[WARN] expert count {total_experts} incompatible with group layout (expected {expected_total}); falling back to direct mode.")
                     grouped_mode = False
                     type_weights = None
                 else:
                     type_weights = type_weights.to(device=device, dtype=x.dtype)
 
-        # ------------------ 工具函数（与老版本语义一致） ------------------
+        # ------------------ inner helpers (legacy semantics) ------------------
         def _zeros_like_x(bsz: int, channels: int, like: torch.Tensor) -> torch.Tensor:
             return torch.zeros(bsz, channels, *like.shape[2:], device=like.device, dtype=like.dtype)
 
@@ -574,8 +574,8 @@ class MOEOperator(BaseModel, name='MOE'):
             default_shape: Optional[Tuple[int, ...]] = None
         ) -> Tuple[int, ...]:
             """
-            从收集到的空间形状中选出 target_shape。
-            若 all_shapes 为空则回退到 default_shape（若提供）或 x 的空间形状。
+            Pick target_shape from collected spatial sizes.
+            If all_shapes is empty, use default_shape if given else x.spatial shape.
             """
             if not all_shapes:
                 return tuple(default_shape) if default_shape is not None else tuple(x.shape[2:])
@@ -600,7 +600,7 @@ class MOEOperator(BaseModel, name='MOE'):
                     mode = 'linear'
                 return F.interpolate(out, size=target_shape, mode=mode, align_corners=True)
             except Exception as e:
-                _log(f"[ERROR] 插值失败: {e}；用零张量兜底。in={tuple(out.shape)} target={target_shape}")
+                _log(f"[ERROR] Interpolation failed: {e}; using zeros. in={tuple(out.shape)} target={target_shape}")
                 return torch.zeros(out.shape[0], out.shape[1], *target_shape, device=out.device, dtype=out.dtype)
 
         def _apply_sample_weights(batch_tensor: torch.Tensor, sample_wts: torch.Tensor) -> torch.Tensor:
@@ -610,11 +610,11 @@ class MOEOperator(BaseModel, name='MOE'):
                 sample_wts = sample_wts.view(-1, 1, 1, 1)
             return batch_tensor * sample_wts
 
-        # 形状日志，与老版本保持一致风格（只存 shape，避免持有显存）
+        # Shape log: store shapes only (avoid holding tensors)
         shape_log: Dict[Any, List[Tuple[int, ...]]] = {}
 
-        # ------------------ 主过程：逐 k 计算“未对齐、未乘路由权重”的逐样本输出 ------------------
-        # 每个 k_idx -> (List[torch.Tensor: [1,C,h,w] * B], sample_weights: [B])
+        # ------------------ main loop: per k, outputs before align / route multiply ------------------
+        # each k_idx -> (List of per-sample [1,C,h,w], sample_weights [B])
         collected: List[Tuple[List[torch.Tensor], torch.Tensor]] = []
 
         for k_idx in range(top_k):
@@ -623,16 +623,16 @@ class MOEOperator(BaseModel, name='MOE'):
             weights_k = weights_k.to(device=device, dtype=x.dtype)
 
             if not grouped_mode:
-                # -------- 直接专家模式：按专家聚合、一次前向、scatter 回填为 [B,C,h,w]，但先不乘路由权重 --------
+                # -------- Direct expert mode: pack by expert, forward, scatter; no route mult yet --------
                 routed, meta = self._pack_by_expert(indices_k, x)
 
                 if not routed:
-                    # 这一列 k 没有任何路由命中
+                    # no route hits for this k column
                     batch_outputs = [_zeros_like_x(1, C, x[b:b+1]) for b in range(batch_size)]
                     collected.append((batch_outputs, weights_k))
                     continue
 
-                # 前向（代理 or 直连），带兜底
+                # Forward (proxy or direct) with fallbacks
                 try:
                     if getattr(self, "expert_proxy", None) is not None:
                         y_by_eid = self.expert_proxy.forward_many(routed)
@@ -642,23 +642,23 @@ class MOEOperator(BaseModel, name='MOE'):
                             try:
                                 y_by_eid[eid] = self.experts[eid](x_sub, **kwargs)
                             except Exception as e:
-                                _log(f"[ERROR] 专家 {eid} 处理异常：{e}，使用零张量代替")
+                                _log(f"[ERROR] expert {eid} failed: {e}; using zeros")
                                 y_by_eid[eid] = _zeros_like_x(x_sub.size(0), C, x_sub)
                                 import traceback
                                 traceback.print_exc()
                                 exit(0)
                 except Exception as e:
-                    _log(f"[ERROR] forward_many 异常：{e}；该列以零张量兜底")
+                    _log(f"[ERROR] forward_many failed: {e}; zero fallback for this column")
                     batch_outputs = [_zeros_like_x(1, C, x[b:b+1]) for b in range(batch_size)]
                     collected.append((batch_outputs, weights_k))
                     continue
 
-                # 形状日志（每个专家一条）
+                # Per-expert shape log
                 for eid, y in y_by_eid.items():
                     if y is not None:
                         shape_log.setdefault(("expert", int(eid)), []).append(tuple(y.shape))
 
-                # 暂不全局对齐：先局部统一到本列最常见形状，便于 scatter
+                # Local align to modal shape in this column before scatter
                 spatial_shapes = [tuple(y.shape[2:]) for y in y_by_eid.values() if y is not None and y.dim() >= 4]
                 target_shape_local = _most_common_target_shape(spatial_shapes, default_shape=tuple(x.shape[2:]))
                 for eid in list(y_by_eid.keys()):
@@ -666,12 +666,12 @@ class MOEOperator(BaseModel, name='MOE'):
 
                 y_full = self._scatter_back(y_by_eid, meta, batch_size, C, target_shape_local, device, x.dtype)
 
-                # 拆为逐样本 [1,C,h,w]（后续统一全局对齐）
+                # Split to per-sample [1,C,h,w]; global align later
                 batch_outputs = [y_full[b:b+1] for b in range(batch_size)]
                 collected.append((batch_outputs, weights_k))
 
             else:
-                # -------- 分组模式：把 (group, t) 展开为具体专家，合一批处理；先按 type_weights 加权到样本，不乘路由权重 --------
+                # -------- Group mode: expand (group,t) to experts; type_weights on samples; no route mult yet --------
                 T = self.types_per_group
                 routed_dict: Dict[int, torch.Tensor] = {}
                 meta_dict: Dict[int, Tuple[List[int], List[int]]] = {}
@@ -699,11 +699,11 @@ class MOEOperator(BaseModel, name='MOE'):
                     collected.append((batch_outputs, weights_k))
                     continue
 
-                # 拼接 mini-batch
+                # Concat mini-batches per expert
                 for eid in routed_dict:
                     routed_dict[eid] = torch.cat(routed_dict[eid], dim=0).contiguous()
 
-                # 前向（代理 or 直连），带兜底
+                # Forward (proxy or direct) with fallbacks
                 try:
                     if getattr(self, "expert_proxy", None) is not None:
                         y_by_eid = self.expert_proxy.forward_many(routed_dict)
@@ -713,24 +713,24 @@ class MOEOperator(BaseModel, name='MOE'):
                             try:
                                 y_by_eid[eid] = self.experts[eid](x_sub, **kwargs)
                             except Exception as e:
-                                _log(f"[ERROR] 专家 {eid} 处理异常：{e}，使用零张量代替")
+                                _log(f"[ERROR] expert {eid} failed: {e}; using zeros")
                                 y_by_eid[eid] = _zeros_like_x(x_sub.size(0), C, x_sub)
                                 import traceback
                                 traceback.print_exc()
                                 exit(0)
                 except Exception as e:
-                    _log(f"[ERROR] forward_many 异常：{e}；该列以零张量兜底")
+                    _log(f"[ERROR] forward_many failed: {e}; zero fallback for this column")
                     batch_outputs = [_zeros_like_x(1, C, x[b:b+1]) for b in range(batch_size)]
                     collected.append((batch_outputs, weights_k))
                     continue
 
-                # 形状日志（按组内 t 记录）
+                # Shape log per (group, t)
                 for eid, y in y_by_eid.items():
                     if y is not None:
                         g = int(eid // T); t = int(eid % T)
                         shape_log.setdefault(("group", g, t), []).append(tuple(y.shape))
 
-                # 局部统一到本列最常见形状，便于逐样本累加
+                # Local unify for this column
                 spatial_shapes = [tuple(y.shape[2:]) for y in y_by_eid.values() if y is not None and y.dim() >= 4]
                 target_shape_local = _most_common_target_shape(spatial_shapes, default_shape=tuple(x.shape[2:]))
 
@@ -740,23 +740,23 @@ class MOEOperator(BaseModel, name='MOE'):
                 H, W = target_shape_local
                 y_group = torch.zeros(batch_size, C, H, W, device=device, dtype=x.dtype)
 
-                # 向量化回填：对同一 eid 的所有样本一次性 index_add_
+                # Vectorized fill: index_add_ for all samples of same eid
                 for eid, y_sub in y_by_eid.items():
-                    positions, _ = meta_dict[eid]         # List[int]，长度 N
+                    positions, _ = meta_dict[eid]         # List[int], length N
                     if len(positions) == 0:
                         continue
                     idx = torch.tensor(positions, device=device, dtype=torch.long)  # [N]
                     local_t = eid % T
                     tw = type_weights[idx, local_t].view(-1, 1, 1, 1)               # [N,1,1,1]
-                    # y_sub: [N,C,H,W]（已被局部对齐）
+                    # y_sub: [N,C,H,W] (locally aligned)
                     y_group.index_add_(0, idx, y_sub * tw)
 
-                # 拆成逐样本 [1,C,h,w]；后续再统一“全局对齐 + 按样本路由加权”
+                # Per-sample [1,C,h,w]; then global align + route weights
                 batch_outputs = [y_group[b:b+1] for b in range(batch_size)]
                 collected.append((batch_outputs, weights_k))
 
-        # ------------------ 统一形状对齐 + 统一按样本路由加权（与老版本一致） ------------------
-        # 收集所有输出的空间形状
+        # ------------------ global align + per-sample routing weights (legacy) ------------------
+        # Collect spatial shapes from all outputs
         all_spatial_shapes: List[Tuple[int, ...]] = []
         for batch_outputs, _ in collected:
             for out in batch_outputs:
@@ -764,11 +764,11 @@ class MOEOperator(BaseModel, name='MOE'):
                     all_spatial_shapes.append(tuple(out.shape[2:]))
 
         if not all_spatial_shapes:
-            _log("[WARN] 没有有效输出，返回零张量列表")
+            _log("[WARN] no valid outputs; returning zero tensors")
             return [torch.zeros(batch_size, C, *x.shape[2:], device=device, dtype=x.dtype) for _ in range(top_k)]
 
         target_shape = _most_common_target_shape(all_spatial_shapes)
-        _log(f"[INFO] 目标形状（对齐用）: {target_shape}")
+        _log(f"[INFO] target shape for alignment: {target_shape}")
 
         outputs: List[torch.Tensor] = []
         for batch_outputs, sample_wts in collected:
@@ -777,20 +777,20 @@ class MOEOperator(BaseModel, name='MOE'):
                 out_adj = _resize_to(out, target_shape)
                 adjusted.append(out_adj)
 
-            # 合并为 [B,C,H,W]
+            # stack -> [B,C,H,W]
             try:
                 stacked = torch.cat(adjusted, dim=0)  # [B,C,H,W]
             except Exception as e:
                 bad_shapes = [tuple(a.shape) for a in adjusted]
-                _log(f"[ERROR] 合并组/专家输出失败：{e}；形状列表：{bad_shapes}；跳过该条目")
-                # 跳过这个 k_idx
+                _log(f"[ERROR] merge expert outputs failed: {e}; shapes: {bad_shapes}; skipping")
+                # skip this k_idx
                 continue
 
-            weighted = _apply_sample_weights(stacked, sample_wts)  # 逐样本广播乘权
+            weighted = _apply_sample_weights(stacked, sample_wts)  # broadcast per-sample weights
             outputs.append(weighted)
 
         if not outputs:
-            _log("[WARN] 没有有效的组/专家输出，返回零张量列表")
+            _log("[WARN] no valid grouped/expert outputs; returning zero tensors")
             return [torch.zeros(batch_size, C, *target_shape, device=device, dtype=x.dtype) for _ in range(top_k)]
 
         return outputs
@@ -895,16 +895,16 @@ class MOEOperator(BaseModel, name='MOE'):
     def load_experts(self, load_dir):
         load_dir = Path(load_dir)
         if not load_dir.exists():
-            raise ValueError(f"专家目录不存在: {load_dir}")
+            raise ValueError(f"Expert directory does not exist: {load_dir}")
         metadata_path = load_dir / "metadata.pt"
         if not metadata_path.exists():
-            raise ValueError(f"元数据文件不存在: {metadata_path}")
+            raise ValueError(f"Metadata file missing: {metadata_path}")
         metadata = torch.load(metadata_path)
         if metadata['num_experts'] != self.num_experts:
-            raise ValueError(f"专家数量不匹配: 期望 {self.num_experts}，实际 {metadata['num_experts']}")
+            raise ValueError(f"Expert count mismatch: expected {self.num_experts}, got {metadata['num_experts']}")
         for i, expert in enumerate(self.experts):
             expert_path = load_dir / f"expert_{i}.pt"
             if not expert_path.exists():
-                raise ValueError(f"专家文件不存在: {expert_path}")
+                raise ValueError(f"Expert checkpoint missing: {expert_path}")
             expert.load_state_dict(torch.load(expert_path))
-        print(f"成功加载 {self.num_experts} 个专家模型")
+        print(f"Loaded {self.num_experts} expert checkpoints")

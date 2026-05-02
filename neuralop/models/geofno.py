@@ -307,15 +307,15 @@ class IPHI(nn.Module):
     
 class GeoFNO2d(BaseModel):
     """
-    对外接口：
-        输入:  x_img       (B, 1, H, W)   —— 单通道波形图
-        可选:  code        (B, C_code)    —— 与 IPHI 一致的额外条件特征，C_code=42(默认)
+    Public API:
+        Inputs:  x_img  (B, 1, H, W)   single-channel image / waveform map
+        Optional: code  (B, C_code)    extra conditioning for IPHI (default C_code=42)
 
-    内部逻辑：
-        1) 生成坐标网格 grid ∈ [0,1]^2，展平为 (B, N, 2)，N=H*W
-        2) 将图像展平为 (B, N, 1)
-        3) 拼接特征  (u, x, y) → (B, N, 3)，喂入 FNO2d，并显式传入 x_in/x_out、IPHI
-        4) FNO2d 输出 (B, N, out_channels) → 还原为 (B, out_channels, H, W)
+    Flow:
+        1) Build coordinate grid in [0,1]^2, flattened to (B, N, 2), N=H*W
+        2) Flatten image to (B, N, 1)
+        3) Concatenate (u, x, y) -> (B, N, 3), feed FNO2d with x_in/x_out and IPHI
+        4) FNO2d outputs (B, N, out_channels) -> reshape to (B, out_channels, H, W)
     """
     def __init__(
         self,
@@ -330,14 +330,14 @@ class GeoFNO2d(BaseModel):
         n_fourier_layers: int = 5,
     ):
         super().__init__()
-        # FNO 期望的输入通道为 3: (u, x, y)
+        # FNO expects 3 input channels: (u, x, y)
         self.in_channels = 3
         self.code_dim = code_dim
 
-        # 几何映射模块（IPHI）
+        # Geometry map (IPHI)
         self.iphi = IPHI(width=width)
 
-        # 主体 FNO；注意这里的 s1/s2 是初始化默认值，前向里会根据输入 H/W 自动同步
+        # Main FNO; s1/s2 defaults are synced to input H/W in forward
         self.fno = FNO2d(
             modes1=modes1,
             modes2=modes2,
@@ -352,30 +352,22 @@ class GeoFNO2d(BaseModel):
 
     @torch.no_grad()
     def _make_grid(self, B: int, H: int, W: int, device, dtype=torch.float32):
-        """
-        生成归一化到 [0,1] 的 2D 网格，并展平为 (B, N, 2)
-        """
+        """Build a [0,1]^2 grid and flatten to (B, N, 2)."""
         xs = torch.linspace(0., 1., H, device=device, dtype=dtype)
         ys = torch.linspace(0., 1., W, device=device, dtype=dtype)
         gy, gx = torch.meshgrid(ys, xs, indexing="xy")   # gy:(W,H), gx:(W,H)
-        # 上面 indexing="xy" 使第0维对应 x(宽W)，第1维对应 y(高H)
-        # 为了与常规 (H,W) 对齐，下方转置回来
+        # indexing="xy": dim0 is x (width W), dim1 is y (height H); transpose to (H,W) layout
         gx = gx.t()   # (H,W)
         gy = gy.t()   # (H,W)
         grid = torch.stack([gx, gy], dim=-1).view(1, H * W, 2).repeat(B, 1, 1)  # (B, N, 2)
         return grid
 
     def _sync_sizes(self, H: int, W: int):
-        """
-        将 FNO2d / SpectralConv2d 中用到的 s1/s2 同步为当前输入大小
-        """
+        """Sync FNO2d / SpectralConv2d s1/s2 to current spatial size."""
         self.fno.set_spatial_size(H, W)
 
     def _ensure_iphi_buffers(self, device, dtype):
-        """
-        让 IPHI 内部 buffer 与当前输入对齐到相同 device / dtype
-        （你的 IPHI 里把 center/B 固定写在了 cuda 上；这里在前向时动态对齐）
-        """
+        """Align IPHI buffers (e.g. center/B) to current device/dtype."""
         if hasattr(self.iphi, "center"):
             self.iphi.center = self.iphi.center.to(device=device, dtype=dtype)
         if hasattr(self.iphi, "B"):
@@ -387,35 +379,34 @@ class GeoFNO2d(BaseModel):
         code : (B, code_dim) or None
         return: (B, out_channels, H, W)
         """
-        assert x_img.dim() == 4 and x_img.size(1) == 1, "输入应为形状 (B,1,H,W) 的单通道图像"
+        assert x_img.dim() == 4 and x_img.size(1) == 1, "x_img must be single-channel with shape (B,1,H,W)"
         B, _, H, W = x_img.shape
         device = x_img.device
         f_dtype = x_img.dtype if x_img.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64) else torch.float32
 
-        # 1) 生成坐标，展平
+        # 1) Coordinates + flatten
         x_flat = self._make_grid(B, H, W, device=device, dtype=f_dtype)     # (B, N, 2)
 
-        # 2) 图像展平
+        # 2) Flatten image
         u_flat = x_img.view(B, 1, H * W).transpose(1, 2).to(dtype=f_dtype)  # (B, N, 1)
 
-        # 3) 拼接 (u, x, y) → (B, N, 3)
+        # 3) Concat (u, x, y) -> (B, N, 3)
         feat = torch.cat([u_flat, x_flat], dim=-1)                           # (B, N, 3)
 
-        # 4) 同步 FNO 的 s1/s2
+        # 4) Sync FNO s1/s2
         self._sync_sizes(H, W)
 
-        # 5) 对齐 IPHI buffer 的设备/精度
+        # 5) Align IPHI buffers
         self._ensure_iphi_buffers(device=device, dtype=f_dtype)
 
-        # 6) 处理 code（可选）
+        # 6) Optional code
         if code is not None:
-            assert code.dim() == 2 and code.size(0) == B, "code 形状应为 (B, code_dim)"
-            # IPHI.forward 期望 code 的形状是 (B, N_features)；直接传入即可
+            assert code.dim() == 2 and code.size(0) == B, "code must have shape (B, code_dim)"
             code_in = code.to(device=device, dtype=f_dtype)
         else:
             code_in = None
 
-        # 7) 调 FNO：显式传 x_in/x_out、iphi，避免 is_mesh=True 分支的歧义
+        # 7) FNO with explicit x_in/x_out/iphi
         y = self.fno(
             u=feat,               # (B, N, 3)
             code=code_in,         # (B, code_dim) or None
@@ -424,6 +415,6 @@ class GeoFNO2d(BaseModel):
             iphi=self.iphi,
         )                          # → (B, N, out_channels)
 
-        # 8) 还原为 (B, out_channels, H, W)
+        # 8) Reshape to (B, out_channels, H, W)
         out = y.view(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         return out

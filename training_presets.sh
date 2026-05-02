@@ -111,7 +111,7 @@ set_training_preset_args() {
           )
           ;;
         *)
-          echo "不支持的 family: ${family}" >&2
+          echo "Unsupported family: ${family}" >&2
           return 1
           ;;
       esac
@@ -243,13 +243,13 @@ set_training_preset_args() {
           )
           ;;
         *)
-          echo "不支持的 family: ${family}" >&2
+          echo "Unsupported family: ${family}" >&2
           return 1
           ;;
       esac
       ;;
     *)
-      echo "不支持的 preset: ${preset}，可选值: default / preset1 / preset2" >&2
+      echo "Unsupported preset: ${preset} (allowed: default / preset1 / preset2)" >&2
       return 1
       ;;
   esac

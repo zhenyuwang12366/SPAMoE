@@ -10,7 +10,7 @@ font = FontProperties(size=6)
 colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
 
 def draw_single_radar(algs, stats_ls, labels, rgrid_ticks, title, outfile):
-    """绘制一张雷达图（一个组一张图）"""
+    """Draw one radar chart (one figure per group)."""
     angles = np.linspace(0, 2*np.pi, len(labels), endpoint=False)
     angles_closed = np.concatenate((angles, [angles[0]]))
 
@@ -32,8 +32,6 @@ def draw_single_radar(algs, stats_ls, labels, rgrid_ticks, title, outfile):
     ax.set_thetagrids(angles * 180 / np.pi, labels, fontproperties=font,
                       fontname='DejaVu Sans')
     ax.spines['polar'].set_visible(False)
-    # ax.set_title(title, fontsize=8, loc="center", y=-0.25,
-    #              fontname='Times New Roman')
     for txt in ax.get_xticklabels():
         x, y = txt.get_position()
         txt.set_position((x, y - 0.01))
@@ -47,15 +45,13 @@ def draw_single_radar(algs, stats_ls, labels, rgrid_ticks, title, outfile):
     plt.close(fig)
 
 
-# =========================
-# 数据区（与你原来的保持一致）
-# =========================
+# Data section (kept aligned with your original setup)
 
 labels = ["CurveVelA","CurveVelB","FlatVelA","FlatVelB",
         "CurveFaultA","CurveFaultB","FlatFaultA",
         "FlatFaultB","StyleA","StyleB"]
 
-# 图1：Closed-source LMMs
+# Fig 1: baselines
 algs1 = ["Ours (SA-EMO)","InversionNet","VelocityGAN","UPFWI"]
 stats_ls1 = [
     [0.9564, 0.8750, 0.9999, 0.9949, 0.9897, 0.7753, 0.9963, 0.9262, 0.9604, 0.9345],
@@ -65,7 +61,6 @@ stats_ls1 = [
 ]
 rgrids1 = [0.25, 0.50, 0.75, 1.0]
 
-# 逐一出图（一个组一张图）
 draw_single_radar(algs1, stats_ls1, labels, rgrids1,
                   title="Comparative Evaluation of Model Performance across Geological Domains",
                   outfile="radar_seismic.pdf")

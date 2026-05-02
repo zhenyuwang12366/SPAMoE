@@ -3,10 +3,10 @@
 """
 train_pdebench_emo_afmoe.py
 
-基于现有 FWI EMO + MoE 框架，改成 PDEBench 版本的训练脚本骨架：
-- 多任务: Burgers(1D), Navier-Stokes(2D), Darcy(2D)
-- 可选 router_type = 'sar' 时，用 AF-MoE (AdaptiveFreqMoE)
-- 其它 router_type 走你原来的 MOEOperator
+PDEBench training script skeleton adapted from the existing FWI EMO + MoE stack:
+- Multi-task: Burgers (1D), Navier-Stokes (2D), Darcy (2D)
+- When router_type = 'sar', use AF-MoE (AdaptiveFreqMoE)
+- Other router_type values use the original MOEOperator
 """
 
 import os
@@ -25,7 +25,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-# ======= 你自己仓库里的模块，这里假定名字 =======
+# ======= Project modules (names assumed here) =======
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.distributed import DistributedConfig
 import neuralop.mpu.comm as comm
@@ -33,13 +33,13 @@ from config.default_config import Default
 from neuralop.training import setup
 from neuralop.models.EMO import EMO
 from neuralop.models.moe import MOEOperator
-from neuralop.models.afreqmoe import AdaptiveFreqMoE  # 你上面实现的 AF-MoE
+from neuralop.models.afreqmoe import AdaptiveFreqMoE  # AF-MoE implementation
 from neuralop.models.expert_factory import ExpertFactory
-from neuralop.data.datasets.pde_dataset import PDEBenchDataset   # 需要你实现或改写
+from neuralop.data.datasets.pde_dataset import PDEBenchDataset   # implement or adapt as needed
 from neuralop.layers.spectral_convolution import SpectralConv
 import scripts.transforms as T
 from torchvision.transforms import Compose
-from neuralop.losses.seismic_loss import PDECombinedLoss  # 这里已经包含 RelativeL2 + Grad + Fourier
+from neuralop.losses.seismic_loss import PDECombinedLoss  # includes RelativeL2 + optional Grad/Fourier
 from scripts.scheduler import (
     WarmupMultiStepLR,
     WarmupCosineLR,
@@ -56,21 +56,21 @@ from utils import (
 patch_spectral_conv_forward(SpectralConv)
 
 
-PhysicsMetrics = SeismicMetrics  # PDE 任务沿用地震指标实现
+PhysicsMetrics = SeismicMetrics  # reuse seismic metrics helpers for PDE tasks
 # ===========================================================
-# 1. 配置定义：沿用你 SeismicMOEConfig 的风格，略简化
+# 1. Config: same style as SeismicMOEConfig, simplified
 # ===========================================================
 
 @dataclass
 class PDEBenchConfig(Default):
-    # ---- 通用网络超参 ----
+    # ---- General network hyperparameters ----
     in_channels: int = 1
     out_channels: int = 1
     hidden_channels: int = 128
     backbone: str = "vit"
     use_encoder: bool = True
-    v_type_num: int = 1               # PDE 任务一般不分多种 type，可留1
-    
+    v_type_num: int = 1               # PDE tasks usually need a single type; keep at 1
+
     # ---- MoE & Router ----
     top_k: int = 2
     noisy_gating: bool = False
@@ -91,7 +91,7 @@ class PDEBenchConfig(Default):
     moe_mode: str = "standard"
     aux_loss_weight: float = 0.1
 
-    # ---- 训练相关 ----
+    # ---- Training ----
     batch_size: int = 16
     test_batch_size: int = 16
     epochs: int = 200
@@ -112,7 +112,7 @@ class PDEBenchConfig(Default):
     seed: int = 42
     num_workers: int = 4
     
-    # 分布式训练配置
+    # Distributed training
     distributed = DistributedConfig(
         use_distributed=False,
         model_parallel_size=1,
@@ -120,8 +120,8 @@ class PDEBenchConfig(Default):
     )
     is_logger = False
 
-    # ---- 任务 & 数据 ----
-    # 这里用 PDEBench 的任务命名：navier/darcy/pipe/airfoil/plasticity
+    # ---- Tasks & data ----
+    # PDEBench-style task names: navier/darcy/pipe/airfoil/plasticity
     task: str = "darcy"
     data_root: str = "./pdebench_data"
     save_dir: str = "./results_pdebench"
@@ -129,9 +129,9 @@ class PDEBenchConfig(Default):
     vis_every: int = 100
     k: float = 1.0
     
-    # 专家配置
+    # Expert configurations
     expert_configs = [
-        # 傅里叶域专家 - 适合捕捉频率特征 FNO
+        # Fourier-domain expert — frequency structure (FNO)
         {
             'type': 'domain',
             'domain_type': 'fourier',
@@ -142,35 +142,35 @@ class PDEBenchConfig(Default):
             'projection_channel_ratio': 2,
             'n_layers': 4,
         },
-        # 原生多尺度神经算子专家 - 专门处理多尺度结构 MNO
+        # Native multiscale neural operator expert — multiscale structure (MNO)
         {
             'type': 'scale',
-            'scale_expert_type': 'native',  # 更新为scale_expert_type
+            'scale_expert_type': 'native',  # use scale_expert_type
             'n_dim': 2,
             'n_scales': 3,
             'scale_factors': [1.0, 0.6, 0.3],
             'fusion_mode': 'hierarchical',
             'n_layers': 4,
         },
-        # 局部处理专家 - 用于局部细节重建 LNO
+        # Local expert — spatial detail reconstruction (LNO)
         {
             'type': 'local',
-            'local_type': 'basic',  # 更新为basic类型
+            'local_type': 'basic',  # basic local type
             'n_dim': 2,
             'n_modes': (16, 16),
-            'disco_layers': True,  # 启用DISCO层
-            'diff_layers': True,   # 启用差分层
-            'n_layers': 3,         # 设置层数
-            'default_in_shape': (70, 70),  # 基于输入张量形状设置（后面会覆盖）
+            'disco_layers': True,  # enable DISCO layers
+            'diff_layers': True,   # enable finite-difference layers
+            'n_layers': 3,         # layer count
+            'default_in_shape': (70, 70),  # placeholder; overwritten from data later
             'domain_length': [2, 2],
         },
-        # # 小波域专家 - 适合处理局部特征和多尺度结构 WNO
+        # # Wavelet-domain expert — local features and multiscale (WNO)
         # {
         #     'type': 'domain',
         #     'domain_type': 'wavelet',
         #     'n_dim': 2,
-        #     'n_levels_height': 2,  # 减少级别为2，避免形状不匹配问题
-        #     'n_levels_width': 2,   # 减少级别为2，避免形状不匹配问题
+        #     'n_levels_height': 2,  # fewer levels to avoid shape mismatch
+        #     'n_levels_width': 2,   # fewer levels to avoid shape mismatch
         #     'conv_kind': 'dwt',
         #     'wavelet': 'db6',
         #     'biort': 'near_sym_b',
@@ -189,16 +189,16 @@ class PDEBenchConfig(Default):
 import argparse
 
 def build_argparser():
-    parser = argparse.ArgumentParser("PDEBench EMO + (AF-)MoE 训练脚本")
+    parser = argparse.ArgumentParser("PDEBench EMO + (AF-)MoE training script")
 
-    # 任务 & 数据
+    # Task & data
     parser.add_argument("--task", type=str, default="darcy",
                         choices=["navier", "darcy", "pipe", "airfoil", "plasticity"])
     parser.add_argument("--data_root", type=str, default="./pdebench_data")
     parser.add_argument("--save_dir", type=str, default="./results_pdebench")
     parser.add_argument("--status_json", type=str, default="./pde_status.json")
     
-    # 训练控制
+    # Training controls
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--test_batch_size", type=int, default=16)
@@ -222,15 +222,15 @@ def build_argparser():
     parser.add_argument("--aux_loss_weight", type=float, default=0.1,
                         help="Coefficient for aux loss balancing in routers.")
     parser.add_argument("--band_sharpness", type=float, default=20.0,
-                        help="AFreqMoE 软频带锐度（越大越接近硬分段）。")
+                        help="AFreqMoE soft band sharpness (higher ~= harder band splits).")
     parser.add_argument("--freq_affinity_sharpness", type=float, default=10.0,
-                        help="专家频率偏好与频带中心的匹配锐度。")
+                        help="Sharpness matching expert freq preference to band centers.")
     parser.add_argument("--disable_soft_bands", action="store_true",
-                        help="消融：禁用软频带，改为硬划分。")
+                        help="Ablation: disable soft bands (use hard splits).")
     parser.add_argument("--disable_freq_attn", action="store_true",
-                        help="消融：禁用频域自注意力。")
+                        help="Ablation: disable frequency-domain self-attention.")
     parser.add_argument("--disable_band_mixing", action="store_true",
-                        help="消融：禁用频带混合输入，专家仅接收对应频带。")
+                        help="Ablation: disable band mixing (experts receive only their band).")
     parser.add_argument("--resume_path", type=str, default=None,
                         help="Checkpoint path to resume training from.")
     parser.add_argument("--lr_scheduler_type", type=str, default="cos_restart",
@@ -250,7 +250,7 @@ def build_argparser():
     parser.add_argument("--distributed", action="store_true")
     parser.add_argument("--local_rank", type=int, default=-1)
 
-    # 可视化频率
+    # Visualization / logging cadence
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--vis_every", type=int, default=200)
     parser.add_argument("--vis_router_every", type=int, default=400)
@@ -259,7 +259,7 @@ def build_argparser():
 
 
 # ===========================================================
-# 3. DDP 初始化 & 杂项
+# 3. DDP init & utilities
 # ===========================================================
 
 def is_main_process(cfg):
@@ -281,7 +281,7 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 
 
 # ===========================================================
-# 3.5 自动计算 radius_cutoff，使 DISCO 输出尺寸与输入一致
+# 3.5 Auto-compute radius_cutoff so DISCO output matches input spatial size
 # ===========================================================
 
 def auto_radius_cutoff_same_size(
@@ -290,58 +290,58 @@ def auto_radius_cutoff_same_size(
     target_support: int = 3,
 ) -> float:
     """
-    根据 EquidistantDiscreteContinuousConv2d 的公式：
+    From EquidistantDiscreteContinuousConv2d:
         psi_local_h = floor(2 * radius_cutoff * H / Lx) + 1
         psi_local_w = floor(2 * radius_cutoff * W / Ly) + 1
 
-    这里选择 radius_cutoff，使得:
-        psi_local_h = psi_local_w = target_support (建议奇数: 3,5,7,...)
-    从而在 stride=1 + same padding 下保证空间尺寸不变。
+    Choose radius_cutoff so that:
+        psi_local_h = psi_local_w = target_support (odd values 3, 5, 7, ... recommended)
+    so that with stride=1 and same padding the spatial size is unchanged.
     """
     H, W = in_shape
     Lx, Ly = float(domain_length[0]), float(domain_length[1])
-    assert target_support % 2 == 1, "target_support 必须为奇数（3,5,7,...）"
+    assert target_support % 2 == 1, "target_support must be odd (3, 5, 7, ...)"
 
-    # A,B 是关于 H,W,domain_length 的系数
+    # A, B are coefficients in H, W, domain_length
     A = 2.0 * H / max(Lx, 1e-6)
     B = 2.0 * W / max(Ly, 1e-6)
     k = float(target_support)
 
-    # 需要满足：
+    # Require:
     #   k-1 ≤ radius*A < k
     #   k-1 ≤ radius*B < k
-    # → radius 的两个区间交集：
+    # → intersection of the two radius intervals:
     low = max((k - 1.0) / A, (k - 1.0) / B)
     high = min(k / A, k / B)
 
     if low >= high:
-        # 极端情况下退而求其次
+        # Fallback in edge cases
         radius = low
     else:
-        # 取交集区间中点，避免落在边界
+        # Midpoint of the intersection to avoid boundary issues
         radius = 0.5 * (low + high)
 
     return float(radius)
 
 
 # ===========================================================
-# 4. 构建数据集 (PDEBench)
+# 4. Datasets (PDEBench)
 # ===========================================================
 
 def build_pdebench_dataloaders(cfg: PDEBenchConfig, args):
     """
-    这里假定你已经写了 PDEBenchDataset：
+    Assumes PDEBenchDataset is implemented as:
       PDEBenchDataset(task, root, split, transform=None)
-    每个样本返回:
-      {"input": tensor [C_in, H, W] 或 [C_in, T, X],
-       "output": tensor [C_out, H, W] 或同尺寸}
-    你可以在内部根据 task 自动适配维度 / 通道。
+    Each sample returns:
+      {"input": tensor [C_in, H, W] or [C_in, T, X],
+       "output": tensor [C_out, H, W] or same layout}
+    Adapt channels/dims inside the dataset by task as needed.
     """
     status_path = Path(args.status_json).expanduser()
     if not status_path.exists():
         raise FileNotFoundError(
-            f"PDEBench 归一化统计文件不存在: {status_path}. "
-            "请先通过 convert_pdebench_to_emo_format.py 生成 *_stats.json。"
+            f"PDEBench normalization stats file not found: {status_path}. "
+            "Generate *_stats.json first (e.g. via convert_pdebench_to_emo_format.py)."
         )
 
     k_value = float(getattr(cfg, "k", 1.0))
@@ -432,23 +432,23 @@ def build_pdebench_dataloaders(cfg: PDEBenchConfig, args):
 
 
 # ===========================================================
-# 5. 构建 EMO + MoE / AF-MoE 模型
+# 5. Build EMO + MoE / AF-MoE
 # ===========================================================
 
 def build_emo_model(cfg: PDEBenchConfig, device):
     """
-    和你 FWI 那套尽量保持接口一致：
-      - Encoder: 负责 from PDE field -> latent feature map
-      - MoE / AF-MoE: 在 latent 上做 operator
-      - EMO：封装两者
+    Keep the same high-level interface as the FWI stack:
+      - Encoder: maps PDE field -> latent feature map
+      - MoE / AF-MoE: operator on the latent
+      - EMO: wraps encoder + MoE
     """
 
-    # 1) Encoder (和你现在 get_encoder 一样)
+    # 1) Encoder (same pattern as get_encoder elsewhere)
     from neuralop.models.encoder import get_encoder
 
     encoder_model = None
     if cfg.use_encoder:
-        num_types = 1  # PDE 任务通常没有多type分类
+        num_types = 1  # PDE tasks typically have no multi-type head
         encoder_model = get_encoder(
             in_channels=cfg.in_channels,
             out_channels=cfg.hidden_channels,
@@ -476,7 +476,7 @@ def build_emo_model(cfg: PDEBenchConfig, device):
             load_balance_scale = min(1.0, cfg.top_k / float(expert_count))
             aux_alpha = base_alpha * load_balance_scale
 
-        # 使用你写好的 AdaptiveFreqMoE，内部带 SpectralAttentionRouter
+        # AdaptiveFreqMoE with SpectralAttentionRouter
         moe = AdaptiveFreqMoE(
             experts=experts,
             in_channels=moe_in_channels,
@@ -489,7 +489,7 @@ def build_emo_model(cfg: PDEBenchConfig, device):
             enable_band_mixing=getattr(cfg, "enable_band_mixing", True),
         )
     else:
-        # 走你原来的 MOEOperator (basic / velocity_type / group)
+        # Original MOEOperator (basic / velocity_type / group, etc.)
         moe = MOEOperator(
             experts=experts,
             in_channels=moe_in_channels,
@@ -519,7 +519,7 @@ def build_emo_model(cfg: PDEBenchConfig, device):
 
 
 # ===========================================================
-# 6. 训练 & 验证
+# 6. Train & validation
 # ===========================================================
 
 def train_one_epoch(
@@ -552,7 +552,7 @@ def train_one_epoch(
 
         preds, aux_loss, _ = emo(inputs, use_amp=amp_enabled, amp_dtype=amp_dtype)
 
-        # ---- 主 PDE 损失：PDECombinedLoss (RelativeL2 + 可选 Grad/Fourier) ----
+        # ---- Main PDE loss: PDECombinedLoss (RelativeL2 + optional Grad/Fourier) ----
         loss_dict = criterion(preds, targets)
         loss_main = loss_dict["loss"]
         aux = aux_loss if aux_loss is not None else loss_main.new_zeros(())
@@ -569,7 +569,7 @@ def train_one_epoch(
             lr_scheduler.step()
 
         total_loss += float(loss_main.detach().item())
-        # 这里 metrics 仍然用 MSE/MAE 方便和别人对比
+        # MSE/MAE for comparable baselines
         mse_sum += metrics.calculate_mse(preds, targets)
         mae_sum += metrics.calculate_mae(preds, targets)
         count += 1
@@ -614,7 +614,7 @@ def evaluate(emo, val_loader, device, metrics, cfg, args, epoch):
         l2r_sum  += metrics.calculate_relative_l2(preds, targets)
         count    += 1
 
-        # 仅保存首个 batch，供测试脚本复用做可视化
+        # Keep first batch for visualization in downstream scripts
         if sample_inputs is None:
             sample_inputs  = inputs.detach().cpu()
             sample_targets = targets.detach().cpu()
@@ -626,7 +626,7 @@ def evaluate(emo, val_loader, device, metrics, cfg, args, epoch):
     if count == 0:
         return 0, 0, 0, 0, 0, 0, None
 
-    # ========= 这里做 all_reduce，把各个 rank 的统计量汇总 =========
+    # all_reduce stats across ranks
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         stats_tensor = torch.tensor(
             [mse_sum, mae_sum, psnr_sum, rmse_sum, ssim_sum, l2r_sum, float(count)],
@@ -636,7 +636,7 @@ def evaluate(emo, val_loader, device, metrics, cfg, args, epoch):
         torch.distributed.all_reduce(stats_tensor, op=torch.distributed.ReduceOp.SUM)
         mse_sum, mae_sum, psnr_sum, rmse_sum, ssim_sum, l2r_sum, count = stats_tensor.tolist()
 
-    # 注意：count 现在是 float 了，这里防止 0 除
+    # count is float after all_reduce; guard division
     denom = max(count, 1.0)
 
     mse  = mse_sum / denom
@@ -663,13 +663,13 @@ def evaluate(emo, val_loader, device, metrics, cfg, args, epoch):
 
 
 # ===========================================================
-# 7. 主函数
+# 7. main
 # ===========================================================
 
 def main():
     parser = build_argparser()
     args = parser.parse_args()
-    # 训练阶段只输出指标，不做可视化
+    # Training: metrics only; skip visualization hooks
     args.vis_every = 0
     args.vis_router_every = 0
     
@@ -678,7 +678,7 @@ def main():
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
 
-    # === 构建 config ===
+    # Build config
     cfg = PDEBenchConfig(
         task=args.task,
         data_root=args.data_root,
@@ -721,7 +721,7 @@ def main():
     device, is_logger = setup(cfg)
     cfg.is_logger = is_logger
     
-    # 同步 rank/world_size
+    # Sync rank / world_size
     args.rank = comm.get_global_rank()
     args.world_size = comm.get_world_size()
     args.local_rank = comm.get_local_rank()
@@ -735,7 +735,7 @@ def main():
     train_loader, val_loader, train_sampler, val_sampler = build_pdebench_dataloaders(cfg, args)
 
     # === Model ===
-    # 先探测 in/out channels
+    # Infer in/out channels
     try:
         sample_batch = train_loader.dataset[0]
     except Exception:
@@ -743,18 +743,18 @@ def main():
     cfg.in_channels = int(sample_batch["input"].shape[0])
     cfg.out_channels = int(sample_batch["output"].shape[0])
     
-    # fno 0,mno 1,lno 2
+    # fno 0, mno 1, lno 2
     cfg.img_size = tuple(sample_batch["output"].shape[-2:])
     # cfg.expert_configs[1]["base_size"] = cfg.img_size
     cfg.expert_configs[2]["default_in_shape"] = cfg.img_size
 
-    # ==== 这里：根据 img_size + domain_length 自动计算 LNO/DISCO 的 radius_cutoff ====
+    # Auto radius_cutoff for LNO/DISCO from img_size + domain_length
     lno_cfg = cfg.expert_configs[2]
     domain_length = lno_cfg.get("domain_length", [2, 2])
     radius_cutoff = auto_radius_cutoff_same_size(
         in_shape=cfg.img_size,
         domain_length=(float(domain_length[0]), float(domain_length[1])),
-        target_support=3,   # 可以换成 5/7，看你想要的 DISCO 感受野
+        target_support=3,   # try 5/7 for a larger DISCO receptive field
     )
     lno_cfg["radius_cutoff"] = radius_cutoff
 
@@ -872,7 +872,7 @@ def main():
         elif is_main_process(cfg):
             print(f"[Resume] Provided resume_path '{resume_path}' not found; starting fresh.")
 
-    # ==== 为不同 PDE 任务设置 PDECombinedLoss 的权重 ====
+    # ==== PDECombinedLoss weights per task ====
     if cfg.task == "darcy":
         lambda_rel = 1.0
         lambda_grad = 0.05

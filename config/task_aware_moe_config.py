@@ -1,38 +1,38 @@
 """
-使用任务感知路由器的MOE (Mixture of Experts) 神经算子模型配置
+MOE configuration with a task-aware router.
 """
 
 from .default_config import DefaultConfig
 
 class TaskAwareMOEConfig(DefaultConfig):
-    """使用任务感知路由器的MOE神经算子配置"""
-    
-    # 基本配置
+    """MOE neural operator with task-conditioned routing."""
+
+    # Core model
     model_name = 'MOE'
-    in_channels = 3  # 输入通道数
-    out_channels = 1  # 输出通道数
+    in_channels = 3
+    out_channels = 1
     hidden_channels = 64
-    
-    # 数据集配置
+
+    # Dataset
     dataset_name = 'multi_task'
     data_dir = './data'
-    n_train_samples = None  # None表示使用所有可用训练样本
-    n_test_samples = None  # None表示使用所有可用测试样本
+    n_train_samples = None  # None = all train samples
+    n_test_samples = None   # None = all test samples
     normalize_inputs = True
     normalize_outputs = True
-    
-    # MOE配置
-    top_k = 2  # 选择前k个专家
-    noisy_gating = True  # 是否使用噪声门控
-    fusion_type = 'linear'  # 专家输出融合方式
-    router_hidden_dim = 256  # 路由器隐藏层维度
-    
-    # 任务感知路由器配置
-    router_type = 'task_aware'  # 使用任务感知路由器
-    task_dim = 8  # 任务特征维度
-    routing_mode = 'both'  # 同时使用输入和任务特征进行路由
-    
-    # 任务配置
+
+    # MoE routing
+    top_k = 2
+    noisy_gating = True
+    fusion_type = 'linear'
+    router_hidden_dim = 256
+
+    # Task-aware router
+    router_type = 'task_aware'
+    task_dim = 8
+    routing_mode = 'both'  # use both input and task embeddings
+
+    # Task metadata
     tasks = [
         {
             'name': 'darcy',
@@ -55,10 +55,10 @@ class TaskAwareMOEConfig(DefaultConfig):
             'embedding': [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
         }
     ]
-    
-    # 专家配置
+
+    # Expert templates
     expert_configs = [
-        # 傅里叶域专家 - 适合捕捉频率特征
+        # Fourier expert
         {
             'type': 'domain',
             'domain_type': 'fourier',
@@ -68,7 +68,7 @@ class TaskAwareMOEConfig(DefaultConfig):
             'lifting_channel_ratio': 2,
             'projection_channel_ratio': 2,
         },
-        # 小波域专家 - 适合处理局部特征和多尺度结构
+        # Wavelet expert
         {
             'type': 'domain',
             'domain_type': 'wavelet',
@@ -77,7 +77,7 @@ class TaskAwareMOEConfig(DefaultConfig):
             'n_levels_width': 4,
             'wavelet_type': 'haar',
         },
-        # 多尺度专家 - 适合处理多尺度物理现象
+        # Multiscale expert
         {
             'type': 'scale',
             'expert_type': 'native',
@@ -87,7 +87,7 @@ class TaskAwareMOEConfig(DefaultConfig):
             'fusion_mode': 'hierarchical',
             'n_layers': 3,
         },
-        # 几何专家 - 适合处理非规则网格
+        # Geometry expert (irregular grids)
         {
             'type': 'geometry',
             'geometry_type': 'irregular',
@@ -96,8 +96,8 @@ class TaskAwareMOEConfig(DefaultConfig):
             'n_layers': 4,
         }
     ]
-    
-    # 训练配置
+
+    # Optimization
     use_distributed = False
     batch_size = 8
     test_batch_size = 8
@@ -106,9 +106,7 @@ class TaskAwareMOEConfig(DefaultConfig):
     epochs = 100
     milestones = [30, 60, 90]
     scheduler_gamma = 0.5
-    
-    # 损失函数配置
-    loss_fn = 'mse'  # 均方误差损失
-    
-    # 评估指标配置
-    metrics = ['mse', 'rel_l2_error'] 
+
+    # Loss / metrics
+    loss_fn = 'mse'
+    metrics = ['mse', 'rel_l2_error']

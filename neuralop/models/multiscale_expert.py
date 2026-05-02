@@ -11,29 +11,26 @@ from ..layers.resample import resample
 
 class MultiscaleExpert(BaseModel, name='MultiscaleExpert'):
     """
-    多尺度专家模型
-    
-    该模型能够在多个尺度上处理输入，捕捉不同尺度的特征并融合它们。
-    特别适合处理具有多尺度特性的物理系统。
-    
+    Multiscale expert wrapper.
+
+    Processes input at multiple resolutions, aggregates multi-scale features,
+    suited to physical systems with scale structure.
+
     Parameters
     ----------
     base_model : nn.Module
-        基础模型，将在不同尺度上应用
+        Backbone applied at each scale
     in_channels : int
-        输入通道数
     out_channels : int
-        输出通道数
     hidden_channels : int
-        隐藏层通道数
     n_scales : int, optional
-        尺度数量，默认为3
+        Number of scales (default 3)
     scale_factors : List[float], optional
-        每个尺度的缩放因子，默认为[1.0, 0.5, 0.25]
+        Per-scale factors (default [1.0, 0.5, 0.25])
     fusion_type : str, optional
-        尺度融合方式，可选'adaptive'或'fixed'，默认为'adaptive'
+        'adaptive' or 'fixed' (default 'adaptive')
     positional_embedding : str or nn.Module, optional
-        位置嵌入类型，默认为'grid'
+        Default 'grid'
     """
     def __init__(
         self,
@@ -53,7 +50,7 @@ class MultiscaleExpert(BaseModel, name='MultiscaleExpert'):
         self.hidden_channels = hidden_channels
         self.n_scales = n_scales
         
-        # 确定每个尺度的缩放因子
+        # Scale factors per branch
         if scale_factors is None:
             self.scale_factors = [1.0]
             for i in range(1, n_scales):
@@ -61,12 +58,11 @@ class MultiscaleExpert(BaseModel, name='MultiscaleExpert'):
         else:
             self.scale_factors = scale_factors[:n_scales]
             
-        # 位置嵌入
-        # 假设基础模型接受的输入维度与位置嵌入相同
+        # Positional embedding (same dim as base model when available)
         if hasattr(base_model, 'n_dim'):
             self.n_dim = base_model.n_dim
         else:
-            # 默认为2D
+            # Default 2D
             self.n_dim = 2
             
         if positional_embedding == "grid":
@@ -81,29 +77,22 @@ class MultiscaleExpert(BaseModel, name='MultiscaleExpert'):
         elif positional_embedding is None:
             self.positional_embedding = None
         else:
-            raise ValueError(f"无效的位置嵌入类型: {positional_embedding}")
+            raise ValueError(f"Invalid positional_embedding type: {positional_embedding}")
         
-        # 对每个尺度创建一个基础模型实例
+        # One base-model instance per scale
         self.models = nn.ModuleList()
         for i in range(n_scales):
-            # 克隆基础模型的参数
             if i == 0:
-                # 第一个尺度使用原始模型
                 self.models.append(base_model)
             else:
-                # 创建基础模型的新实例
                 self.models.append(type(base_model)(**{
                     k: v for k, v in base_model.__dict__.items() 
                     if not k.startswith('_') and not callable(v)
                 }))
         
-        # 尺度融合机制
         self.fusion_type = fusion_type
         if fusion_type == 'adaptive':
-            # 自适应融合：学习不同尺度的权重
             self.fusion_weights = nn.Parameter(torch.ones(n_scales) / n_scales)
-            
-            # 尺度特征融合层
             self.fusion_layer = nn.Sequential(
                 nn.Conv2d(out_channels * n_scales, hidden_channels, 1) 
                 if self.n_dim == 2 else 
@@ -118,71 +107,50 @@ class MultiscaleExpert(BaseModel, name='MultiscaleExpert'):
                 nn.Conv1d(hidden_channels, out_channels, 1)
             )
         elif fusion_type == 'fixed':
-            # 固定权重融合
             self.register_buffer('fusion_weights', torch.ones(n_scales) / n_scales)
         else:
-            raise ValueError(f"无效的融合类型: {fusion_type}")
+            raise ValueError(f"Invalid fusion_type: {fusion_type}")
             
     def forward(self, x, output_shape=None, **kwargs):
         """
-        前向传播
-        
         Parameters
         ----------
         x : torch.Tensor
-            输入张量
+            Input tensor
         output_shape : tuple, optional
-            输出形状，默认为None
-        
+            Target output shape (optional)
+
         Returns
         -------
         torch.Tensor
-            输出张量
         """
-        # 保存原始形状
         original_shape = x.shape
-        
-        # 应用位置嵌入
+
         if self.positional_embedding is not None:
             x = self.positional_embedding(x)
         
-        # 在不同尺度上处理输入
         scale_outputs = []
         for i, model in enumerate(self.models):
-            # 缩放输入
             if self.scale_factors[i] != 1.0:
-                # 计算缩放后的空间尺寸
                 scale_shape = list(original_shape)
                 for d in range(2, 2 + self.n_dim):
                     scale_shape[d] = int(scale_shape[d] * self.scale_factors[i])
-                
-                # 缩放输入
                 scale_x = resample(x, scale_shape)
             else:
                 scale_x = x
                 
-            # 应用模型
             scale_out = model(scale_x, **kwargs)
             
-            # 如果需要，将输出调整回原始尺寸
             if self.scale_factors[i] != 1.0 and (output_shape is None or output_shape == original_shape):
                 scale_out = resample(scale_out, original_shape)
             
             scale_outputs.append(scale_out)
         
-        # 融合不同尺度的输出
         if self.fusion_type == 'adaptive':
-            # 应用可学习的权重并融合
             norm_weights = F.softmax(self.fusion_weights, dim=0)
-            
-            # 将所有尺度的输出拼接在一起
-            # 假设所有输出的空间尺寸相同
             concat_output = torch.cat(scale_outputs, dim=1)
-            
-            # 通过融合层
             output = self.fusion_layer(concat_output)
-        else:  # 'fixed'
-            # 使用固定权重融合
+        else:
             output = sum(w * out for w, out in zip(self.fusion_weights, scale_outputs))
         
         return output 

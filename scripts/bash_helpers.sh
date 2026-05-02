@@ -47,7 +47,7 @@ activate_conda_env() {
 
   local conda_sh=""
   if ! conda_sh="$(find_conda_sh)"; then
-    echo "[WARN] 未找到 conda.sh，继续使用当前 shell 环境。" >&2
+    echo "[WARN] conda.sh not found; continuing with the current shell environment." >&2
     return 0
   fi
 

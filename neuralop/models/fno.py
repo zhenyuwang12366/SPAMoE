@@ -228,8 +228,7 @@ class FNO(BaseModel, name='FNO'):
         self.complex_data = complex_data
         self.fno_block_precision = fno_block_precision
 
-        #在输入数据中附加位置信息。这相当于告诉神经网络：
-        #“你不能只知道一个像素点的值是多少，还得知道这个像素点是在哪个位置”。
+        # Optional positional encoding: each spatial location carries its coordinates.
         if positional_embedding == "grid":
             spatial_grid_boundaries = [[0., 1.]] * self.n_dim
             self.positional_embedding = GridEmbeddingND(in_channels=self.in_channels,
@@ -249,9 +248,7 @@ class FNO(BaseModel, name='FNO'):
                               expected one of \'grid\', GridEmbeddingND")
 
 
-        #这段代码的功能是：决定是否要对输入数据的边缘进行额外填充
-        # 假设你的输入是一个64×64的场（如温度场），加上domain_padding = 0.1，表示在每个维度两侧填充
-        # 10 % 的长度，即：原始输入：64×64加padding后：增加左右各6.4个点，总共增加12.8，变成76×76（实际可能取整）
+        # Optional domain padding on each side (e.g. domain_padding=0.1 adds ~10% length per dim before transforms).
         if domain_padding is not None and (
             (isinstance(domain_padding, list) and sum(domain_padding) > 0)
             or (isinstance(domain_padding, (float, int)) and domain_padding > 0)
@@ -270,11 +267,8 @@ class FNO(BaseModel, name='FNO'):
         self.complex_data = self.complex_data
 
 
-        #每一层是否对输入函数的分辨率（即空间尺寸）进行缩放，如果是 None，表示不进行缩放，
-        # 模型内部就使用默认的“保持原分辨率”的方式处理。否则就进入下一步处理。
-        #如果用户只传了一个浮点数（比如 0.5），这代表他希望所有的 FNO 层都 统一缩小一半的分辨率。比如：
-        #resolution_scaling_factor = 0.5，处理之后：resolution_scaling_factor = [0.5, 0.5, 0.5, 0.5]  # 假设有4层
-        #也就是说，每一层都会把输入的空间大小缩放一半，然后再做 Fourier transform。
+        # Per-layer spatial resolution scaling inside FNO blocks; None keeps native resolution.
+        # A scalar is broadcast to every layer (e.g. 0.5 -> halve each layer before the spectral conv).
         if resolution_scaling_factor is not None:
             if isinstance(resolution_scaling_factor, (float, int)):
                 resolution_scaling_factor = [resolution_scaling_factor] * self.n_layers
@@ -317,7 +311,7 @@ class FNO(BaseModel, name='FNO'):
         # if lifting_channels is passed, make lifting a Channel-Mixing MLP
         # with a hidden layer of size lifting_channels
 
-        #有lifting_channels → 两层非线性MLP（更强表达能力）。无lifting_channels → 单层线性MLP（轻量快速）
+        # With lifting_channels: 2-layer MLP lifting; without: single linear lifting (lighter).
         if self.lifting_channels:
             self.lifting = ChannelMLP(
                 in_channels=lifting_in_channels,
@@ -338,9 +332,7 @@ class FNO(BaseModel, name='FNO'):
                 non_linearity=non_linearity
             )
 
-        # Convert lifting to a complex ChannelMLP if self.complex_data==True
-        #如果处理的是复数数据（例如波动方程在频域下的解），就要使用复数版本的MLP，PyTorch自身不直接支持复数
-        # MLP，这里是封装好的模块来处理实部虚部（或模幅角）。
+        # Wrap lifting in ComplexValued MLP when operating on complex fields.
         if self.complex_data:
             self.lifting = ComplexValued(self.lifting)
 
@@ -385,33 +377,25 @@ class FNO(BaseModel, name='FNO'):
             * If tuple list, specifies the exact output-shape of each FNO Block
         """
 
-        #允许用户指定输出向量形状，如果不指定，自动推断
+        # Optional per-block output shapes; default leaves sizes unconstrained.
         if output_shape is None:
             output_shape = [None]*self.n_layers
         elif isinstance(output_shape, tuple):
             output_shape = [None]*(self.n_layers - 1) + [output_shape]
 
-        # append spatial pos embedding if set
-        # 如果positional_embedding不是None，则对数据的每个空间位置编码其物理位置
-        # 常见的实现包括： 将(x, y) 网格坐标拼接到输入通道中使用GridEmbeddingND
-        # 或FourierFeatures 对位置做正弦编码
+        # Append spatial coordinates or Fourier features when positional_embedding is set.
         if self.positional_embedding is not None:
             x = self.positional_embedding(x)
 
-        # 将输入从低维通道（如1个速度通道）映射到更高维的特征通道空间，比如128或256维本质上是一个MLP
-        # 或1×1卷积（全连接 + 激活）这一步并不会改变空间结构，只是对通道数进行扩充
-        # 举例：输入(B, 1, 64, 64) → (B, 128, 64, 64)
+        # Map inputs to hidden_channels without changing spatial extent (e.g. (B,1,H,W)->(B,C,H,W)).
         x = self.lifting(x)
 
-        #决定是否padding
         if self.domain_padding is not None:
             x = self.domain_padding.pad(x)
 
-        #核心：多层FNO_Block计算
         for layer_idx in range(self.n_layers):
             x = self.fno_blocks(x, layer_idx, output_shape=output_shape[layer_idx])
 
-        #除去结果中的padding
         if self.domain_padding is not None:
             x = self.domain_padding.unpad(x)
 
@@ -419,7 +403,6 @@ class FNO(BaseModel, name='FNO'):
 
         return x
 
-    #这两行代码实现了通过脚本对fno宽度和高度进行修改
     @property
     def n_modes(self):
         return self._n_modes

@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# 分布式启动 pde/train_pde.py，参考 scripts/run_distributed_seismic_moe.sh
+# Distributed launcher for pde/train_pde.py (mirrors run_distributed_seismic_moe.sh)
 set -e
 
-# 默认参数，可通过命令行覆盖
+# Defaults (override via CLI)
 NUM_GPUS=2
 TASK="navier2d"
 DATA_ROOT_BASE="./pdebench_data"
@@ -38,7 +38,7 @@ DISABLE_BAND_MIXING=0
 USE_DEFAULT_DATA_ROOT=1
 USE_DEFAULT_SAVE_DIR=1
 
-# 解析命令行参数
+# Parse CLI
 while [[ $# -gt 0 ]]; do
   case $1 in
     --num_gpus) NUM_GPUS="$2"; shift 2 ;;
@@ -70,11 +70,11 @@ while [[ $# -gt 0 ]]; do
     --log_every) LOG_EVERY="$2"; shift 2 ;;
     --vis_every) VIS_EVERY="$2"; shift 2 ;;
     --vis_router_every) VIS_ROUTER_EVERY="$2"; shift 2 ;;
-    *) echo "未知参数: $1"; exit 1 ;;
+    *) echo "Unknown argument: $1"; exit 1 ;;
   esac
 done
 
-# 根据 task 生成默认路径
+# Default paths derived from task name
 if [[ $USE_DEFAULT_DATA_ROOT -eq 1 ]]; then
   DATA_ROOT="${DATA_ROOT_BASE}/${TASK}"
 fi
@@ -84,7 +84,7 @@ fi
 
 mkdir -p "$SAVE_DIR"
 
-echo "启动分布式 PDE 训练:"
+echo "Starting distributed PDE training:"
 echo "  GPUs: $NUM_GPUS"
 echo "  Task: $TASK"
 echo "  Data root: $DATA_ROOT"

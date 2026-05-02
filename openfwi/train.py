@@ -51,13 +51,13 @@ except Exception:
 # ------------------------------
 def get_seismic_config(args):
     """
-    构建用于 plain/GAN 训练管线的配置（SeismicMOEConfig）与运行时上下文（runtime_ctx）。
+    Build SeismicMOEConfig and runtime context (runtime_ctx) for plain/GAN training.
     """
     cfg = SeismicMOEConfig()
-    # 设置随机种子
+    # Random seed
     cfg.distributed.seed = args.seed
 
-    # 启用分布式训练
+    # Distributed training
     if args.distributed:
         cfg.distributed.use_distributed = True
         device, is_logger = setup(cfg)
@@ -68,35 +68,35 @@ def get_seismic_config(args):
     global_rank = comm.get_global_rank()
     world_size = comm.get_world_size()
 
-    # —— 数据/任务基本设置 —— #
+    # --- Data / task ---
     cfg.family = str(getattr(args, "family", "all"))
     cfg.channel_dim = int(getattr(cfg, "channel_dim", 1))
     cfg.out_channels = int(getattr(cfg, "out_channels", 1))
 
-    # —— 训练超参 —— #
+    # --- Training hyperparameters ---
     cfg.epochs = int(getattr(args, "epochs", 200))
     cfg.learning_rate = float(getattr(args, "learning_rate", 1e-4))
     cfg.weight_decay = float(getattr(args, "weight_decay", 1e-2))
     cfg.batch_size = int(getattr(args, "batch_size", 64))
     cfg.test_batch_size = int(getattr(args, "test_batch_size", 64))
 
-    # —— 日志/输出 —— #
+    # --- Logging / output ---
     cfg.output_dir = str(getattr(args, "output_dir", "./outputs"))
     cfg.log_root = str(getattr(args, "log_root", "./runs"))
     cfg.save_every = int(getattr(args, "save_every", 50))
     cfg.log_every = int(getattr(args, "log_every", 50))
 
-    # —— AMP/梯度裁剪 —— #
+    # --- AMP / gradient clipping ---
     cfg.use_amp = bool(getattr(args, "use_amp", False))
     cfg.max_norm = float(getattr(args, "max_norm", 0.0))
 
-    # —— 早停 —— #
+    # --- Early stopping ---
     cfg.early_stop = bool(getattr(args, "early_stop", False))
     cfg.early_stop_patience = int(getattr(args, "early_stop_patience", 20))
     cfg.early_stop_min_delta = float(getattr(args, "early_stop_min_delta", 0.0))
     cfg.early_stop_warmup_epochs = int(getattr(args, "early_stop_warmup_epochs", 10))
 
-    # —— 学习率调度 —— #
+    # --- LR schedule ---
     cfg.lr_milestones = list(getattr(args, "lr_milestones", []))
     cfg.lr_gamma = float(getattr(args, "lr_gamma", 0.1))
     cfg.lr_warmup_epochs = float(getattr(args, "lr_warmup_epochs", 0.0))
@@ -154,8 +154,8 @@ class PlainAdapter(nn.Module):
 # Data builders (same as moe facade)
 # ------------------------------
 def build_zarr_loaders_like_moe(args, config, world_size, local_rank, is_logger):
-    assert args.zarr_path is not None, "需要 --zarr_path"
-    assert args.status_json is not None, "需要 --status_json（归一化统计量）"
+    assert args.zarr_path is not None, "Requires --zarr_path"
+    assert args.status_json is not None, "Requires --status_json (normalization stats)"
 
     with open(args.status_json, "r", encoding="utf-8") as f:
         stats = json.load(f)
@@ -367,7 +367,7 @@ def run_training(args):
     local_rank = runtime_ctx["local_rank"]
 
     if bool(getattr(args, "use_deepspeed", False)):
-        assert deepspeed is not None, "未安装 DeepSpeed"
+        assert deepspeed is not None, "DeepSpeed is not installed"
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
 
@@ -388,7 +388,7 @@ def run_training(args):
     if is_logger:
         print(f"in_channels={config.in_channels}, out_channels={config.out_channels}")
 
-    # ========= 构建 Generator & Discriminator =========
+    # ========= Build generator & discriminator =========
     gen_key = str(getattr(args, "generator", "InversionNet"))
     if gen_key == "UPFWI":
         gen_ctor = network.model_dict["UPFWI"]
@@ -402,7 +402,7 @@ def run_training(args):
             "sample_spatial": getattr(args, "sample_spatial", 1.0),
         }
     else:
-        raise ValueError(f"未知生成器：{gen_key}；可选 InversionNet/UPFWI")
+        raise ValueError(f"Unknown generator: {gen_key}; choose InversionNet or UPFWI")
 
     generator = gen_ctor(**gen_kwargs).to(device)
     model_core = PlainAdapter(generator)
@@ -411,19 +411,19 @@ def run_training(args):
     use_gan = bool(getattr(args, "use_gan", False))
     if use_gan:
         disc_key = str(getattr(args, "discriminator", "Discriminator"))
-        assert disc_key in network.model_dict, f"未知判别器：{disc_key}"
+        assert disc_key in network.model_dict, f"Unknown discriminator: {disc_key}"
         discriminator = network.model_dict[disc_key]().to(device)
     else:
         discriminator = None
 
-    # ========= 分布式封装：全部使用 PyTorch DDP =========
+    # ========= Distributed: PyTorch DDP =========
     ddp_use = bool(config.distributed.use_distributed) and (world_size > 1)
 
     if use_gan:
-        # GAN + WGAN-GP：这里也使用 PyTorch 自带 DDP
+        # GAN + WGAN-GP: wrap with PyTorch DDP
         if ddp_use:
             if is_logger:
-                print("[GAN] 使用 torch.nn.parallel.DistributedDataParallel 封装 G 和 D")
+                print("[GAN] Wrapping G and D with torch.nn.parallel.DistributedDataParallel")
             model = torch.nn.parallel.DistributedDataParallel(
                 model_core.to(device),
                 device_ids=[device.index],
@@ -438,12 +438,12 @@ def run_training(args):
             )
         else:
             model = model_core.to(device)
-            # discriminator 已经 to(device)
+            # discriminator already on device
     else:
-        # 非 GAN：沿用 torch DDP
+        # Non-GAN: same DDP path
         if ddp_use:
             if is_logger:
-                print("[Info] 非 GAN 训练：使用 torch.nn.parallel.DistributedDataParallel")
+                print("[Info] Non-GAN training: torch.nn.parallel.DistributedDataParallel")
             model = torch.nn.parallel.DistributedDataParallel(
                 model_core.to(device),
                 device_ids=[device.index],
@@ -512,11 +512,11 @@ def run_training(args):
     )
     d_crit = WGANGPCriterion(lambda_gp=(args.lambda_gp if use_gan else 10.0)) if use_gan else None
 
-    # ========= AMP 设置 =========
+    # ========= AMP =========
     if use_gan:
         amp_enabled = False
         if is_logger:
-            print("[Info] use_gan=True ⇒ 关闭 AMP 以保证 WGAN-GP 稳定性")
+            print("[Info] use_gan=True: AMP disabled for WGAN-GP stability")
     else:
         amp_enabled = bool(getattr(config, "use_amp", False)) and device.type == "cuda"
 
@@ -816,14 +816,14 @@ def run_inference(args):
             "sample_spatial": getattr(args, "sample_spatial", 1.0),
         }
     else:
-        raise ValueError(f"未知生成器：{gen_key}；可选 InversionNet/UPFWI")
+        raise ValueError(f"Unknown generator: {gen_key}; choose InversionNet or UPFWI")
 
     generator = gen_ctor(**gen_kwargs).to(device)
     model = PlainAdapter(generator).to(device)
 
     # Load checkpoint
     ckpt_path = args.checkpoint
-    assert ckpt_path and os.path.exists(ckpt_path), f"checkpoint 不存在: {ckpt_path}"
+    assert ckpt_path and os.path.exists(ckpt_path), f"checkpoint missing: {ckpt_path}"
     ckpt = torch.load(ckpt_path, map_location="cpu")
     state = ckpt.get("model_state_dict", ckpt)
     (model.module if hasattr(model, "module") else model).load_state_dict(state, strict=False)

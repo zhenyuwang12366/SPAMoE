@@ -12,23 +12,23 @@ _T_co = TypeVar("_T_co", covariant=True)
 
 class ChunkDistributedSampler(Sampler[_T_co]):
     r"""
-    分布式按块采样器：
-    - 以 `chunk_size` 为粒度进行乱序（而非样本级乱序）；
-    - 将打乱后的 chunk 等分到各 rank（必要时按 chunk 维度补齐或截断，使其整除）；
-    - 在各自 rank 内，对每个 chunk 的样本索引做（可选）块内乱序，并按 `batch_size` 切分；
-    - 这样 DataLoader 顺序取 batch 时，基本不会跨块，I/O 显著更平滑。
+    Distributed chunk-wise sampler:
+    - Shuffles at `chunk_size` granularity (not per-sample);
+    - Splits shuffled chunks across ranks (pad or trim along chunks so counts divide by num_replicas);
+    - Within each rank, optionally shuffles indices inside each chunk and groups them by `batch_size`;
+    - Batches from DataLoader then rarely straddle chunks, smoothing I/O.
 
-    参数
-    ----
+    Parameters
+    ----------
     dataset: Dataset
-    num_replicas: 分布式进程数（world_size）
-    rank: 当前进程 rank
-    chunk_size: Zarr 第 0 维块大小（每块包含的样本数）
-    batch_size: 每个 rank 的 batch 大小（注意：是 per-rank）
-    shuffle: 是否对 chunk 级别打乱（默认 True）
-    seed: 乱序种子（与 epoch 叠加）
-    drop_last: True 时在块内对不满一个 batch 的尾部丢弃；False 时在块内循环补齐到整 batch
-    intra_chunk_shuffle: 是否对每个 chunk 内部的样本索引做随机打乱（默认 True）
+    num_replicas: number of distributed processes (world_size)
+    rank: current process rank
+    chunk_size: Zarr chunk length along dimension 0 (samples per chunk)
+    batch_size: per-rank batch size
+    shuffle: shuffle chunk order (default True)
+    seed: shuffle seed (combined with epoch)
+    drop_last: if True, drop tail of chunk that does not fill a batch; if False, wrap within chunk to full batches
+    intra_chunk_shuffle: shuffle sample indices inside each chunk (default True)
     """
     def __init__(
         self,
@@ -74,23 +74,22 @@ class ChunkDistributedSampler(Sampler[_T_co]):
         self.N = len(self.dataset)  # type: ignore[arg-type]
         self.num_chunks = math.ceil(self.N / self.chunk_size)
 
-        # 为了保证各 rank 步数一致：把 chunk 列表补齐/截断为可被 num_replicas 整除
+        # Keep per-rank step counts aligned: pad/trim chunk list to multiple of num_replicas
         if self.drop_last:
             self.num_chunks_total = (self.num_chunks // self.num_replicas) * self.num_replicas
         else:
             self.num_chunks_total = math.ceil(self.num_chunks / self.num_replicas) * self.num_replicas
 
-        # 预估每块可产生的样本数量（按 batch 对齐）
-        # 用于 __len__ 的近似/下界（实际 __iter__ 严格产出）
+        # Expected samples per chunk (batch-aligned); used for __len__ estimate (__iter__ is authoritative)
         full_batches_per_chunk = self.chunk_size // self.batch_size
         if self.drop_last:
             self.samples_per_chunk = full_batches_per_chunk * self.batch_size
         else:
-            # 不丢尾：每块向上取整到 batch 的整数倍
+            # keep tail: round each chunk up to a multiple of batch_size
             need = (-self.chunk_size) % self.batch_size
             self.samples_per_chunk = self.chunk_size + need
 
-        # 近似每个 rank 的样本数（用于 __len__）
+        # Approximate samples per rank (for __len__)
         chunks_per_rank = self.num_chunks_total // self.num_replicas
         self._len_estimate = chunks_per_rank * self.samples_per_chunk
 
@@ -98,22 +97,22 @@ class ChunkDistributedSampler(Sampler[_T_co]):
         self.epoch = int(epoch)
 
     def __len__(self) -> int:
-        # 注意：真实产出严格按 __iter__ 生成；这里给出稳定的一致长度
+        # Note: actual yield is defined by __iter__; this returns a stable consistent length
         return self._len_estimate
 
     def __iter__(self) -> Iterator[_T_co]:
         g = torch.Generator()
         g.manual_seed(self.seed + self.epoch)
 
-        # 1) 构造 chunk id 列表并按需打乱
+        # 1) Build chunk id list and optionally shuffle
         chunk_ids = list(range(self.num_chunks))
         if self.shuffle:
             perm = torch.randperm(self.num_chunks, generator=g).tolist()
             chunk_ids = [chunk_ids[i] for i in perm]
 
-        # 2) 补齐/截断到可被 num_replicas 整除
+        # 2) Pad/trim to multiple of num_replicas
         if len(chunk_ids) < self.num_chunks_total:
-            # pad：循环补到目标长度
+            # pad by cycling chunk_ids
             extra = self.num_chunks_total - len(chunk_ids)
             chunk_ids += (chunk_ids * math.ceil(extra / len(chunk_ids)))[:extra]
         else:
@@ -121,10 +120,10 @@ class ChunkDistributedSampler(Sampler[_T_co]):
 
         assert len(chunk_ids) % self.num_replicas == 0
 
-        # 3) 均分到各 rank（关键：在“chunk 维度”做切片，保持块粒度的独立性）
+        # 3) Split chunks across ranks (slice along chunk dimension keeps chunk locality)
         chunk_ids_rank = chunk_ids[self.rank :: self.num_replicas]
 
-        # 4) 在当前 rank 内，逐块产出按 batch 对齐的索引
+        # 4) Within this rank, emit batch-aligned indices per chunk
         indices_rank: List[int] = []
         for cid in chunk_ids_rank:
             lo = cid * self.chunk_size
@@ -132,24 +131,24 @@ class ChunkDistributedSampler(Sampler[_T_co]):
             idxs = list(range(lo, hi))
 
             if self.intra_chunk_shuffle and len(idxs) > 1:
-                # 在块内随机，但仍保持后续按 batch 切分
+                # shuffle inside chunk while still grouping into batches afterward
                 perm = torch.randperm(len(idxs), generator=g).tolist()
                 idxs = [idxs[i] for i in perm]
 
             if self.drop_last:
                 usable = (len(idxs) // self.batch_size) * self.batch_size
                 idxs = idxs[:usable]
-                # 若该块不足一批，直接跳过（典型发生在最后一块）
+                # Chunk smaller than one batch: skip (typical for the last chunk)
                 if usable == 0:
                     continue
             else:
-                # 补齐到整批（在块内循环补，避免跨块）
+                # pad to full batch by wrapping within chunk (no cross-chunk reads)
                 need = (-len(idxs)) % self.batch_size
                 if need:
                     idxs += idxs[:need]
 
             indices_rank.extend(idxs)
 
-        # 5) 现在 indices_rank 已经是“按块分组且按 batch 对齐”的顺序；
-        #    DataLoader 顺序取样时，每个 batch 会落在单一 chunk（或极少跨块，视补齐策略而定）
+        # 5) indices_rank is grouped by chunk and batch-aligned;
+        #    sequential DataLoader iteration keeps each batch in a single chunk (rare cross-chunk cases depend on padding)
         return iter(indices_rank)

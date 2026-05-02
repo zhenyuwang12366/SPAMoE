@@ -106,7 +106,7 @@ def log_transform(data, k=1, c=0):
 #     # data: log-transformed tensor or array
 #     sign = np.sign(data)
 #     abs_val = np.abs(data)
-#     # expm1(x) = exp(x) - 1 → 更稳定
+#     # expm1(x) = exp(x) - 1 (often more stable)
 #     exp_term = np.expm1(abs_val) - c
 #     x = sign * (exp_term / k)
 #     return x

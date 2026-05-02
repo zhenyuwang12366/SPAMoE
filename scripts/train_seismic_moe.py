@@ -1,7 +1,7 @@
 # scripts/train_seismic_moe.py
 """
-使用MOE（Mixture of Experts）架构训练地震数据的神经算子模型
-支持分布式训练 + DeepSpeed
+Train neural operator models on seismic data with a Mixture of Experts (MoE).
+Supports distributed training and DeepSpeed.
 """
 import optuna
 import os
@@ -24,13 +24,13 @@ from torch.utils.data import DataLoader, random_split, Subset, DistributedSample
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms import Compose
 
-# >>> DeepSpeed（仅导入，不影响非 DS 路径）
+# >>> DeepSpeed (import only; harmless when not using DS)
 try:
     import deepspeed
 except Exception:
     deepspeed = None
 
-# 添加项目根目录到路径
+# Add project root to sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import scripts.transforms as T
@@ -74,18 +74,18 @@ def _load_router_weights(model: nn.Module, router_path: Union[str, Path], map_lo
           or ckpt.get("state_dict")
           or ckpt)
     if not isinstance(sd, dict):
-        raise ValueError(f"无法从 {router_path} 提取可用的 state_dict。")
+        raise ValueError(f"Could not extract a usable state_dict from {router_path}.")
 
     router_prefixes = ("router.", "gate.", "routing.", "router_net.", "router_module.")
     router_sd = _filter_state_by_prefix(sd, router_prefixes)
 
     missing, unexpected = model.load_state_dict(router_sd, strict=False)
     if is_logger:
-        print(f"[Router] 已从 {router_path} 加载路由器权重（过滤前缀: {router_prefixes}）。")
+        print(f"[Router] Loaded router weights from {router_path} (prefix filter: {router_prefixes}).")
         if missing:
-            print(f"[Router] 缺失参数（可能是非路由器键或名称不匹配）：{missing}")
+            print(f"[Router] Missing keys (non-router keys or name mismatch): {missing}")
         if unexpected:
-            print(f"[Router] 未使用参数（可能是检查点里包含了非路由器键）：{unexpected}")
+            print(f"[Router] Unexpected keys (checkpoint may contain non-router keys): {unexpected}")
 
 from collections import defaultdict
 import torch.distributed as dist
@@ -139,20 +139,20 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     experts_name_str = runtime_ctx["experts_name_str"]
     use_amp = config.use_amp
 
-    # <<< 新增：DeepSpeed 必须把当前进程绑定到自己的 GPU >>>
+    # DeepSpeed: bind this process to its local GPU
     if use_deepspeed:
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
     
     # ======================
-    # 数据加载（Zarr 或文件）
+    # Data loading (Zarr or on-disk files)
     # ======================
     if args.zarr_path is not None:
         json_path = getattr(args, 'status_json', None)
-        assert json_path is not None, "使用zarr数据集格式，需要指定归一化统计量json"
+        assert json_path is not None, "Zarr format requires status_json for normalization stats"
 
         zarr_path = getattr(args, 'zarr_path', None)
-        assert zarr_path is not None, "使用zarr数据格式时请在 args.zarr_path 指定路径"
+        assert zarr_path is not None, "Set args.zarr_path when using Zarr data"
 
         with open(json_path, 'r') as f:
             data_dict_raw = json.load(f)
@@ -223,7 +223,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         elif config.family in ['style_a', 'style_b', 'style_style_a', 'style_style_b']:
             val_ratio = 7 / 67
         else:
-            raise ValueError("不支持的 family")
+            raise ValueError("Unsupported family")
 
         full_dataset = SeismicDataset(
             data_dir=config.data_dir,
@@ -238,9 +238,9 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         train_size, val_size = safe_random_split(dataset_size, [1 - val_ratio, val_ratio])
 
         if is_logger:
-            print(f"数据集总大小: {dataset_size}")
-            print(f"训练集大小: {train_size}")
-            print(f"验证集大小: {val_size}")
+            print(f"Dataset size: {dataset_size}")
+            print(f"Train size: {train_size}")
+            print(f"Val size: {val_size}")
 
         train_dataset, val_dataset = random_split(
             full_dataset,
@@ -255,9 +255,9 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             val_indices_set = set(val_dataset.indices)
             overlap = train_indices_set.intersection(val_indices_set)
             if overlap:
-                print(f"警告：训练集和验证集有{len(overlap)}个重叠样本！")
+                print(f"Warning: train and val share {len(overlap)} overlapping samples!")
             else:
-                print("验证成功：训练集和验证集没有重叠样本")
+                print("OK: train and val have no overlap")
             assert len(train_dataset) == train_size
             assert len(val_dataset) == val_size
 
@@ -347,29 +347,29 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         if prefetch is not None:
             print(f'prefetch_factor={prefetch}')
 
-    # 形状检查
+    # Shape sanity check
     sample_batch = next(iter(train_loader))
     if is_logger:
         input_shape = sample_batch['input'].shape
         output_shape = sample_batch['output'].shape
-        print(f"输入张量形状: {input_shape}")
-        print(f"输出张量形状: {output_shape}")
+        print(f"Input tensor shape: {input_shape}")
+        print(f"Output tensor shape: {output_shape}")
         if len(input_shape) < 3 or len(input_shape) > 4:
-            print(f"警告：输入形状不符合预期（3D/4D），实际为{len(input_shape)}D")
+            print(f"Warning: unexpected input rank (expected 3D/4D), got {len(input_shape)}D")
         if len(output_shape) < 3:
-            print(f"警告：输出形状不符合预期，应为3D或更高维张量，实际为{len(output_shape)}D")
+            print(f"Warning: unexpected output rank (expected 3D+), got {len(output_shape)}D")
 
     in_channels = sample_batch['input'].shape[1]
     config.in_channels = in_channels
 
     if is_logger:
-        print(f"更新后的输入通道数: {config.in_channels}")
-        print(f"输出通道数: {config.out_channels}")
-        print(f"隐藏通道数: {config.hidden_channels}")
-        print(f"use_moe = False时专家数量: {len(config.expert_configs)}")
+        print(f"Updated in_channels: {config.in_channels}")
+        print(f"out_channels: {config.out_channels}")
+        print(f"hidden_channels: {config.hidden_channels}")
+        print(f"Expert configs count (use_moe=False path): {len(config.expert_configs)}")
 
     # ======================
-    # 构建 Encoder
+    # Build encoder
     # ======================
     encoder_model = None
     encoder_freeze = False
@@ -399,11 +399,11 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                 strict=False,
             )
             if is_logger:
-                print(f"[Encoder] 已从 {args.encoder_path} 加载预训练权重。")
+                print(f"[Encoder] Loaded pretrained weights from {args.encoder_path}.")
                 if missing:
-                    print(f"[Encoder] 缺失参数: {missing}")
+                    print(f"[Encoder] Missing keys: {missing}")
                 if unexpected:
-                    print(f"[Encoder] 未使用参数: {unexpected}")
+                    print(f"[Encoder] Unexpected keys: {unexpected}")
             for p in encoder_model.parameters():
                 p.requires_grad_(False)
             encoder_freeze = True
@@ -417,7 +417,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                     if n.startswith("head."):
                         p.requires_grad_(False)
 
-        # ====== moe_in_channels 的确定 ======
+        # Resolve moe_in_channels
         if use_deepspeed:
             moe_in_channels = 128
         else:
@@ -432,16 +432,16 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                 encoder_model.train()
 
         if is_logger:
-            print(f"Encoder 输出通道数(供 MoE 使用): {moe_in_channels}")
+            print(f"Encoder output channels (for MoE): {moe_in_channels}")
     else:
         moe_in_channels = config.in_channels
         if is_logger:
-            print("[Encoder] use_encoder=False，直接将原始输入送入 MoE。")
+            print("[Encoder] use_encoder=False: feed raw input to MoE.")
 
     config.moe_in_channels = moe_in_channels
 
     # ======================
-    # 构建 Experts + MOE
+    # Build experts + MoE
     # ======================
     experts_map_location = "cpu" if use_deepspeed else device
 
@@ -509,9 +509,9 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     # ======================
     if use_deepspeed:
         if deepspeed is None:
-            raise RuntimeError("未安装 deepspeed，但传入了 --use_deepspeed")
+            raise RuntimeError("deepspeed is not installed but --use_deepspeed was set")
         emo_model = EMO(encoder_model, moe_model, pass_encoder_logits_as_weights=True)
-        model = emo_model  # 先占位，初始化后会替换为 DeepSpeedEngine
+        model = emo_model  # placeholder; replaced by DeepSpeed engine after init
     else:
         if experts_name_str == "all":
             static_graph = True
@@ -535,10 +535,10 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     if encoder_model is not None and encoder_freeze:
         encoder_model.eval()
         if is_logger:
-            print("[Encoder] 已冻结 encoder 参数。")
+            print("[Encoder] Encoder parameters frozen.")
 
     # ======================
-    # 优化器 & 调度器
+    # Optimizer & LR scheduler
     # ======================
     if config.distributed.use_distributed and world_size > 2:
         lr = float(config.learning_rate) * math.sqrt(world_size)
@@ -584,10 +584,10 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     lr_scheduler = None
     if use_deepspeed:
         if not args.ds_config:
-            raise ValueError("需提供 --deepspeed_config")
+            raise ValueError("Provide --deepspeed_config")
         ds_cfg_path = Path(args.ds_config)
         if not ds_cfg_path.exists():
-            raise ValueError(f"DeepSpeed 配置文件不存在: {ds_cfg_path}")
+            raise ValueError(f"DeepSpeed config not found: {ds_cfg_path}")
 
         with open(ds_cfg_path, "r", encoding="utf-8") as f:
             ds_cfg = json.load(f)
@@ -642,7 +642,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(**ds_init_kwargs)
         model = model_engine
         if is_logger:
-            print("[DeepSpeed] 已启用 DeepSpeed 训练。")
+            print("[DeepSpeed] DeepSpeed training enabled.")
             try:
                 print(f"[DeepSpeed] Zero Stage: {model.zero_optimization_stage()}")
             except Exception:
@@ -684,7 +684,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     summarize_module_devices(model)
     
     # ======================
-    # 损失函数
+    # Loss functions
     # ======================
     lambda_grad_l1 = float(getattr(config, "lambda_grad_l1", 0.0))
     lambda_fourier_mag_l1 = float(getattr(config, "lambda_fourier_mag_l1", 0.0))
@@ -694,17 +694,17 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     grad_loss_module = SobelLoss().to(device) if lambda_grad_l1 > 0 else None
     fourier_loss_module = FourierMag_L1().to(device) if lambda_fourier_mag_l1 > 0 else None
 
-    # 训练分类 + 回归（encoder logits 参与 CE）
+    # Train classification + regression (CE on encoder logits)
     if config.train_encoder:
         def criterion(pred: torch.Tensor, gt: torch.Tensor, logits: torch.Tensor, labels: torch.Tensor):
-            # 在损失阶段禁用 AMP，并统一到 fp32 计算，避免混精度导致的 dtype 冲突/数值不稳
+            # Disable AMP in loss; compute in fp32 to avoid dtype issues under mixed precision
             with torch.amp.autocast(device_type=pred.device.type, enabled=False):
                 pred32 = pred.float()
                 gt32 = gt.float()
 
-                # base: 必须返回 Tensor 分量 {"loss", "l1", "l2"}
+                # base_loss must return tensor fields {"loss", "l1", "l2"}
                 loss_dict = base_loss(pred32, gt32)
-                total_loss_t = loss_dict["loss"]  # Tensor (标量)
+                total_loss_t = loss_dict["loss"]  # scalar tensor
 
                 # grad L1
                 grad_val_t = pred32.new_zeros(())
@@ -720,13 +720,13 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                     fourier_val_t = fourier_res["loss"]
                     total_loss_t = total_loss_t + lambda_fourier_mag_l1 * fourier_val_t
 
-                # Cross Entropy（同样在 fp32 下计算）
+                # Cross-entropy in fp32
                 ce_val_t = pred32.new_zeros(())
                 if logits is not None and labels is not None:
                     ce_val_t = F.cross_entropy(logits.float(), labels.long(), reduction="mean")
                     total_loss_t = total_loss_t + lambda_ce * ce_val_t
 
-            # 返回两套（*_t: 反传用；无后缀: 日志用 float）
+            # Return tensors (*_t) for backward and floats for logging
             combined = {
                 # tensors for backward
                 "loss_t":       total_loss_t,
@@ -747,7 +747,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             return combined
     else:
         def criterion(pred: torch.Tensor, gt: torch.Tensor):
-            # 在损失阶段禁用 AMP，并统一到 fp32 计算
+            # Disable AMP in loss; use fp32
             with torch.amp.autocast(device_type=pred.device.type, enabled=False):
                 pred32 = pred.float()
                 gt32 = gt.float()
@@ -785,7 +785,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             return combined
 
     # ======================
-    # 运行目录 & 日志
+    # Run dirs & logging
     # ======================
     def _slugify(text: str) -> str:
         return "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in str(text))
@@ -835,7 +835,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         config.tensorboard_dir = str(tb_dir)
 
     # ======================
-    # 最佳模型保存路径
+    # Best-checkpoint paths
     # ======================
     best_val_loss = float("inf")
     best_model_path = results_dir / f"best_model_{experts_name_str}.pt"
@@ -867,18 +867,18 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
         )
 
     # ======================
-    # Resume（与保存逻辑严格对偶；不对 moe 分开加载）
+    # Resume (mirrors save logic; no separate moe load)
     # ======================
     start_epoch = 0
     if hasattr(args, "resume_path") and args.resume_path is not None and os.path.exists(args.resume_path):
         ckpt_path = args.resume_path
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
-        # 兼容 DDP(EMO) / EMO / DeepSpeedEngine
+        # Works with DDP(EMO), EMO, or DeepSpeedEngine
         target_model = model.module if hasattr(model, "module") else model
         target_moe = getattr(target_model, "moe", None)
 
-        # ---------- 1) DeepSpeed 引擎状态（若保存时用 engine.save_checkpoint） ----------
+        # ---------- 1) DeepSpeed engine state (if saved via engine.save_checkpoint) ----------
         if use_deepspeed and ("engine" in globals() or "engine" in locals()) and (model is not None):
             resume_dir = os.path.dirname(ckpt_path)
             resume_file = os.path.basename(ckpt_path)
@@ -890,51 +890,51 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
             if ds_tag is not None:
                 load_path, client_state = model.load_checkpoint(resume_dir, tag=ds_tag)
                 if is_logger:
-                    print(f"[DeepSpeed] 已加载引擎状态: dir={resume_dir}, tag={ds_tag}, load_path={load_path}")
+                    print(f"[DeepSpeed] Loaded engine state: dir={resume_dir}, tag={ds_tag}, load_path={load_path}")
             else:
                 if is_logger:
-                    print("[DeepSpeed][WARN] 未能推断 tag；若保存用过 engine.save_checkpoint，请提供 --resume_tag=best 或 last-epN")
+                    print("[DeepSpeed][WARN] Could not infer tag; if you used engine.save_checkpoint, pass --resume_tag=best or last-epN")
 
-        # ---------- 2) 解析保存文件中各分量（仅按你的保存逻辑对偶恢复） ----------
-        model_check   = checkpoint.get("model_state_dict", None)       # 只有某些场景会存在
-        router_check  = checkpoint.get("router_state_dict", None)      # 非 DS + "all" 场景保存
-        encoder_check = checkpoint.get("encoder_state_dict", None)     # 两边都可能存在
-        expert_check  = checkpoint.get("expert_state_dict", None)      # 仅“单专家模式”可选存在（有时单独文件）
+        # ---------- 2) Parse checkpoint shards (mirror your save layout) ----------
+        model_check   = checkpoint.get("model_state_dict", None)       # present in some setups
+        router_check  = checkpoint.get("router_state_dict", None)      # non-DS + "all" saves
+        encoder_check = checkpoint.get("encoder_state_dict", None)     # may exist in both paths
+        expert_check  = checkpoint.get("expert_state_dict", None)      # optional in single-expert mode
 
-        # 情况 A：非 DeepSpeed 且 experts_name_str == "all"
-        # 保存端：删除了 model_state_dict，仅保存 router_state_dict (+ encoder)
+        # Case A: not DeepSpeed and experts_name_str == "all"
+        # Saver dropped model_state_dict; keeps router_state_dict (+ encoder)
         if (not use_deepspeed) and (experts_name_str == "all"):
             if router_check is not None and (target_moe is not None) and hasattr(target_moe, "router") and (target_moe.router is not None):
                 missing, unexpected = target_moe.router.load_state_dict(router_check, strict=False)
                 if is_logger and (missing or unexpected):
-                    print(f"[Resume][all][router] 缺失参数: {missing}, 多余参数: {unexpected}")
+                    print(f"[Resume][all][router] missing: {missing}, unexpected: {unexpected}")
             else:
                 if is_logger:
-                    print("[Resume][all][router] ckpt 未含 router_state_dict（或模型无 moe.router），跳过 Router 恢复")
+                    print("[Resume][all][router] no router_state_dict in ckpt (or no moe.router); skip router")
 
-            # Encoder：若未指定外部 encoder_path，则从 ckpt 恢复
+            # Encoder: restore from ckpt if no external encoder_path
             if hasattr(target_model, "encoder") and (encoder_check is not None) and not getattr(args, "encoder_path", None):
                 missing, unexpected = load_encoder_weights(target_model.encoder, encoder_check, strict=False)
                 if is_logger and (missing or unexpected):
-                    print(f"[Resume][all][encoder] 缺失参数: {missing}, 多余参数: {unexpected}")
+                    print(f"[Resume][all][encoder] missing: {missing}, unexpected: {unexpected}")
             elif encoder_check is not None and getattr(args, "encoder_path", None) and is_logger:
-                print(f"[Resume][all][encoder] 检测到 --encoder_path，跳过从 ckpt 恢复 encoder")
+                print(f"[Resume][all][encoder] --encoder_path set; skip encoder from ckpt")
 
         else:
-            # 情况 B：其余所有场景（包括 DeepSpeed 或 非 DS 的普通/单专家/非 all）
-            # 保存端一定/常常包含整模 model_state_dict（DeepSpeed: 附加文件里；非 DS：默认就有）
+            # Case B: all other setups (DeepSpeed or non-DS, single/all experts)
+            # Saver usually includes full model_state_dict (DS sidecar or non-DS default)
             if model_check is not None:
                 missing, unexpected = target_model.load_state_dict(model_check, strict=False)
                 if is_logger and (missing or unexpected):
-                    print(f"[Resume][generic][model] 缺失参数: {missing}, 多余参数: {unexpected}")
+                    print(f"[Resume][generic][model] missing: {missing}, unexpected: {unexpected}")
             else:
                 if is_logger:
-                    print("[Resume][generic] ckpt 未包含 model_state_dict，跳过整模恢复（与保存逻辑一致）")
+                    print("[Resume][generic] no model_state_dict in ckpt; skip full-model restore")
 
-            # 单专家模式下：如果你另存了专家专属文件，可通过 --resume_expert_path 再细粒度覆盖
+            # Single-expert: optional --resume_expert_path overrides experts[0]
             if (experts_name is not None and len(experts_name) == 1 and experts_name[0] != "all"):
-                # 1) 从 ckpt 主文件里恢复到整模（上面已做）
-                # 2) 可选：再覆盖 experts[0]
+                # 1) Full model loaded from main ckpt above
+                # 2) Optionally overwrite experts[0]
                 resume_expert_path = getattr(args, "resume_expert_path", None)
                 if resume_expert_path and os.path.exists(resume_expert_path):
                     try:
@@ -943,39 +943,39 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                         if expert_sd is not None and (target_moe is not None) and hasattr(target_moe, "experts") and len(target_moe.experts) > 0:
                             missing, unexpected = target_moe.experts[0].load_state_dict(expert_sd, strict=False)
                             if is_logger and (missing or unexpected):
-                                print(f"[Resume][single-expert][experts[0]] 缺失参数: {missing}, 多余参数: {unexpected}")
+                                print(f"[Resume][single-expert][experts[0]] missing: {missing}, unexpected: {unexpected}")
                             if is_logger:
-                                print(f"[Resume][single-expert] 已从 {resume_expert_path} 覆盖 experts[0]")
+                                print(f"[Resume][single-expert] Overwrote experts[0] from {resume_expert_path}")
                         elif is_logger:
-                            print(f"[Resume][single-expert] {resume_expert_path} 未含 expert_state_dict 或模型无 experts[0]")
+                            print(f"[Resume][single-expert] {resume_expert_path} has no expert_state_dict or no experts[0]")
                     except Exception as e:
                         if is_logger:
-                            print(f"[Resume][single-expert] 载入 resume_expert_path 失败：{e}")
+                            print(f"[Resume][single-expert] Failed to load resume_expert_path: {e}")
                 elif expert_check is not None and (target_moe is not None) and hasattr(target_moe, "experts") and len(target_moe.experts) > 0:
-                    # 若主 ckpt 就带了 expert_state_dict（DeepSpeed 附件场景）
+                    # expert_state_dict bundled in main ckpt (DeepSpeed attachment)
                     missing, unexpected = target_moe.experts[0].load_state_dict(expert_check, strict=False)
                     if is_logger and (missing or unexpected):
-                        print(f"[Resume][single-expert][experts[0]] 缺失参数: {missing}, 多余参数: {unexpected}")
+                        print(f"[Resume][single-expert][experts[0]] missing: {missing}, unexpected: {unexpected}")
 
-            # Encoder：DeepSpeed 与普通模式都可存在
+            # Encoder: present in both DS and non-DS checkpoints
             if hasattr(target_model, "encoder") and (encoder_check is not None) and not getattr(args, "encoder_path", None):
                 missing, unexpected = load_encoder_weights(target_model.encoder, encoder_check, strict=False)
                 if is_logger and (missing or unexpected):
-                    print(f"[Resume][generic][encoder] 缺失参数: {missing}, 多余参数: {unexpected}")
+                    print(f"[Resume][generic][encoder] missing: {missing}, unexpected: {unexpected}")
             elif encoder_check is not None and getattr(args, "encoder_path", None) and is_logger:
-                print(f"[Resume][generic][encoder] 检测到 --encoder_path，跳过从 ckpt 恢复 encoder")
+                print(f"[Resume][generic][encoder] --encoder_path set; skip encoder from ckpt")
 
-            # Router：即便不是 "all"，若 ckpt 附带了 router_state_dict 也可尝试恢复（保存时允许存在）
+            # Router: even when not "all", try router_state_dict if present
             if router_check is not None and (target_moe is not None) and hasattr(target_moe, "router") and (target_moe.router is not None):
                 try:
                     missing, unexpected = target_moe.router.load_state_dict(router_check, strict=False)
                     if is_logger and (missing or unexpected):
-                        print(f"[Resume][generic][router] 缺失参数: {missing}, 多余参数: {unexpected}")
+                        print(f"[Resume][generic][router] missing: {missing}, unexpected: {unexpected}")
                 except Exception as e:
                     if is_logger:
-                        print(f"[Resume][generic][router] 跳过 router_state_dict 加载：{e}")
+                        print(f"[Resume][generic][router] Skip router_state_dict load: {e}")
 
-        # ---------- 3) Optimizer（仅非 DeepSpeed 会保存在 ckpt 里） ----------
+        # ---------- 3) Optimizer (only non-DS checkpoints store it) ----------
         if (not use_deepspeed) and (optimizer is not None):
             try:
                 opt_state = checkpoint.get("optimizer_state_dict", None)
@@ -983,22 +983,22 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                     optimizer.load_state_dict(opt_state)
                 else:
                     if is_logger:
-                        print("[Resume][optimizer] ckpt 未包含 optimizer_state_dict，跳过")
+                        print("[Resume][optimizer] ckpt has no optimizer_state_dict; skip")
             except Exception as e:
                 if is_logger:
-                    print(f"[Resume][optimizer] 跳过 optimizer_state_dict 加载：{e}")
+                    print(f"[Resume][optimizer] Skip optimizer_state_dict load: {e}")
 
-        # ---------- 4) 训练元信息 ----------
+        # ---------- 4) Training metadata ----------
         data_dict   = checkpoint.get("data_dict", None)
         start_epoch = int(checkpoint.get("epoch", -1)) + 1
         if start_epoch < 0:
             start_epoch = 0
 
         if is_logger:
-            print(f"==> 成功从 {ckpt_path} 恢复，start_epoch = {start_epoch}")
+            print(f"==> Resumed from {ckpt_path}, start_epoch = {start_epoch}")
     else:
         if is_logger:
-            print("未提供 resume 路径，或路径无效，将从头开始训练。")
+            print("No valid resume path; training from scratch.")
 
     amp_enabled = bool(use_amp) and (device.type == 'cuda')
     if use_deepspeed:
@@ -1006,14 +1006,14 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
     else:
         optimizer.zero_grad(set_to_none=True)
 
-    # ========= 关键：初始化“最佳指标缓存” =========
+    # Init best-metrics cache
     best_epoch_metrics = None
     best_epoch_index = 0
 
     success_flag = results_dir / "TRAIN_DONE"
     failed_flag = results_dir / "TRAIN_FAILED"
 
-    # 可选：启动前先删除旧标志，避免误判
+    # Remove stale success/fail flags before run
     if is_logger:
         if success_flag.exists():
             success_flag.unlink()
@@ -1022,7 +1022,7 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
 
     try:
         # ======================
-        # 核心训练循环
+        # Main training loop
         # ======================
         try:
             for epoch in range(start_epoch, config.epochs):
@@ -1111,20 +1111,20 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
                         "best/epoch": float(best_epoch_index or 0),
                     })
                 tb_writer.add_hparams(hparam_summary, metric_summary)
-                print("已写入hparams")
+                print("Logged hparams to TensorBoard")
 
         finally:
             if tb_writer is not None:
                 tb_writer.flush()
                 tb_writer.close()
 
-        # ===== 正常执行到这里，说明训练主体和 finally 清理都完成了 =====
+        # Reached here: training body and finally cleanup finished
         if is_logger:
             success_flag.write_text("ok\n", encoding="utf-8")
             print(f"[done] success flag written to: {success_flag}", flush=True)
 
     except Exception as e:
-        # ===== 只有主进程写失败标志，避免多卡重复写 =====
+        # Logger rank writes failure flag only
         if is_logger:
             failed_flag.write_text(f"{type(e).__name__}: {e}\n", encoding="utf-8")
             print(f"[failed] failure flag written to: {failed_flag}", flush=True)
@@ -1135,32 +1135,32 @@ def run_training(args, trial: Optional["optuna.trial.Trial"] = None):
 
 def run_inference(n_args):
     """
-    推理流程（与训练流程严格对偶）：
-      1) 载入训练期 args/config，并用 CLI 覆盖
-      2) 构建数据管线（Zarr + 归一化）
-      3) 构建 Encoder + MOE -> EMO（参数与训练完全一致）
-      4) 权重加载
-      5) AMP(bf16) 推理 + 全 batch 指标统计
-      6) [新增] encoder vs bilinear-interpolation 的频谱假设检验（A1-A3 代理量）
-      7) 可视化 + 路由可视化（保持你原逻辑）
+    Inference pipeline (mirrors training):
+      1) Load training args/config and apply CLI overrides
+      2) Build data pipeline (Zarr + normalization)
+      3) Build Encoder + MOE -> EMO (same as training)
+      4) Load weights
+      5) AMP (bf16) inference + full-batch metrics
+      6) Spectral assumption check proxies (A1–A3): encoder vs bilinear interpolation
+      7) Visualization + router visualization (original behavior)
     """
     from utils.calculate import SpectralAccumulator
 
     # =======================
-    # 1) 读取训练期 args/config，并被 CLI 覆盖
+    # 1) Load training args/config; CLI overrides
     # =======================
     setting_dir = Path(getattr(n_args, "setting_path", ""))
     if not setting_dir:
-        raise ValueError("推理需要 --setting_path（包含训练时保存的 args.json 与 config.json）")
+        raise ValueError("Inference requires --setting_path (args.json and config.json from training)")
     if not setting_dir.exists():
-        raise ValueError(f"--setting_path 不存在: {setting_dir}")
+        raise ValueError(f"--setting_path not found: {setting_dir}")
 
     args_path = setting_dir / "args.json"
     config_path = setting_dir / "config.json"
     if not args_path.exists():
-        raise ValueError(f"缺少训练时保存的参数文件: {args_path}")
+        raise ValueError(f"Missing saved args file: {args_path}")
     if not config_path.exists():
-        raise ValueError(f"缺少训练时保存的配置文件: {config_path}")
+        raise ValueError(f"Missing saved config file: {config_path}")
 
     with open(args_path, "r", encoding="utf-8") as f:
         stored_args_dict = json.load(f)
@@ -1175,7 +1175,7 @@ def run_inference(n_args):
     runtime_args = Namespace(**runtime_args_dict)
 
     # =======================
-    # 2) 初始化 config / 运行环境（与训练一致）
+    # 2) Init config / runtime (same as training)
     # =======================
     config, runtime_ctx = get_seismic_config(runtime_args)
     device = runtime_ctx["device"]
@@ -1199,7 +1199,7 @@ def run_inference(n_args):
     _recursive_update(config, stored_config_dict)
 
     # =======================
-    # 3) 归一化统计（优先 --status_json；否则 checkpoint 内的 data_dict）
+    # 3) Norm stats (--status_json first, else data_dict in checkpoint)
     # =======================
     checkpoint = None
     checkpoint_path = None
@@ -1207,10 +1207,10 @@ def run_inference(n_args):
     if model_path_arg:
         checkpoint_path = Path(model_path_arg)
         if not checkpoint_path.exists():
-            raise ValueError(f"[MoE] 提供的模型文件不存在: {checkpoint_path}")
+            raise ValueError(f"[MoE] Model file not found: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     elif experts_name_str != "all":
-        raise ValueError("[MoE] 常规推理需要提供模型文件 --model_path")
+        raise ValueError("[MoE] Inference requires --model_path")
 
     stats_dict = None
     status_json = getattr(runtime_args, "status_json", None)
@@ -1226,11 +1226,11 @@ def run_inference(n_args):
         stats_dict = checkpoint.get("data_dict")
 
     if stats_dict is None:
-        hint = "（ALL 模式下通常无整体 checkpoint，请通过 --status_json 提供归一化统计量）" if experts_name_str == "all" else ""
-        raise ValueError(f"无法获取归一化统计量，请提供 --status_json 或确保 checkpoint 中包含 data_dict。{hint}")
+        hint = " (ALL mode: provide --status_json for norm stats if no global checkpoint)" if experts_name_str == "all" else ""
+        raise ValueError(f"Cannot get normalization stats; pass --status_json or include data_dict in checkpoint.{hint}")
 
     # =======================
-    # 4) 数据变换 & Zarr DataLoader
+    # 4) Transforms & Zarr DataLoader
     # =======================
     k_value = float(getattr(runtime_args, "k", 1.0))
     input_transform = Compose([
@@ -1264,10 +1264,10 @@ def run_inference(n_args):
 
     zarr_path = getattr(runtime_args, "zarr_path", None)
     if not zarr_path:
-        raise ValueError("推理需要指定 zarr 数据集路径 (--zarr_path)")
+        raise ValueError("Inference requires zarr path (--zarr_path)")
     zarr_path = Path(zarr_path)
     if not zarr_path.exists():
-        raise ValueError(f"zarr 数据文件不存在: {zarr_path}")
+        raise ValueError(f"Zarr path not found: {zarr_path}")
 
     eval_split = getattr(runtime_args, "eval_split", "val")
     test_dataset = ZarrSeismicDataset(
@@ -1285,10 +1285,10 @@ def run_inference(n_args):
         infer_one = int(infer_one)
         dataset_len = len(test_dataset_with_transform)
         if infer_one < 0 or infer_one >= dataset_len:
-            raise ValueError(f"--infer_one 索引超出范围: {infer_one} (有效范围: 0~{dataset_len - 1})")
+            raise ValueError(f"--infer_one out of range: {infer_one} (valid: 0..{dataset_len - 1})")
         test_dataset_with_transform = Subset(test_dataset_with_transform, [infer_one])
         if is_logger:
-            print(f"[Inference] infer_one={infer_one}，仅对单一样本推理。")
+            print(f"[Inference] infer_one={infer_one}; running single-sample inference.")
 
     effective_test_batch_size = 1 if infer_one is not None else int(config.test_batch_size)
     if getattr(runtime_args, "distributed", False) and world_size > 1 and infer_one is None:
@@ -1322,7 +1322,7 @@ def run_inference(n_args):
         )
 
     if len(test_loader) == 0:
-        raise RuntimeError("测试数据加载器为空，请检查数据集配置。")
+        raise RuntimeError("Test DataLoader is empty; check dataset config.")
 
     model_state_dict = checkpoint.get("model_state_dict") if isinstance(checkpoint, dict) else None
     router_state_dict = checkpoint.get("router_state_dict") if isinstance(checkpoint, dict) else None
@@ -1330,7 +1330,7 @@ def run_inference(n_args):
     encoder_state_dict = checkpoint.get("encoder_state_dict") if isinstance(checkpoint, dict) else None
 
     # =======================
-    # 5) 构建 EMO（Encoder + MOE）
+    # 5) Build EMO (encoder + MoE)
     # =======================
     sample_batch = next(iter(test_loader))
     config.in_channels = int(sample_batch["input"].shape[1])
@@ -1355,18 +1355,18 @@ def run_inference(n_args):
         if enc_ckpt:
             missing, unexpected = load_encoder_weights(encoder_model, enc_ckpt, map_location=device, strict=False)
             if is_logger:
-                print(f"[Encoder] 已从 {enc_ckpt} 加载推理权重。")
+                print(f"[Encoder] Loaded inference weights from {enc_ckpt}.")
                 if missing:
-                    print(f"[Encoder] 缺失参数: {missing}")
+                    print(f"[Encoder] Missing keys: {missing}")
                 if unexpected:
-                    print(f"[Encoder] 未使用参数: {unexpected}")
+                    print(f"[Encoder] Unexpected keys: {unexpected}")
         elif encoder_state_dict is not None:
             missing, unexpected = load_encoder_weights(encoder_model, encoder_state_dict, map_location=device, strict=False)
             encoder_loaded_from_ckpt = True
             if is_logger and (missing or unexpected):
-                print(f"[Encoder] 从 checkpoint 加载编码器: 缺失 {missing}, 多余 {unexpected}")
+                print(f"[Encoder] Loaded encoder from checkpoint: missing {missing}, unexpected {unexpected}")
         elif is_logger:
-            print("[Encoder] 未提供 encoder_path，且 checkpoint 中缺少 encoder_state_dict，将使用随机初始化的编码器。")
+            print("[Encoder] No encoder_path and no encoder_state_dict; using random encoder init.")
 
         with torch.no_grad():
             probe_inputs = sample_batch["input"].to(device, non_blocking=True)
@@ -1376,15 +1376,15 @@ def run_inference(n_args):
     else:
         config.moe_in_channels = config.in_channels
         if is_logger:
-            print("[Encoder] use_encoder=False，推理阶段直接使用原始输入。")
+            print("[Encoder] use_encoder=False: use raw input in inference.")
 
     # --- Experts ---
     if experts_name_str == "all":
         experts_dir = getattr(config, "use_experts_path", None) or getattr(runtime_args, "experts_path", None)
         if not experts_dir:
-            raise ValueError("[Experts] experts_name_str='all' 模式下必须提供专家权重目录（config.use_experts_path 或 --experts_path）")
+            raise ValueError("[Experts] experts_name_str='all' requires expert weight dir (config.use_experts_path or --experts_path)")
         if not Path(experts_dir).exists():
-            raise ValueError(f"[Experts] 专家权重目录不存在: {experts_dir}")
+            raise ValueError(f"[Experts] Expert weight dir not found: {experts_dir}")
 
         experts = load_moe_experts(
             experts_config=getattr(config, "load_expert_configs", config.expert_configs),
@@ -1398,7 +1398,7 @@ def run_inference(n_args):
             moe_mode=getattr(config, "moe_mode", "standard"),
         )
         if is_logger:
-            print(f"[Experts] (ALL) 已从目录加载专家: {experts_dir}")
+            print(f"[Experts] (ALL) Loaded experts from {experts_dir}")
     else:
         if getattr(config, "use_moe", False) and getattr(config, "use_experts_path", None):
             experts = load_moe_experts(
@@ -1433,7 +1433,7 @@ def run_inference(n_args):
 
         if is_logger:
             print(
-                "[MoE] 使用 AdaptiveFreqMoE (afmoe)，"
+                "[MoE] Using AdaptiveFreqMoE (afmoe), "
                 f"alpha={router_alpha}, band_sharpness={band_sharpness}, "
                 f"freq_affinity_sharpness={freq_affinity_sharpness}, "
                 f"use_soft_bands={use_soft_bands}, enable_freq_attn={enable_freq_attn}, "
@@ -1454,7 +1454,7 @@ def run_inference(n_args):
         ).to(device)
     else:
         if is_logger:
-            print(f"[MoE] 使用普通 MoEOperator (moe_method={moe_method})")
+            print(f"[MoE] Using standard MOEOperator (moe_method={moe_method})")
         moe = MOEOperator(
             experts=experts,
             in_channels=config.moe_in_channels,
@@ -1483,7 +1483,7 @@ def run_inference(n_args):
     emo.eval()
 
     # =======================
-    # 6) 权重加载（与训练对偶）
+    # 6) Load weights (mirror training)
     # =======================
     use_deepspeed = bool(getattr(runtime_args, "use_deepspeed", False))
     target_model = emo
@@ -1496,38 +1496,38 @@ def run_inference(n_args):
         elif router_state_dict is not None and (target_moe is not None) and hasattr(target_moe, "router") and (target_moe.router is not None):
             missing, unexpected = target_moe.router.load_state_dict(router_state_dict, strict=False)
             if is_logger and (missing or unexpected):
-                print(f"[Inference][all][router] 缺失参数: {missing}, 多余参数: {unexpected}")
+                print(f"[Inference][all][router] missing: {missing}, unexpected: {unexpected}")
         else:
-            raise ValueError("[Router] experts_name_str='all' 需要提供 --router_path 或 checkpoint.router_state_dict")
+            raise ValueError("[Router] experts_name_str='all' needs --router_path or checkpoint.router_state_dict")
 
         if hasattr(target_model, "encoder") and (encoder_state_dict is not None) and not getattr(runtime_args, "encoder_path", None) and not encoder_loaded_from_ckpt:
             missing, unexpected = load_encoder_weights(target_model.encoder, encoder_state_dict, map_location=device, strict=False)
             if is_logger and (missing or unexpected):
-                print(f"[Inference][all][encoder] 缺失参数: {missing}, 多余参数: {unexpected}")
+                print(f"[Inference][all][encoder] missing: {missing}, unexpected: {unexpected}")
             encoder_loaded_from_ckpt = True
         elif encoder_state_dict is not None and getattr(runtime_args, "encoder_path", None) and is_logger:
-            print("[Inference][all][encoder] 检测到 --encoder_path，跳过从 checkpoint 恢复 encoder")
+            print("[Inference][all][encoder] --encoder_path set; skip encoder from checkpoint")
     else:
         if not isinstance(checkpoint, dict):
-            raise ValueError("checkpoint 不是字典，无法解析 state_dict。")
+            raise ValueError("checkpoint is not a dict; cannot parse state_dict.")
 
         if model_state_dict is not None:
             missing, unexpected = target_model.load_state_dict(model_state_dict, strict=False)
             if is_logger and (missing or unexpected):
-                print(f"[Inference][generic][model] 缺失参数: {missing}, 多余参数: {unexpected}")
+                print(f"[Inference][generic][model] missing: {missing}, unexpected: {unexpected}")
             elif is_logger:
-                print("[Inference][generic][model] 已从 checkpoint 加载 model_state_dict")
+                print("[Inference][generic][model] Loaded model_state_dict from checkpoint")
         elif router_state_dict is not None:
             if (target_moe is not None) and hasattr(target_moe, "router") and (target_moe.router is not None):
                 missing, unexpected = target_moe.router.load_state_dict(router_state_dict, strict=False)
                 if is_logger and (missing or unexpected):
-                    print(f"[Inference][generic][router-only] 缺失参数: {missing}, 多余参数: {unexpected}")
+                    print(f"[Inference][generic][router-only] missing: {missing}, unexpected: {unexpected}")
                 elif is_logger:
-                    print("[Inference][generic][router-only] 已从 checkpoint 加载 router_state_dict")
+                    print("[Inference][generic][router-only] Loaded router_state_dict from checkpoint")
             else:
-                raise ValueError("[MoE][generic] checkpoint 仅包含 router_state_dict，但模型中不存在 moe.router")
+                raise ValueError("[MoE][generic] checkpoint has only router_state_dict but model has no moe.router")
         else:
-            raise ValueError("checkpoint 中既无 model_state_dict 也无 router_state_dict，无法恢复 MoE。")
+            raise ValueError("checkpoint has neither model_state_dict nor router_state_dict; cannot restore MoE.")
 
         if experts_name is not None and isinstance(experts_name, (list, tuple)) and len(experts_name) == 1 and experts_name[0] != "all":
             resume_expert_path = getattr(runtime_args, "resume_expert_path", None)
@@ -1538,36 +1538,36 @@ def run_inference(n_args):
                     if expert_sd is not None and (target_moe is not None) and hasattr(target_moe, "experts") and len(target_moe.experts) > 0:
                         missing, unexpected = target_moe.experts[0].load_state_dict(expert_sd, strict=False)
                         if is_logger and (missing or unexpected):
-                            print(f"[Inference][single-expert][experts[0]] 缺失参数: {missing}, 多余参数: {unexpected}")
+                            print(f"[Inference][single-expert][experts[0]] missing: {missing}, unexpected: {unexpected}")
                         if is_logger:
-                            print(f"[Inference][single-expert] 已从 {resume_expert_path} 覆盖 experts[0]")
+                            print(f"[Inference][single-expert] Overwrote experts[0] from {resume_expert_path}")
                 except Exception as e:
                     if is_logger:
-                        print(f"[Inference][single-expert] 载入 resume_expert_path 失败：{e}")
+                        print(f"[Inference][single-expert] Failed to load resume_expert_path: {e}")
             elif expert_state_dict is not None and (target_moe is not None) and hasattr(target_moe, "experts") and len(target_moe.experts) > 0:
                 missing, unexpected = target_moe.experts[0].load_state_dict(expert_state_dict, strict=False)
                 if is_logger and (missing or unexpected):
-                    print(f"[Inference][single-expert][experts[0]] 缺失参数: {missing}, 多余参数: {unexpected}")
+                    print(f"[Inference][single-expert][experts[0]] missing: {missing}, unexpected: {unexpected}")
 
         if hasattr(target_model, "encoder") and (encoder_state_dict is not None) and not getattr(runtime_args, "encoder_path", None) and not encoder_loaded_from_ckpt:
             missing, unexpected = load_encoder_weights(target_model.encoder, encoder_state_dict, map_location=device, strict=False)
             if is_logger and (missing or unexpected):
-                print(f"[Inference][generic][encoder] 缺失参数: {missing}, 多余参数: {unexpected}")
+                print(f"[Inference][generic][encoder] missing: {missing}, unexpected: {unexpected}")
             encoder_loaded_from_ckpt = True
         elif encoder_state_dict is not None and getattr(runtime_args, "encoder_path", None) and is_logger:
-            print("[Inference][generic][encoder] 检测到 --encoder_path，跳过从 checkpoint 恢复 encoder")
+            print("[Inference][generic][encoder] --encoder_path set; skip encoder from checkpoint")
 
         if router_state_dict is not None and (target_moe is not None) and hasattr(target_moe, "router") and (target_moe.router is not None):
             try:
                 missing, unexpected = target_moe.router.load_state_dict(router_state_dict, strict=False)
                 if is_logger and (missing or unexpected):
-                    print(f"[Inference][generic][router] 额外覆盖 router：缺失参数: {missing}, 多余参数: {unexpected}")
+                    print(f"[Inference][generic][router] Router overlay: missing: {missing}, unexpected: {unexpected}")
             except Exception as e:
                 if is_logger:
-                    print(f"[Inference][generic][router] 覆盖 router_state_dict 失败：{e}")
+                    print(f"[Inference][generic][router] Failed to overlay router_state_dict: {e}")
 
     # =======================
-    # 7) 推理循环 + 全 batch 指标统计 + 频谱假设检验
+    # 7) Inference loop + metrics + spectral check
     # =======================
     amp_enabled = bool(getattr(config, "use_amp", False)) and device.type == "cuda"
 
@@ -1588,12 +1588,12 @@ def run_inference(n_args):
     visual_payload = None
     band_accum = {}
 
-    # ====== 新增：两个累积器（Encoder vs Interpolation）======
+    # Two accumulators: encoder vs interpolation
     spec_enc = SpectralAccumulator(name="encoder")
     spec_int = SpectralAccumulator(name="bilinear_interp")
 
-    # 可选：频带定义从 config/args 读取（没有就用默认）
-    # 例如：config.low_band=(0.05,0.3), config.high_band=(0.4,0.85)
+    # Optional band limits from config/args (defaults otherwise)
+    # e.g. config.low_band=(0.05,0.3), config.high_band=(0.4,0.85)
     if hasattr(config, "low_band") and hasattr(config, "high_band"):
         try:
             spec_enc.low_band = tuple(config.low_band)
@@ -1606,14 +1606,14 @@ def run_inference(n_args):
     with torch.no_grad():
         global_sample_id = 0
 
-        for batch in tqdm.tqdm(test_loader, desc=f"推理中({eval_split})", disable=not is_logger):
+        for batch in tqdm.tqdm(test_loader, desc=f"Inference ({eval_split})", disable=not is_logger):
             inputs = batch["input"].to(device, non_blocking=True)  # [B,1,1000,350]
             targets = batch.get("output")
             if targets is None:
                 continue
             targets = targets.to(device, non_blocking=True).to(dtype=torch.float32)  # [B,1,70,70]
 
-            # --- 前向 ---
+            # --- Forward ---
             if amp_enabled:
                 with torch.amp.autocast(device_type=device.type, enabled=True, dtype=torch.bfloat16):
                     preds, aux, enc_weights = emo(inputs)
@@ -1622,7 +1622,7 @@ def run_inference(n_args):
 
             preds = preds.to(dtype=torch.float32)
 
-            # --- 空间域指标累计 ---
+            # --- Spatial metrics ---
             mse_sum += metrics_module.calculate_mse(preds, targets)
             mae_sum += metrics_module.calculate_mae(preds, targets)
             psnr_sum += metrics_module.calculate_psnr(preds, targets)
@@ -1643,7 +1643,7 @@ def run_inference(n_args):
                     acc["tgt_energy_ratio"] += vals["tgt_energy_ratio"]
                     acc["count"] += 1
 
-            # --- 反归一化到物理域（用于频谱统计）---
+            # --- Denorm to physical domain (for spectra) ---
             inputs_cpu = inputs.detach().cpu()
             preds_cpu = preds.detach().cpu()
             targets_cpu = targets.detach().cpu()
@@ -1654,7 +1654,7 @@ def run_inference(n_args):
                 preds_cpu = output_inverse_transform(preds_cpu)
                 targets_cpu = output_inverse_transform(targets_cpu)
 
-            # --- encoder 的 u_c：R(z)=mean over channel（线性读出）---
+            # --- Encoder u_c: channel-mean readout ---
             encoded_cpu = None
             if encoder_model is not None:
                 if amp_enabled:
@@ -1667,7 +1667,7 @@ def run_inference(n_args):
             if encoded_cpu is not None and input_inverse_transform is not None:
                 encoded_cpu = input_inverse_transform(encoded_cpu)
             
-            # --- 插值 u_int：bilinear resize 到 (H,W) ---
+            # --- Interp u_int: bilinear resize to (H,W) ---
             H, W = preds_cpu.shape[-2], preds_cpu.shape[-1]
             u_int = F.interpolate(
                 inputs_cpu.to(dtype=torch.float32),
@@ -1676,7 +1676,7 @@ def run_inference(n_args):
                 align_corners=False,
             )  # [B,1,H,W]
 
-            # --- 逐样本累积（全 batch）---
+            # --- Per-sample accumulation (full batch) ---
             B = preds_cpu.shape[0]
             for b in range(B):
                 y_hat = preds_cpu[b, 0].numpy()
@@ -1691,12 +1691,12 @@ def run_inference(n_args):
                     u_enc_b = encoded_cpu[b].mean(0).numpy()  # [H,W]
                     spec_enc.add_sample(u_front=u_enc_b, y_pred=y_hat, y_gt=y_gt, sample_id=global_sample_id)
                 else:
-                    # 没有 encoder 时不记录 encoder 组
+                    # Skip encoder group if no encoder
                     pass
 
                 global_sample_id += 1
 
-            # --- 仅采样一次可视化样本（保持你原逻辑）---
+            # --- Single visualization batch (original behavior) ---
             if visual_payload is None and is_logger:
                 logits_cpu = enc_weights.detach().cpu() if enc_weights is not None else None
                 visual_payload = {
@@ -1709,7 +1709,7 @@ def run_inference(n_args):
                 }
 
     if batch_count == 0:
-        raise RuntimeError("测试数据集中没有可评估的样本。")
+        raise RuntimeError("No evaluable samples in test set.")
 
     mse = mse_sum / batch_count
     mae = mae_sum / batch_count
@@ -1718,13 +1718,13 @@ def run_inference(n_args):
     ssim = ssim_sum / batch_count
 
     if is_logger:
-        print(f"推理指标: MSE={mse:.6f} | MAE={mae:.6f} | PSNR={psnr:.4f} | RMSE={rmse:.6f} | SSIM={ssim:.6f}")
+        print(f"Inference metrics: MSE={mse:.6f} | MAE={mae:.6f} | PSNR={psnr:.4f} | RMSE={rmse:.6f} | SSIM={ssim:.6f}")
 
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"  Inference |        -        |        -        | {mae:.6f} | {mse:.6f} | {psnr:.4f} | {rmse:.6f} | {ssim:.6f} |\n")
 
     # =======================
-    # 8) DDP 聚合：all_gather_object（把不同 rank 的 records 合并）
+    # 8) DDP: all_gather_object to merge per-rank records
     # =======================
     def _dist_ready():
         return (dist is not None) and dist.is_available() and dist.is_initialized()
@@ -1745,7 +1745,7 @@ def run_inference(n_args):
         spec_enc.records = _gather_records(spec_enc.records)
 
     # =======================
-    # 9) 导出频谱假设检验结果（rank0 保存即可；你这里 is_logger 通常就是 rank0）
+    # 9) Export spectral check (rank0 / logger saves)
     # =======================
     if is_logger:
         out_payload = {
@@ -1758,9 +1758,9 @@ def run_inference(n_args):
         with open(out_json, "w", encoding="utf-8") as f:
             json.dump(out_payload, f, indent=2, ensure_ascii=False)
 
-        print(f"[AssumptionCheck] 已保存: {out_json}")
+        print(f"[AssumptionCheck] Saved: {out_json}")
 
-        # 可选：在 log 里也落一份简要摘要，方便你写 Appendix 的“实验检验”段落
+        # Optional brief summary in log (e.g. for appendix)
         with open(log_path, "a", encoding="utf-8") as f:
             f.write("\n[AssumptionCheck]\n")
             for key in out_payload:
@@ -1776,7 +1776,7 @@ def run_inference(n_args):
                     f.write(f"    A3_empirical_bounds: {bnd}\n")
 
     # =======================
-    # 10) 你原本的 band_metrics summary（保持）
+    # 10) Frequency-band metrics summary (unchanged)
     # =======================
     band_summary = {}
     if band_accum:
@@ -1808,7 +1808,7 @@ def run_inference(n_args):
                 )
 
     # =======================
-    # 11) 可视化输出 + 路由可视化（保持你原逻辑）
+    # 11) Viz + router viz (original behavior)
     # =======================
     if visual_payload is not None:
         inputs_vis = visual_payload["inputs"]
@@ -1852,10 +1852,10 @@ def run_inference(n_args):
                     global_step=None,
                 )
                 if is_logger:
-                    print(f"[RouterVis] 频段/专家选择统计已保存到 {router_vis_dir}")
+                    print(f"[RouterVis] Band/expert selection stats saved to {router_vis_dir}")
             except Exception as e:
                 if is_logger:
-                    print(f"[RouterVis] 频段/专家选择可视化失败: {e}")
+                    print(f"[RouterVis] Band/expert selection viz failed: {e}")
 
             try:
                 routed_bands = emo.moe.get_last_routed_bands()
@@ -1872,15 +1872,15 @@ def run_inference(n_args):
                         global_step=None,
                     )
                     if is_logger:
-                        print(f"[RouterVis] routed_bands 可视化已保存到 {router_vis_dir}")
+                        print(f"[RouterVis] routed_bands viz saved to {router_vis_dir}")
             except Exception as e:
                 if is_logger:
-                    print(f"[RouterVis] routed_bands 可视化失败: {e}")
+                    print(f"[RouterVis] routed_bands viz failed: {e}")
 
     if test_sampler is not None and hasattr(test_sampler, "set_epoch"):
         test_sampler.set_epoch(0)
 
-    print(f"推理完成！结果保存在: {results_dir}")
+    print(f"Inference done. Outputs: {results_dir}")
 
 if __name__ == '__main__':
     args = build_argparser_and_parse()
@@ -1889,4 +1889,4 @@ if __name__ == '__main__':
     elif args.mode == 'inference':
         run_inference(args)
     else:
-        raise ValueError(f"不支持的运行模式: {args.mode}")
+        raise ValueError(f"Unsupported mode: {args.mode}")

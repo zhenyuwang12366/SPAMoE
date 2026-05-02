@@ -5,10 +5,10 @@ import dtcwt
 
 catlogs = ['coif4','db4','db8','sym4','coif5','sym8']
 for catlog in catlogs:
-    # 选择 db2 小波
+    # Instantiate named orthogonal wavelet
     wavelet = pywt.Wavelet(catlog)
-    # 返回离散化后的尺度函数 φ(t) 和小波函数 ψ(t)
-    # level=10 表示迭代次数，越大曲线越平滑
+    # Discrete scaling function φ(t) and wavelet ψ(t)
+    # level controls refinement (higher -> smoother curves)
     phi, psi, x = wavelet.wavefun(level=10)
 
     plt.figure(figsize=(8, 4))

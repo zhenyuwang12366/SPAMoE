@@ -16,7 +16,7 @@ class TaskDependentRouter(nn.Module):
         noisy_gating: bool = True,
         alpha: float = 0.0,
     ):
-        # 子类调用父类初始化方法，assert判断
+        # Subclass calls parent __init__ with assertions
         super().__init__()
         assert num_experts >= 1, "num_experts must be >= 1"
         assert 1 <= init_num <= num_experts, "init_num must be in [1, num_experts]"
@@ -30,12 +30,12 @@ class TaskDependentRouter(nn.Module):
         self.noisy_gating = noisy_gating
         self.alpha = alpha
         
-        # 验证表现跟踪，使用buffer，可以保证可以保存进state_dict
-        # 状态变量
+        # Validation metrics: use buffers so they persist in state_dict
+        # State variables
         self.register_buffer("best_val_loss", torch.tensor(float("inf")))
-        self.no_improved_cnt = 0 # 连续无改进验证轮次数
-        self.improved = True # 当前k下产生了改进
-        self.fixed = False # 外层回退与固定
+        self.no_improved_cnt = 0  # consecutive validation steps without improvement
+        self.improved = True  # improvement observed at current k
+        self.fixed = False  # outer schedule fixed / reverted
         
         # x_flat b*1(input_dim)
         self.router = nn.Sequential(
@@ -46,14 +46,14 @@ class TaskDependentRouter(nn.Module):
 
     @torch.no_grad()
     def step_validation(self, val_loss: float):
-        if self.fixed: # 如果外层已回退固定，就不更改了
+        if self.fixed:  # outer loop already pinned; do not change
             return 
         
         if math.isnan(val_loss) or math.isinf(val_loss):
             return
         
-        if val_loss + 1e-12 < float(self.best_val_loss.item()): # 确认真的很小，而不是因为浮点数的抖动
-            # 有改进
+        if val_loss + 1e-12 < float(self.best_val_loss.item()):  # real improvement, not float noise
+            # improvement
             self.best_val_loss.fill_(val_loss)
             self.improved = True
             self.no_improved_cnt = 0
@@ -61,10 +61,10 @@ class TaskDependentRouter(nn.Module):
             self.no_improved_cnt += 1
             if self.no_improved_cnt >= self.patience:
                 if not self.improved:
-                    # 当前k没有产生改进，向外层发出信号
+                    # no improvement at current k; signal outer loop
                     return "should_break"
                 else:
-                    # 试探阶段，增加k
+                    # exploration phase: increase k
                     if self.top_k < self.num_experts:
                         self.top_k += 1
                     self.improved = False
@@ -76,7 +76,7 @@ class TaskDependentRouter(nn.Module):
         # b * num 
         logits = self.router(feats)
         if self.noisy_gating and self.training:
-            # 训练时添加噪声以增加探索性
+            # train-time noise for exploration
             noise = torch.randn_like(logits) * 1.0
             logits = logits + noise
         
@@ -84,10 +84,10 @@ class TaskDependentRouter(nn.Module):
         
         top_k_weights, top_k_indices = torch.topk(routing_weights, self.top_k, dim = -1)
         
-        # 归一化top-k权重
+        # renormalize top-k weights
         top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         
-        # 弱激活专家
+        # weakly activated experts
         w_top_k = self.num_experts - self.top_k
         if w_top_k > 0:
             mask = torch.zeros_like(routing_weights, dtype=torch.bool)
@@ -96,7 +96,7 @@ class TaskDependentRouter(nn.Module):
             masked_weights = routing_weights.masked_fill_(mask, -1e9)
             
             w_weights, w_indices = torch.topk(masked_weights, k=w_top_k, dim=-1)
-            # 归一化top-k权重
+            # renormalize top-k weights
             w_weights = w_weights / w_weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         else:
             w_weights = None
@@ -113,4 +113,3 @@ class TaskDependentRouter(nn.Module):
         
         return top_k_weights, top_k_indices, w_weights, w_indices, aux_loss, self.top_k
     
-                

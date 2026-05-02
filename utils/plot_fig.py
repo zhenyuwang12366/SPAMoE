@@ -16,14 +16,14 @@ from PIL import Image
 
 
 # ============================================================
-#  通用工具：Figure → ndarray；保存 & 日志 (TB / WandB)
+#  General helpers: Figure → ndarray; save & log (TB / WandB)
 # ============================================================
 
 def _fig_to_arrays(fig, dpi=200):
     """
-    将 Figure 转为：
-      - arr_chw: (3,H,W) 供 TensorBoard add_image 使用
-      - arr_hwc: (H,W,3) 供 wandb.Image 使用
+    Convert Figure to:
+      - arr_chw: (3,H,W) for TensorBoard add_image
+      - arr_hwc: (H,W,3) for wandb.Image
     """
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
@@ -45,7 +45,7 @@ def _log_figure(
     dpi=200,
 ):
     """
-    保存 + 同步到 TensorBoard 和 W&B。三者都可选。
+    Save and optionally mirror to TensorBoard and W&B. All three paths are optional.
     """
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
@@ -60,11 +60,11 @@ def _log_figure(
             import wandb
             wandb_run.log({wb_key: wandb.Image(arr_hwc)}, step=step)
         except Exception as e:
-            print(f"[warn] wandb log 失败：{e}")
+            print(f"[warn] wandb log failed: {e}")
 
 
 # ============================================================
-# 1. 类型预测日志保存
+# 1. Save type-prediction logs
 # ============================================================
 
 def save_type_predictions_txt(
@@ -72,24 +72,24 @@ def save_type_predictions_txt(
     batch: Dict[str, Any],
     save_dir: Union[str, Path],
     epoch: int,
-    config=None,                # 直接传 config（含 type_id_specific）
+    config=None,                # pass config directly (includes type_id_specific)
     filename: str = "type_predictions.txt",
     append: bool = True,
     is_logger: bool = False,
 ) -> Path:
     """
-    将预测类型（未softmax的原始logits）与真实类型标签保存到本地txt文件。
+    Save predicted types (raw logits before softmax) and ground-truth type labels to a local txt file.
     """
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     txt_path = save_dir / filename
 
-    # ---- 自动反转 type_id_specific: str->int  →  int->str ----
+    # ---- Build id↔name from type_id_specific: str->int  →  int->str ----
     id2name = {}
     if hasattr(config, "type_id_specific"):
         id2name = {v: k for k, v in getattr(config, "type_id_specific").items()}
 
-    # ---- 批次大小 ----
+    # ---- Batch size ----
     B = None
     if isinstance(batch, dict):
         for k in ('input', 'label', 'input_file'):
@@ -106,7 +106,7 @@ def save_type_predictions_txt(
     if B is None:
         B = 0
 
-    # ---- 预测结果（未softmax，仅argmax）----
+    # ---- Predictions (no softmax; argmax only) ----
     if isinstance(logits, torch.Tensor):
         pred_prob = torch.softmax(logits, dim=-1)
         pred_ids = torch.argmax(pred_prob, dim=-1).detach().cpu().tolist()
@@ -115,7 +115,7 @@ def save_type_predictions_txt(
         pred_ids = [None] * B
         pred_prob = [None] * B
 
-    # ---- 真实标签 ----
+    # ---- Ground-truth labels ----
     true_ids = [None] * B
     if isinstance(batch, dict) and ('label' in batch):
         t = batch['label']
@@ -124,7 +124,7 @@ def save_type_predictions_txt(
         elif isinstance(t, (list, tuple)):
             true_ids = list(t)
 
-    # ---- 文件名（可选）----
+    # ---- File names (optional) ----
     file_names = ["" for _ in range(B)]
     if isinstance(batch, dict) and ('input_file' in batch):
         f = batch['input_file']
@@ -133,7 +133,7 @@ def save_type_predictions_txt(
         elif isinstance(f, (list, tuple)):
             file_names = list(f)
 
-    # ---- 写入 txt ----
+    # ---- Write txt ----
     mode = "a" if append else "w"
     try:
         with open(txt_path, mode, encoding="utf-8") as f:
@@ -163,13 +163,13 @@ def save_type_predictions_txt(
 
 
 # ============================================================
-# 2. Loss 曲线（从日志解析）
+# 2. Loss curves (parsed from logs)
 # ============================================================
 
 def plot_loss_curve(log_file, save_path=None):
     """
-    从日志文件中解析并绘制 Train Loss 和 Val Loss 曲线
-    自动适配是否存在 CE 列
+    Parse Train Loss and Val Loss from the log file and plot them.
+    Handles logs with or without a CE column.
     """
     with open(log_file, "r", encoding="utf-8") as f:
         text = f.read()
@@ -183,7 +183,7 @@ def plot_loss_curve(log_file, save_path=None):
             ([+-]?\d+(?:\.\d+)?)\s*\|\s*         # PSNR
             (\d+(?:\.\d+)?)\s*\|\s*              # RMSE
             (\d+(?:\.\d+)?)\s*\|\s*              # SSIM
-            (\d+(?:\.\d+)?)\s*\|?\s*$            # CE（可选）
+            (\d+(?:\.\d+)?)\s*\|?\s*$            # CE (optional)
         """, re.MULTILINE | re.VERBOSE
     )
 
@@ -207,7 +207,7 @@ def plot_loss_curve(log_file, save_path=None):
         columns = ["Epoch", "Train Loss", "Val Loss", "MAE", "MSE", "PSNR", "RMSE", "SSIM"]
 
     if not rows:
-        raise ValueError("日志格式不匹配，请检查 log_file 是否包含正确的数值行")
+        raise ValueError("Log format does not match; ensure log_file contains valid numeric rows")
 
     df = pd.DataFrame(rows, columns=columns).astype(float)
     df_grouped = df.groupby("Epoch").mean().reset_index()
@@ -225,26 +225,26 @@ def plot_loss_curve(log_file, save_path=None):
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
-        print(f"保存曲线到 {save_path}")
+        print(f"Saved curve to {save_path}")
         plt.close()
     else:
         plt.show()
 
 
 # ============================================================
-# 3. 输入/预测/真值可视化（空间域）
-#    + 通用辅助函数
+# 3. Input / prediction / ground truth (spatial domain)
+#    + shared helpers
 # ============================================================
 
 def _squeeze_leading_ones(t: torch.Tensor) -> torch.Tensor:
-    """去掉前面多余 size=1 的维度，例如 [1,C,H,W] -> [C,H,W]."""
+    """Drop leading size-1 dimensions, e.g. [1,C,H,W] -> [C,H,W]."""
     while t.dim() > 2 and t.shape[0] == 1:
         t = t.squeeze(0)
     return t
 
 
 def _ensure_2d(t: torch.Tensor) -> np.ndarray:
-    """确保拿到 2D ndarray，用在“最终帧”这种场景。"""
+    """Return a 2D ndarray (e.g. for the final time frame)."""
     t = _squeeze_leading_ones(t)
     if t.dim() == 2:
         return t.cpu().numpy()
@@ -255,7 +255,7 @@ def _ensure_2d(t: torch.Tensor) -> np.ndarray:
 
 def _to_channel_list_2d(t: torch.Tensor):
     """
-    将张量转成若干 2D 通道列表（适用于非时间序列任务）：
+    Split tensor into a list of 2D per-channel arrays (non–time-series tasks):
       - [H,W]        -> [ (ndarray,) ]
       - [C,H,W]      -> [ (ndarray_0, ndarray_1, ... ) ]
     """
@@ -264,7 +264,7 @@ def _to_channel_list_2d(t: torch.Tensor):
         return [t.cpu().numpy()]
     if t.dim() == 3:
         return [t[c].cpu().numpy() for c in range(t.shape[0])]
-    # 尽量 squeeze 再试一次
+    # Try squeeze once more
     t2 = t.squeeze()
     if t2.dim() == 2:
         return [t2.cpu().numpy()]
@@ -281,22 +281,22 @@ def visualize_results(
     wandb_run=None,
     global_step=None,
     log_prefix='vis',
-    task: str = 'generic',   # 'navier' | 'plasticity' | 其他
+    task: str = 'generic',   # 'navier' | 'plasticity' | other
 ):
     """
-    可视化输入 / 输出（空间域）：
+    Visualize inputs / outputs in the spatial domain.
 
-    - 时间序列任务（navier, plasticity）：
-        * navier: 输入选取若干时间帧，输出取最终时间步
-        * plasticity: 输入为参数场，输出为 4*T 的展开张量，取最终时间步
-    - 其他任务（pipe / airfoil / darcy / seismic / generic）：
-        * 输入所有通道：每个通道一个子图
-        * 输出所有通道：target/pred 每个通道一个子图
+    - Time-series tasks (navier, plasticity):
+        * navier: several input time frames; output shows the final time step
+        * plasticity: parameter-field input; output is 4*T stacked channels; final time step
+    - Other tasks (pipe / airfoil / darcy / seismic / generic):
+        * All input channels: one subplot per channel
+        * All output channels: separate subplots for target and pred
 
-    要求：
-        * input 通道共用一套归一化 (norm_in)，但每个子图有自己的颜色条
-        * target + pred 通道共用一套归一化 (norm_out)，但每个子图有自己的颜色条
-        * 颜色条放在各自子图旁边
+    Notes:
+        * Inputs share normalization (norm_in); each subplot keeps its own colorbar
+        * Target + pred share normalization (norm_out); each subplot keeps its own colorbar
+        * Colorbars sit beside their subplots
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -310,7 +310,7 @@ def visualize_results(
         fig = None
 
         # ==============================
-        # 1) navier: u(t,x,y)，有时间维
+        # 1) navier: u(t,x,y) with time dimension
         # ==============================
         if task == 'navier':
             inp = _squeeze_leading_ones(inp)   # [T_in,H,W]
@@ -324,14 +324,14 @@ def visualize_results(
             T_in, H, W = inp.shape
             T_out = tgt.shape[0]
 
-            # 输入：3 个关键帧
+            # Input: three representative time frames
             if T_in >= 3:
                 idx_in = [0, T_in // 2, T_in - 1]
             else:
                 idx_in = list(range(T_in))
             input_snaps = [inp[t].numpy() for t in idx_in]
 
-            # 输出：最终时间步
+            # Output: final time step
             tgt_last = tgt[-1].numpy()
             pred_last = pred[-1].numpy()
             err_last = np.abs(pred_last - tgt_last)
@@ -346,7 +346,7 @@ def visualize_results(
                 constrained_layout=True
             )
 
-            # 第一行：输入关键帧
+            # Row 0: input frames
             for k in range(3):
                 ax = axes[0, k]
                 if k < len(idx_in):
@@ -358,7 +358,7 @@ def visualize_results(
                 ax.set_xticks([])
                 ax.set_yticks([])
 
-            # 第二行：最终帧 target/pred/error
+            # Row 1: final-frame target/pred/error
             ax_t = axes[1, 0]
             im_t = ax_t.imshow(tgt_last, cmap='jet', norm=norm, aspect='auto')
             ax_t.set_title(f'Target u(t={T_out-1})', fontsize=10)
@@ -378,10 +378,10 @@ def visualize_results(
             ax_e.set_xticks([]); ax_e.set_yticks([])
 
         # ==============================
-        # 2) plasticity: 输出 4*T 展平，有时间维
+        # 2) plasticity: 4*T flattened output, time-like layout
         # ==============================
         elif task == 'plasticity':
-            # 输入为参数场
+            # Input is a parameter field
             param_field = _ensure_2d(inp)  # -> [H,W]
 
             tgt = _squeeze_leading_ones(tgt)   # [4*T,H,W]
@@ -416,7 +416,7 @@ def visualize_results(
                 constrained_layout=True
             )
 
-            # 第 0 行：param + 空白
+            # Row 0: param + blanks
             ax_p = axes[0, 0]
             im_param = ax_p.imshow(param_field, cmap='viridis', aspect='auto')
             ax_p.set_title('Input parameter', fontsize=10)
@@ -426,7 +426,7 @@ def visualize_results(
             for c in range(1, 4):
                 axes[0, c].axis('off')
 
-            # 第 1 行：4 个 target 分量
+            # Row 1: four target components
             for comp in range(4):
                 ax = axes[1, comp]
                 im_t = ax.imshow(tgt_last[comp], cmap='jet', norm=norm, aspect='auto')
@@ -434,7 +434,7 @@ def visualize_results(
                 plt.colorbar(im_t, ax=ax, fraction=0.046, pad=0.04)
                 ax.set_xticks([]); ax.set_yticks([])
 
-            # 第 2 行：4 个 pred 分量
+            # Row 2: four pred components
             for comp in range(4):
                 ax = axes[2, comp]
                 im_p = ax.imshow(pred_last[comp], cmap='jet', norm=norm, aspect='auto')
@@ -443,10 +443,10 @@ def visualize_results(
                 ax.set_xticks([]); ax.set_yticks([])
 
         # ==============================
-        # 3) 其他任务：所有通道展开（seismic 也走这里）
+        # 3) Other tasks: expand every channel (seismic uses this too)
         # ==============================
         else:
-            in_chs = _to_channel_list_2d(inp)   # List[np.ndarray], 每个 [H,W]
+            in_chs = _to_channel_list_2d(inp)   # List[np.ndarray], each [H,W]
             tgt_chs = _to_channel_list_2d(tgt)
             pred_chs = _to_channel_list_2d(pred)
 
@@ -459,7 +459,7 @@ def visualize_results(
                 print(f"[visualize_results][{task}] No channels for sample {i}, skip.")
                 continue
 
-            # ---- 统一 input 的归一化 ----
+            # ---- Shared normalization for inputs ----
             if C_in > 0:
                 in_vals = np.concatenate([c.ravel() for c in in_chs])
                 vmin_in = float(in_vals.min())
@@ -468,7 +468,7 @@ def visualize_results(
             else:
                 norm_in = None
 
-            # ---- 统一 target + pred 的归一化 ----
+            # ---- Shared normalization for target + pred ----
             out_arrays = []
             if C_tgt > 0:
                 out_arrays.append(np.concatenate([c.ravel() for c in tgt_chs]))
@@ -482,7 +482,7 @@ def visualize_results(
             else:
                 norm_out = None
 
-            # ====== 3 行：inputs / targets / preds ======
+            # ====== 3 rows: inputs / targets / preds ======
             rows, cols = 3, C_max
             fig, axes = plt.subplots(
                 rows, cols,
@@ -490,13 +490,13 @@ def visualize_results(
                 constrained_layout=True
             )
 
-            # ---- 关键修复：强制 axes 变成 (rows, cols) 形状，避免 C_max=1 时变成 1D ----
+            # ---- Force axes to (rows, cols); avoids 1D layout when C_max == 1 ----
             axes = np.array(axes)
             if axes.ndim == 0:
-                # 单个 Axes 对象 -> (1,1)
+                # Single Axes -> (1,1)
                 axes = axes[None, None]
             elif axes.ndim == 1:
-                # 1D 情况有两种：
+                # Two 1-D layouts:
                 #   - rows==1, cols>1  -> shape (cols,)
                 #   - rows>1, cols==1  -> shape (rows,)
                 if rows == 1 and cols > 1:
@@ -558,7 +558,7 @@ def visualize_results(
                 ax.set_xticks([])
                 ax.set_yticks([])
 
-        # ==== 统一的日志保存部分 ====
+        # ==== Shared figure logging ====
         if fig is not None:
             png_path = os.path.join(save_dir, f'sample_{i}_{task}.png')
             tb_tag = f"{log_prefix}/{task}/sample_{i}/composed"
@@ -579,7 +579,7 @@ def visualize_results(
 
 
 # ============================================================
-# 4. Fourier 频域分析（空间 + 频谱，支持时间序列任务）
+# 4. Fourier-domain analysis (spatial + spectrum; time-series OK)
 # ============================================================
 
 def analyze_fourier_domain(
@@ -592,23 +592,23 @@ def analyze_fourier_domain(
     wandb_run=None,
     global_step=None,
     log_prefix='vis',
-    task: str = 'generic',   # 'navier' | 'plasticity' | 其他
+    task: str = 'generic',   # 'navier' | 'plasticity' | other
 ):
     """
-    分析输入与输出在傅里叶域的特点：
+    Fourier-domain view of inputs and outputs.
 
-    - 时间序列任务（navier, plasticity）：
-        * 选定若干关键帧/最终帧，分别作为“输入面板”和“输出面板”
-    - 其他任务：
-        * Inputs：所有通道 → spatial_inputs
-        * Outputs：Target/Pred 所有通道 → spatial_outputs
+    - Time-series tasks (navier, plasticity):
+        * Key frames / final frame form separate input and output panels
+    - Other tasks:
+        * Inputs: all channels → spatial_inputs
+        * Outputs: Target/Pred all channels → spatial_outputs
 
-    空间域可视化：
-        * Input 面板使用统一归一化 norm_in，但每个子图各自有一条颜色条
-        * Target + Pred 面板使用统一归一化 norm_out，但每个子图各自有一条颜色条
+    Spatial panels:
+        * Inputs use shared norm_in; one colorbar per subplot
+        * Target + pred use shared norm_out; one colorbar per subplot
 
-    频域可视化：
-        * 所有 PSD 面板使用同一 log10 归一化，但每个子图各自有一条颜色条
+    Frequency panels:
+        * All PSD maps share one log10 scale; one colorbar per subplot
     """
     os.makedirs(save_dir, exist_ok=True)
     n_samples = min(inputs.shape[0], max_samples)
@@ -639,7 +639,7 @@ def analyze_fourier_domain(
             tgt = targets[i].detach().cpu()
             pred = predictions[i].detach().cpu()
 
-            # 分开维护：输入面板 / 输出面板（target + pred）
+            # Separate lists: input panels / output panels (target + pred)
             spatial_inputs: List[tuple[str, np.ndarray]] = []
             spatial_outputs: List[tuple[str, np.ndarray]] = []
             psd_panels: List[tuple[str, np.ndarray]] = []
@@ -660,7 +660,7 @@ def analyze_fourier_domain(
                 T_in, H, W = inp.shape
                 T_out = tgt.shape[0]
 
-                # 输入 3 帧
+                # Three input frames
                 if T_in >= 3:
                     idx_in = [0, T_in // 2, T_in - 1]
                 else:
@@ -668,7 +668,7 @@ def analyze_fourier_domain(
                 for t_idx in idx_in:
                     spatial_inputs.append((f"Input u(t={t_idx})", inp[t_idx].numpy()))
 
-                # 输出最终帧
+                # Final output frame
                 tgt_last = tgt[-1].numpy()
                 pred_last = pred[-1].numpy()
                 main_tgt_field = tgt_last
@@ -678,7 +678,7 @@ def analyze_fourier_domain(
 
             # ===================== plasticity =====================
             elif task == 'plasticity':
-                # 输入参数场
+                # Input parameter field
                 param_field = _ensure_2d(inp)
                 spatial_inputs.append(("Input parameter", param_field))
 
@@ -707,11 +707,11 @@ def analyze_fourier_domain(
                     spatial_outputs.append((f"Target comp{comp}(t={t_last})", t_field))
                     spatial_outputs.append((f"Pred comp{comp}(t={t_last})", p_field))
 
-                # 主评估：comp0 的最终帧
+                # Primary metric: final frame of comp0
                 main_tgt_field = tgt_last[0]
                 main_pred_field = pred_last[0]
 
-            # ===================== 其他任务：所有通道 =====================
+            # ===================== Other tasks: all channels =====================
             else:
                 in_chs = _to_channel_list_2d(inp)
                 tgt_chs = _to_channel_list_2d(tgt)
@@ -734,7 +734,7 @@ def analyze_fourier_domain(
                 print(f"[Fourier] main fields missing, skip sample {i}")
                 continue
 
-            # ====== 计算 PSD ======
+            # ====== PSD ======
             all_spatial_panels = spatial_inputs + spatial_outputs
             for title, field in all_spatial_panels:
                 psd_panels.append((title, _fft2_psd(field)))
@@ -742,7 +742,7 @@ def analyze_fourier_domain(
             tgt_psd = _fft2_psd(main_tgt_field)
             pred_psd = _fft2_psd(main_pred_field)
 
-            # ====== 频谱指标 ======
+            # ====== Spectral metrics ======
             h, w = tgt_psd.shape
             cy, cx = h // 2, w // 2
 
@@ -764,8 +764,8 @@ def analyze_fourier_domain(
             mse = float(np.mean((main_tgt_field - main_pred_field) ** 2))
             mae = float(np.mean(np.abs(main_tgt_field - main_pred_field)))
 
-            # ====== 统一色标：空间输入 / 空间输出 / 频谱 ======
-            # 空间输入
+            # ====== Shared limits: spatial in / spatial out / spectrum ======
+            # Spatial inputs
             if len(spatial_inputs) > 0:
                 in_vals = np.concatenate([f.ravel() for _, f in spatial_inputs])
                 vmin_in = float(in_vals.min())
@@ -774,7 +774,7 @@ def analyze_fourier_domain(
             else:
                 norm_in = None
 
-            # 空间输出（target + pred）
+            # Spatial outputs (target + pred)
             if len(spatial_outputs) > 0:
                 out_vals = np.concatenate([f.ravel() for _, f in spatial_outputs])
                 vmin_out = float(out_vals.min())
@@ -783,12 +783,12 @@ def analyze_fourier_domain(
             else:
                 norm_out = None
 
-            # PSD 范围（log10）
+            # PSD range (log10)
             all_psd_vals = np.concatenate([p.ravel() for _, p in psd_panels])
             vmin_freq = np.log10(all_psd_vals.min() + 1e-10)
             vmax_freq = np.log10(all_psd_vals.max() + 1e-10)
 
-            # ====== 作图：上空间，下频谱 ======
+            # ====== Plot layout: spatial on top, spectrum below ======
             n_panel = len(all_spatial_panels)
             cols = n_panel
             rows = 2
@@ -803,7 +803,7 @@ def analyze_fourier_domain(
             for idx, (title, field) in enumerate(all_spatial_panels):
                 is_input = idx < len(spatial_inputs)
 
-                # ---- 空间域 ----
+                # ---- Spatial ----
                 ax_sp = axes[0, idx]
                 if is_input:
                     im_sp = ax_sp.imshow(
@@ -823,7 +823,7 @@ def analyze_fourier_domain(
                 ax_sp.set_title(title, fontsize=9)
                 ax_sp.set_xticks([])
                 ax_sp.set_yticks([])
-                # 每个空间图一个 colorbar
+                # One colorbar per spatial panel
                 plt.colorbar(im_sp, ax=ax_sp, fraction=0.046, pad=0.04)
 
                 # ---- PSD ----
@@ -839,10 +839,10 @@ def analyze_fourier_domain(
                 ax_ps.set_title(f"{title_psd} PSD", fontsize=9)
                 ax_ps.set_xticks([])
                 ax_ps.set_yticks([])
-                # 每个 PSD 图一个 colorbar
+                # One colorbar per PSD panel
                 plt.colorbar(im_ps, ax=ax_ps, fraction=0.046, pad=0.04)
 
-            # ====== 保存图像 ======
+            # ====== Save figure ======
             png_path = os.path.join(save_dir, f'fourier_analysis_{task}_sample_{i}.png')
             tb_tag = f"{log_prefix}/{task}/sample_{i}/fourier_composed"
             wb_key = f"{log_prefix}/{task}/sample_{i}/fourier_figure"
@@ -859,7 +859,7 @@ def analyze_fourier_domain(
             )
             plt.close(fig)
 
-            # ====== 保存数值结果 ======
+            # ====== Save numeric dump ======
             analysis_results = {
                 'sample_id': i,
                 'task': task,
@@ -895,9 +895,9 @@ def analyze_fourier_domain(
 
             txt_path = os.path.join(save_dir, f'fourier_analysis_{task}_sample_{i}.txt')
             with open(txt_path, 'w', encoding='utf-8') as f:
-                f.write("=" * 80 + f"\n傅里叶频域分析结果 - 任务 {task} - 样本 {i}\n" + "=" * 80 + "\n\n")
+                f.write("=" * 80 + f"\nFourier-domain analysis – task {task} – sample {i}\n" + "=" * 80 + "\n\n")
                 f.write(json.dumps(analysis_results, indent=2, ensure_ascii=False))
-                f.write(f"\n完成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"\nCompleted at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write("=" * 80 + "\n")
 
             print(f"   [{task}] Sample {i}: HF/LF tgt={tgt_hf_ratio:.4f}, "
@@ -907,12 +907,12 @@ def analyze_fourier_domain(
             print("-" * 80)
 
         except Exception as e:
-            print(f"[Fourier] 样本 {i} 分析失败: {e}")
+            print(f"[Fourier] Sample {i} analysis failed: {e}")
             continue
 
 
 # ============================================================
-# 5. Encoder 输出特征可视化（空间 + 频谱）
+# 5. Encoder output features (spatial + spectrum)
 # ============================================================
 
 def visualize_encoded(
@@ -929,7 +929,7 @@ def visualize_encoded(
     wandb_run=None,
     global_step=None,
     log_prefix='vis/encoded',
-    # 频谱设置
+    # Spectrum settings
     use_window=True,
     r_dc=0.02,
     lf_band=(0.05, 0.30),
@@ -938,14 +938,14 @@ def visualize_encoded(
     log_callback=None,
 ):
     """
-    可视化 Encoder 输出特征并进行空间/频谱统计（稳健版）。
-    输入:
+    Plot encoder activations with spatial/spectrum statistics (robust path).
+    Args:
         encoded: torch.Tensor [B, C, H, W]
-    返回:
+    Returns:
         {'meta': {...}, 'summary': {...}, 'per_sample': [ {...}, ... ]}
     """
     os.makedirs(save_dir, exist_ok=True)
-    assert encoded.dim() == 4, f"encoded 应为 [B,C,H,W]，但收到 {tuple(encoded.shape)}"
+    assert encoded.dim() == 4, f"encoded must be [B,C,H,W], got {tuple(encoded.shape)}"
     B, C, H, W = encoded.shape
     n_samples = min(B, max_samples)
 
@@ -962,13 +962,13 @@ def visualize_encoded(
             elif selection == 'l2':
                 score = (flat.pow(2).sum(dim=-1)).mean(dim=0)
             else:
-                raise ValueError(f"未知 selection: {selection}")
+                raise ValueError(f"Unknown selection: {selection}")
             top_idx = torch.topk(score, k=k, largest=True).indices
             channels = top_idx.tolist()
     else:
         channels = sorted(set(int(c) for c in channels if 0 <= int(c) < C))
         if len(channels) == 0:
-            raise ValueError("channels 为空或越界")
+            raise ValueError("channels empty or out of range")
 
     K = len(channels)
 
@@ -1033,7 +1033,7 @@ def visualize_encoded(
                     vmin, vmax = 0.0, 1.0
                     range_note = f"[{norm_mode}] min={min_:.3e}, max={max_:.3e}"
                 else:
-                    raise ValueError(f"未知 norm_mode: {norm_mode}")
+                    raise ValueError(f"Unknown norm_mode: {norm_mode}")
 
                 arr_in = arr * win if use_window else arr
                 fft2c = fftshift(fft2(arr_in))
@@ -1164,11 +1164,11 @@ def visualize_encoded(
             txt_path = os.path.join(save_dir, f'encoded_analysis_sample_{i}.txt')
             with open(txt_path, 'w', encoding='utf-8') as f:
                 f.write("=" * 90 + "\n")
-                f.write(f"Encoder 特征可视化与频域分析 - 样本 {i}\n")
+                f.write(f"Encoder features & spectrum – sample {i}\n")
                 f.write("=" * 90 + "\n\n")
-                f.write(f"通道选择: {channels}  (mode={selection}, topk={K})\n")
-                f.write(f"可视化归一化: {norm_mode} (p_low={p_low}, p_high={p_high})\n")
-                f.write(f"频谱设置: use_window={use_window}, r_dc={r_dc}, "
+                f.write(f"Channel selection: {channels}  (mode={selection}, topk={K})\n")
+                f.write(f"Visualization norm: {norm_mode} (p_low={p_low}, p_high={p_high})\n")
+                f.write(f"Spectrum settings: use_window={use_window}, r_dc={r_dc}, "
                         f"lf_band={lf_band}, hf_band={hf_band}\n\n")
 
                 for cs in ch_stats:
@@ -1176,22 +1176,22 @@ def visualize_encoded(
                     s = cs['spatial']
                     sp = cs['spectral']
                     f.write(f"[Channel {ch}]\n")
-                    f.write(f"  空间: mean={s['mean']:.6e}, std={s['std']:.6e}, "
+                    f.write(f"  Spatial: mean={s['mean']:.6e}, std={s['std']:.6e}, "
                             f"min={s['min']:.6e}, max={s['max']:.6e}, L2={s['l2']:.6e}\n")
-                    f.write(f"  频谱: psd_mean={sp['psd_mean']:.6e}, psd_max={sp['psd_max']:.6e}, "
+                    f.write(f"  Spectrum: psd_mean={sp['psd_mean']:.6e}, psd_max={sp['psd_max']:.6e}, "
                             f"r*={sp['dominant_radius_norm']:.3f}, HF/LF={sp['hf_ratio']:.6f}, "
                             f"energy_ratio_selected={sp['energy_ratio_selected']:.6f}\n\n")
 
-                f.write("空间域通道间相关矩阵（K×K）:\n")
+                f.write("Spatial inter-channel correlation (K×K):\n")
                 f.write(np.array2string(spatial_corr, formatter={'float_kind': lambda x: f"{x: .3f}"}))
-                f.write("\n\n频谱域通道间相关矩阵（K×K，基于 log10(PSD)）:\n")
+                f.write("\n\nSpectral inter-channel correlation (K×K, log10(PSD)):\n")
                 f.write(np.array2string(spectral_corr, formatter={'float_kind': lambda x: f"{x: .3f}"}))
                 f.write("\n\n")
 
                 f.write("=" * 90 + "\n")
-                f.write(f"保存图像: {png_path}\n")
-                f.write(f"保存 NPY:  {os.path.join(save_dir, f'encoded_analysis_sample_{i}.npy')}\n")
-                f.write(f"完成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Saved figure: {png_path}\n")
+                f.write(f"Saved NPY:  {os.path.join(save_dir, f'encoded_analysis_sample_{i}.npy')}\n")
+                f.write(f"Completed at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write("=" * 90 + "\n")
 
             print(f"[visualize_encoded] Sample {i} done.")
@@ -1216,7 +1216,7 @@ def visualize_encoded(
             })
 
         except Exception as e:
-            print(f"[visualize_encoded] 样本 {i} 可视化失败: {e}")
+            print(f"[visualize_encoded] Sample {i} visualization failed: {e}")
             import traceback
             traceback.print_exc()
             continue
@@ -1264,7 +1264,7 @@ def visualize_encoded(
 
 
 # ============================================================
-# 6. Router 频段选择 / Top-k 专家频率 可视化
+# 6. Router band selection / Top-k expert frequency plots
 # ============================================================
 
 def visualize_router_selection(
@@ -1279,7 +1279,7 @@ def visualize_router_selection(
     log_prefix: str = "router",
 ):
     """
-    可视化 router 对频段的选择分布 & Top-k 专家被选中的次数。
+    Histogram of band picks and Top-k expert hit counts.
     """
     band_centers = np.asarray(band_centers, dtype=float)
     band_select_counts = np.asarray(band_select_counts, dtype=float)
@@ -1290,7 +1290,7 @@ def visualize_router_selection(
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
 
-    # 频段直方图
+    # Band histogram
     axes[0].bar(np.arange(num_bands), band_select_counts)
     axes[0].set_xticks(np.arange(num_bands))
     axes[0].set_xticklabels([f"{c:.2f}" for c in band_centers], rotation=45)
@@ -1298,7 +1298,7 @@ def visualize_router_selection(
     axes[0].set_ylabel("Selections")
     axes[0].set_title(f"{router_name}: band selection histogram")
 
-    # 专家选择次数
+    # Expert hit counts
     axes[1].bar(np.arange(num_experts), expert_select_counts)
     axes[1].set_xticks(np.arange(num_experts))
     axes[1].set_xlabel("Expert index")
@@ -1333,7 +1333,7 @@ def visualize_router_selection_from_stats(
     log_prefix: str = "router",
 ):
     """
-    兼容 router.get_stats() 的版本，从 stats 字典中抽取字段并调用 visualize_router_selection。
+    Adapter for router.get_stats(): pull fields and call visualize_router_selection.
     """
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -1343,12 +1343,12 @@ def visualize_router_selection_from_stats(
     expert_counts = np.asarray(stats.get("expert_select_counts", []), dtype=float)
 
     if band_centers.size == 0 or band_counts.size == 0 or expert_counts.size == 0:
-        print("[RouterVis] stats 中缺少 band_centers/band_select_counts/expert_select_counts，跳过可视化。")
+        print("[RouterVis] stats missing band_centers/band_select_counts/expert_select_counts; skipping plot.")
         return
 
     if band_centers.shape[0] != band_counts.shape[0]:
-        print(f"[RouterVis] band_centers 与 band_select_counts 长度不一致: "
-              f"{band_centers.shape[0]} vs {band_counts.shape[0]}，强制裁剪对齐。")
+        print(f"[RouterVis] band_centers vs band_select_counts length mismatch: "
+              f"{band_centers.shape[0]} vs {band_counts.shape[0]}; truncating to align.")
         n = min(band_centers.shape[0], band_counts.shape[0])
         band_centers = band_centers[:n]
         band_counts = band_counts[:n]
@@ -1374,7 +1374,7 @@ def visualize_router_selection_from_stats(
 
 
 # ============================================================
-# 7. 可视化 routed_bands：每个专家实际吃到的特征
+# 7. Visualize routed_bands (features each expert receives)
 # ============================================================
 
 def visualize_routed_bands(
@@ -1388,7 +1388,7 @@ def visualize_routed_bands(
     wandb_run=None,
     global_step=None,
     log_prefix: str = "router/routed",
-    # 通道选择策略（参考 visualize_encoded）
+    # Channel selection policy (same idea as visualize_encoded)
     channels: Optional[List[int]] = None,
     topk: int = 4,
     selection: str = "variance",     # 'variance' | 'l2' | 'random'
@@ -1397,19 +1397,19 @@ def visualize_routed_bands(
     p_high: float = 99.0,
 ):
     """
-    可视化分频后的特征 routed_bands（空间域 + 频域）：
-      - routed_bands: list of [B, C, H, W]，长度 = num_experts
-      - 对于给定 sample_idx，从每个 expert 的输入中截取 [C, H, W]
-      - 当 C 很大时，参考 visualize_encoded 的方式选择若干通道:
-          * channels 显式指定
-          * 否则根据 selection/topk 从该 expert 的所有通道中选出子集
+    Routed band features after frequency split (spatial + frequency):
+      - routed_bands: list of [B, C, H, W], length = num_experts
+      - For sample_idx, slice [C, H, W] per expert tensor
+      - When C is large, pick channels like visualize_encoded:
+          * explicit channels, or
+          * selection/topk over that expert
 
-      每个 expert 的图：
-          * 上一行：空间域特征图（选出的 K 个通道）
-          * 下一行：对应的频域 log10(PSD)
+      Per-expert figure:
+          * Top row: spatial maps for K selected channels
+          * Bottom row: matching log10(PSD)
     """
     if not routed_bands:
-        print("[RoutedBandsVis] routed_bands 为空，无法可视化。")
+        print("[RoutedBandsVis] routed_bands is empty; nothing to plot.")
         return
 
     save_dir = Path(save_dir)
@@ -1422,19 +1422,19 @@ def visualize_routed_bands(
     for e_idx in range(num_experts):
         feat = routed_bands[e_idx]
         if not isinstance(feat, torch.Tensor):
-            print(f"[RoutedBandsVis] routed_bands[{e_idx}] 不是 Tensor，实际类型 {type(feat)}，跳过。")
+            print(f"[RoutedBandsVis] routed_bands[{e_idx}] is not a Tensor ({type(feat)}); skip.")
             continue
         if feat.ndim != 4:
-            print(f"[RoutedBandsVis] routed_bands[{e_idx}] 维度不是 4D，实际为 {feat.shape}，跳过。")
+            print(f"[RoutedBandsVis] routed_bands[{e_idx}] is not 4D ({feat.shape}); skip.")
             continue
         if sample_idx >= feat.size(0):
-            print(f"[RoutedBandsVis] sample_idx={sample_idx} 超出 batch 大小 {feat.size(0)}，跳过该 expert。")
+            print(f"[RoutedBandsVis] sample_idx={sample_idx} >= batch {feat.size(0)}; skip expert.")
             continue
 
         # feat: [B, C, H, W]
         B, C, H, W = feat.shape
 
-        # ===== 通道选择：参考 visualize_encoded =====
+        # ===== Channel selection (see visualize_encoded) =====
         if channels is None:
             k = min(topk, C, max_channels)
             if selection == "random":
@@ -1447,27 +1447,27 @@ def visualize_routed_bands(
                 elif selection == "l2":
                     score = (flat.pow(2).sum(dim=-1)).mean(dim=0)          # [C]
                 else:
-                    raise ValueError(f"[RoutedBandsVis] 未知 selection: {selection}")
+                    raise ValueError(f"[RoutedBandsVis] unknown selection: {selection}")
                 top_idx = torch.topk(score, k=k, largest=True).indices
                 ch_idx = top_idx.tolist()
         else:
-            # 显式给定通道时：去重 + 边界裁剪
+            # Explicit channels: dedupe + bounds clamp
             ch_idx = sorted(set(int(c) for c in channels if 0 <= int(c) < C))
             if len(ch_idx) == 0:
-                print(f"[RoutedBandsVis] 指定 channels 全部越界/为空，expert {e_idx} 跳过。")
+                print(f"[RoutedBandsVis] all explicit channels invalid/empty for expert {e_idx}; skip.")
                 continue
             if len(ch_idx) > max_channels:
                 ch_idx = ch_idx[:max_channels]
 
         K = len(ch_idx)
         if K == 0:
-            print(f"[RoutedBandsVis] expert {e_idx} 没有可视化通道，跳过。")
+            print(f"[RoutedBandsVis] expert {e_idx}: no channels to visualize; skip.")
             continue
 
-        # 取指定样本： [C, H, W]
+        # Slice selected sample -> [C, H, W]
         feat_e = feat[sample_idx].detach().cpu()   # [C, H, W]
 
-        # 两行：上 = 空间域；下 = 频域
+        # Two rows: spatial (top), frequency (bottom)
         fig, axes = plt.subplots(
             2,
             K,
@@ -1475,17 +1475,17 @@ def visualize_routed_bands(
             constrained_layout=True
         )
 
-        # 兼容 K=1 的情况
+        # Branch for K == 1
         if K == 1:
             axes = np.array([[axes[0]], [axes[1]]])
 
-        # 收集所有 log10(PSD)，方便统一频谱色标
+        # Aggregate log10(PSD) for shared frequency clim
         all_log_psd_list: List[np.ndarray] = []
 
         for col_idx, ch in enumerate(ch_idx):
             img = feat_e[ch].numpy().astype(np.float64)
 
-            # ===== 空间域归一化：参考 visualize_encoded =====
+            # ===== Spatial normalization (see visualize_encoded) =====
             mean_ = float(np.mean(img))
             std_ = float(np.std(img))
             min_ = float(np.min(img))
@@ -1507,9 +1507,9 @@ def visualize_routed_bands(
                 vmin, vmax = 0.0, 1.0
                 range_note = f"[{norm_mode}] min={min_:.3e}, max={max_:.3e}"
             else:
-                raise ValueError(f"[RoutedBandsVis] 未知 norm_mode: {norm_mode}")
+                raise ValueError(f"[RoutedBandsVis] unknown norm_mode: {norm_mode}")
 
-            # ---- 空间域图 ----
+            # ---- Spatial panel ----
             ax_sp = axes[0, col_idx]
             im_sp = ax_sp.imshow(vis_img, origin="lower", aspect="auto",
                                  cmap="viridis", vmin=vmin, vmax=vmax)
@@ -1521,7 +1521,7 @@ def visualize_routed_bands(
             ax_sp.axis("off")
             plt.colorbar(im_sp, ax=ax_sp, fraction=0.046, pad=0.04).set_label("Normalized act.")
 
-            # ---- 频域：log10 Power Spectrum ----
+            # ---- Frequency: log10 power spectrum ----
             F = fftshift(fft2(img))
             psd = np.abs(F) ** 2
             log_psd = np.log10(psd + 1e-10)
@@ -1533,7 +1533,7 @@ def visualize_routed_bands(
             ax_fd.axis("off")
             plt.colorbar(im_fd, ax=ax_fd, fraction=0.046, pad=0.04).set_label("log10(PSD)")
 
-        # 统一当前 expert 内所有频谱的色标，使对比更直观
+        # Single frequency clim within this expert for easier comparison
         if len(all_log_psd_list) > 0:
             all_log_psd = np.stack(all_log_psd_list, axis=0)
             vmin_freq = float(np.percentile(all_log_psd, 1.0))
@@ -1547,7 +1547,7 @@ def visualize_routed_bands(
                 img_obj = axes[1, col_idx].images[0]
                 img_obj.set_clim(vmin=vmin_freq, vmax=vmax_freq)
 
-        # 图标题和文件名中带上 band center（如果有）
+        # Optional band center in suptitle and filename
         if band_centers is not None and band_centers.shape[0] == num_experts:
             r_c = float(band_centers[e_idx])
             fig.suptitle(
@@ -1576,11 +1576,11 @@ def visualize_routed_bands(
         )
         plt.close(fig)
 
-        print(f"[RoutedBandsVis] 已保存专家 E{e_idx} 空间+频域特征图到 {out_path} | channels={ch_idx}")
+        print(f"[RoutedBandsVis] Saved expert E{e_idx} spatial+spectrum figure -> {out_path} | channels={ch_idx}")
 
 
 # ============================================================
-# 8. 误差热力图
+# 8. Error heatmaps
 # ============================================================
 
 def visualize_error_heatmap(
@@ -1596,7 +1596,7 @@ def visualize_error_heatmap(
     log_prefix: str = "vis/error",
 ):
     """
-    绘制预测误差的 heatmap，并同时展示 target / pred / error 三张图。
+    Heatmaps of prediction error together with target / pred / error panels.
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -1611,7 +1611,7 @@ def visualize_error_heatmap(
             pred = predictions[i].detach().cpu().numpy().squeeze()
 
             if tgt.ndim != 2 or pred.ndim != 2:
-                print(f"[ErrorHeatmap] sample {i}: 非 2D 数据，跳过（tgt.ndim={tgt.ndim}, pred.ndim={pred.ndim}）")
+                print(f"[ErrorHeatmap] sample {i}: not 2D (tgt.ndim={tgt.ndim}, pred.ndim={pred.ndim}); skip")
                 continue
 
             diff = pred - tgt
@@ -1713,7 +1713,7 @@ def visualize_error_heatmap(
 
 
 # ============================================================
-# 9. pde 风格的输出可视化（pred / gt / err / input）
+# 9. PDE-style layout (pred / gt / err / input)
 # ============================================================
 
 def visualize_pde_style(
@@ -1731,15 +1731,15 @@ def visualize_pde_style(
     log_prefix: str = "vis/lamo",
 ):
     """
-    参考 LaMO 官方脚本的可视化方式（darcy/pipe/airfoil 等）：
-      - 上/左：pred
-      - 上/右：gt
-      - 下/左：abs error
-      - 下/右：input（若可绘制，否则留空）
+    LaMO-style panels (darcy/pipe/airfoil, …):
+      - Top-left: pred
+      - Top-right: gt
+      - Bottom-left: abs error
+      - Bottom-right: input (if drawable; else blank)
 
-    适用场景：
-      * targets / predictions 为 2D 场或扁平向量（自动 sqrt 还原）。
-      * inputs 若为网格场，会显示第一通道；否则跳过输入面板。
+    Use when:
+      * targets / predictions are 2D fields or flat vectors (sqrt reshape if square).
+      * inputs are grid fields: show first channel; otherwise omit input panel.
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -1748,7 +1748,7 @@ def visualize_pde_style(
         sample_indices = list(range(min(4, B)))
 
     def _to_field(x: torch.Tensor) -> Optional[np.ndarray]:
-        """将 x（[H,W] / [C,H,W] / [N]）转为 2D ndarray。"""
+        """Map x ([H,W] / [C,H,W] / [N]) to a 2D ndarray."""
         x = x.detach().cpu().squeeze()
         if x.ndim == 2:
             return x.numpy()
@@ -1769,7 +1769,7 @@ def visualize_pde_style(
         if idx >= B:
             continue
         # ==========================
-        # LaMO 原生分支：逐任务复刻
+        # LaMO branch: per-task replay
         # ==========================
         if task in {"darcy", "pipe", "airfoil", "navier", "ns", "plasticity"}:
             # --------- darcy (85x85) ---------
@@ -1778,7 +1778,7 @@ def visualize_pde_style(
                 pred_f = _to_field(predictions[idx]) or _to_field(predictions[idx].reshape(85, 85))
                 inp_f = _to_field(inputs[idx]) if inputs is not None else None
                 if tgt_f is None or pred_f is None:
-                    print(f"[LaMOVis] sample {idx}: darcy reshape 85x85 失败，跳过。")
+                    print(f"[LaMOVis] sample {idx}: darcy reshape to 85x85 failed; skip.")
                     continue
                 err_f = pred_f - tgt_f
                 vmin = float(min(tgt_f.min(), pred_f.min()))
@@ -1829,7 +1829,7 @@ def visualize_pde_style(
                 print(f"[LaMOVis][pipe] sample {idx} saved: {p_path}, {g_path}, {e_path}")
                 continue
 
-            # --------- airfoil (221x51 裁剪 140×35) ---------
+            # --------- airfoil (221x51 crop to 140×35) ---------
             if task == "airfoil":
                 x0 = inputs[idx, 0].detach().cpu().numpy().reshape(221, 51)[40:180, :35]
                 x1 = inputs[idx, 1].detach().cpu().numpy().reshape(221, 51)[40:180, :35]
@@ -1855,9 +1855,9 @@ def visualize_pde_style(
                 print(f"[LaMOVis][airfoil] sample {idx} saved: {p_path}, {g_path}, {e_path}")
                 continue
 
-            # --------- navier-stokes (64x64, 单帧展示) ---------
+            # --------- navier-stokes (64x64, single frame) ---------
             if task in {"navier", "ns"}:
-                # 预测通常是 rollout 后的单帧；若有时间维，取最后一帧
+                # Prediction is often one frame after rollout; if time dim exists, take last
                 pred_t = predictions[idx].detach().cpu().squeeze()
                 tgt_t = targets[idx].detach().cpu().squeeze()
                 if pred_t.ndim == 2:
@@ -1865,14 +1865,14 @@ def visualize_pde_style(
                 elif pred_t.ndim == 3:
                     pred_f = pred_t[-1].numpy()
                 else:
-                    print(f"[LaMOVis][ns] sample {idx}: 形状不支持 {pred_t.shape}")
+                    print(f"[LaMOVis][ns] sample {idx}: unsupported shape {pred_t.shape}")
                     continue
                 if tgt_t.ndim == 2:
                     tgt_f = tgt_t.numpy()
                 elif tgt_t.ndim == 3:
                     tgt_f = tgt_t[-1].numpy()
                 else:
-                    print(f"[LaMOVis][ns] sample {idx}: 形状不支持 {tgt_t.shape}")
+                    print(f"[LaMOVis][ns] sample {idx}: unsupported shape {tgt_t.shape}")
                     continue
                 err_f = pred_f - tgt_f
 
@@ -1905,11 +1905,11 @@ def visualize_pde_style(
                 T = c // 4
                 tgt_last = tgt_np.reshape(4, T, h, w)[:, -1]   # [4,H,W]
                 pred_last = pred_np.reshape(4, T, h, w)[:, -1]
-                # 均匀网格坐标
+                # Uniform grid coordinates
                 xs = np.linspace(0, 1, h)
                 ys = np.linspace(0, 1, w)
                 xx, yy = np.meshgrid(xs, ys, indexing="ij")
-                # 使用所有 4 个分量的范数
+                # Norm across all four components
                 truth_du = np.linalg.norm(tgt_last, axis=0)
                 pred_du = np.linalg.norm(pred_last, axis=0)
 
@@ -1956,13 +1956,13 @@ def visualize_pde_style(
                 continue
 
         # ==========================
-        # 默认通用 2×2 布局
+        # Default generic 2×2 layout
         # ==========================
         tgt_f = _to_field(targets[idx])
         pred_f = _to_field(predictions[idx])
         inp_f = _to_field(inputs[idx]) if inputs is not None else None
         if tgt_f is None or pred_f is None:
-            print(f"[LaMOVis] sample {idx}: 无法还原为 2D 场，跳过。")
+            print(f"[LaMOVis] sample {idx}: cannot reshape to 2D field; skip.")
             continue
 
         err_f = np.abs(pred_f - tgt_f)
@@ -2015,7 +2015,7 @@ def visualize_pde_style(
         print(f"[LaMOVis] sample {idx} saved to {fname}")
 
 # ============================================================
-# 10. 专家频率偏好可视化（expert_freq + band_centers）
+# 10. Expert frequency preference (expert_freq + band_centers)
 # ============================================================
 
 def visualize_expert_freq_preference(
@@ -2030,12 +2030,12 @@ def visualize_expert_freq_preference(
     log_prefix: str = "router/freq_pref",
 ):
     """
-    可视化“专家频率偏好”：
-      - expert_freq:   [E]，每个专家的 meta 频率标量 ∈[0,1]
-      - band_centers:  [B]，每个频段的中心半径 ∈[0,1]
-    输出一张图，包含：
-      1) 左：expert_freq 与 band_centers 在 [0,1] 上的散点分布
-      2) 右：expert × band 的 soft 权重矩阵（高斯兼容度 + softmax）
+    Expert frequency preference:
+      - expert_freq:   [E], per-expert meta frequency in [0,1]
+      - band_centers:  [B], band center radius in [0,1]
+    One figure with:
+      1) Left: scatter of expert_freq vs band_centers on [0,1]
+      2) Right: expert × band soft weights (Gaussian affinity + softmax)
     """
     expert_freq = np.asarray(expert_freq, dtype=float).reshape(-1)
     band_centers = np.asarray(band_centers, dtype=float).reshape(-1)
@@ -2044,23 +2044,23 @@ def visualize_expert_freq_preference(
     B = band_centers.shape[0]
 
     if E == 0 or B == 0:
-        print("[FreqPrefVis] expert_freq 或 band_centers 为空，跳过可视化。")
+        print("[FreqPrefVis] expert_freq or band_centers empty; skip plot.")
         return
 
-    # ===== 计算 expert–band 的 soft 权重（高斯兼容度 + softmax）=====
+    # ===== Soft expert–band weights (Gaussian affinity + softmax) =====
     # diff[e,b] = expert_freq[e] - band_centers[b]
     diff = expert_freq[:, None] - band_centers[None, :]          # [E,B]
     compat = -freq_affinity_sharpness * (diff ** 2)              # [E,B]
 
-    # 手动 softmax，避免额外依赖
-    compat_shift = compat - compat.max(axis=1, keepdims=True)    # 数值稳定
+    # Manual softmax (no extra deps)
+    compat_shift = compat - compat.max(axis=1, keepdims=True)    # numeric stability
     w = np.exp(compat_shift)
     band_weights = w / (w.sum(axis=1, keepdims=True) + 1e-12)    # [E,B]
 
-    # ===== 作图 =====
+    # ===== Plot =====
     fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
 
-    # 1) 左：在 [0,1] 上画出 experts 和 bands 的位置
+    # 1) Left: experts and bands on [0,1]
     ax0 = axes[0]
     xs_e = expert_freq
     ys_e = np.zeros_like(xs_e)
@@ -2081,7 +2081,7 @@ def visualize_expert_freq_preference(
     ax0.set_xlabel("normalized radius r* ∈ [0,1]")
     ax0.set_title(f"{router_name}: expert meta frequency vs band centers")
 
-    # 2) 右：expert × band 的 soft 权重热力图
+    # 2) Right: expert × band soft-weight heatmap
     ax1 = axes[1]
     im = ax1.imshow(band_weights, aspect='auto', origin='lower')
     ax1.set_xlabel("band index")
@@ -2096,7 +2096,7 @@ def visualize_expert_freq_preference(
     cbar = fig.colorbar(im, ax=ax1, fraction=0.046, pad=0.04)
     cbar.set_label("preference weight")
 
-    # ===== 保存 & 日志 =====
+    # ===== Save & log =====
     tb_tag = f"{log_prefix}/freq_pref"
     wb_key = f"{log_prefix}/freq_pref"
 
@@ -2126,13 +2126,13 @@ def visualize_expert_freq_preference_from_router(
     log_prefix: str = "router/freq_pref",
 ):
     """
-    直接从 router 中取参数进行可视化：
-      - 需要 router.expert_freq: [E]
-      - 需要 router.band_centers: [B]
+    Plot from router tensors:
+      - requires router.expert_freq: [E]
+      - requires router.band_centers: [B]
       - freq_affinity_sharpness:
-          * 若为 None，则尝试从 router.freq_affinity_sharpness 读取，
-            否则默认 10.0
-    使用方式（例）：
+          * if None, use router.freq_affinity_sharpness when present,
+            else 10.0
+    Example:
         stats = moe.get_router_stats()
         visualize_expert_freq_preference_from_router(
             moe.router, './results/router_vis', epoch=epoch
@@ -2142,10 +2142,10 @@ def visualize_expert_freq_preference_from_router(
     save_dir.mkdir(parents=True, exist_ok=True)
 
     if not hasattr(router, "expert_freq"):
-        print("[FreqPrefVis] router 不包含属性 'expert_freq'，无法可视化频率偏好。")
+        print("[FreqPrefVis] router has no 'expert_freq'; cannot plot frequency preference.")
         return
     if not hasattr(router, "band_centers"):
-        print("[FreqPrefVis] router 不包含属性 'band_centers'，无法可视化频率偏好。")
+        print("[FreqPrefVis] router has no 'band_centers'; cannot plot frequency preference.")
         return
 
     expert_freq = router.expert_freq.detach().cpu().numpy()

@@ -7,9 +7,9 @@ from zarr.storage import DirectoryStore
 
 class ZarrSeismicDataset(Dataset):
     """
-    线程安全、进程安全的 Zarr 读取版
-    - 每个 worker 进程独立只读打开 zarr
-    - 防止句柄在 fork 时共享
+    Thread-safe, process-safe Zarr-backed dataset.
+    - Each worker process opens the Zarr store read-only independently.
+    - Avoids sharing file handles across forked workers.
     """
     def __init__(
         self,
@@ -22,7 +22,7 @@ class ZarrSeismicDataset(Dataset):
     ):
         assert split in {"train", "val", "test"}
 
-        # 只存路径，不在 __init__ 打开
+        # Store path only; do not open in __init__
         self.zarr_path = zarr_path
         self.split = split
         self.input_transform = input_transform
@@ -30,7 +30,7 @@ class ZarrSeismicDataset(Dataset):
         self.expect_input_shape = tuple(expect_input_shape)
         self.to_float32 = bool(to_float32)
         
-        # 惰性打开时缓存这些
+        # Lazily populated when the store is first opened
         self._root = None
         self._inputs = None
         self._outputs = None
@@ -40,20 +40,20 @@ class ZarrSeismicDataset(Dataset):
         self._split_group = None
         self._idx = None
 
-    # ---- 解决 DataLoader 多进程 pickle 问题 ----
+    # ---- Pickle-safe for DataLoader multiprocessing ----
     def __getstate__(self):
         state = self.__dict__.copy()
-        # 清除已打开的对象引用
+        # Drop references to open store handles
         for key in ["_root", "_inputs", "_outputs", "_labels", "_type_name", "_input_file", "_split_group"]:
             state[key] = None
         return state
 
-    # ---- 延迟打开 Zarr ----
+    # ---- Lazy open Zarr ----
     def _ensure_open(self):
         if self._root is not None:
             return
 
-        # 每个 worker 独立只读打开 Zarr
+        # Each worker opens Zarr read-only on its own
         store = DirectoryStore(self.zarr_path)
         self._root = zarr.open_group(store=store, mode="r")
 
@@ -70,7 +70,7 @@ class ZarrSeismicDataset(Dataset):
 
         self._idx = np.asarray(self._split_group[split_key][:], dtype=np.int64)
 
-        # train/val 有监督
+        # train/val splits have supervision (outputs + labels)
         self.has_output = (self._outputs is not None) and (self._labels is not None) and (self.split != "test")
 
     def __len__(self):
@@ -81,7 +81,7 @@ class ZarrSeismicDataset(Dataset):
         self._ensure_open()
         j = int(self._idx[i])
 
-        # ---- 输入 ----
+        # ---- Input ----
         x = self._inputs[j]
         if x.shape != self.expect_input_shape:
             raise ValueError(f"inputs[{j}] shape={x.shape}, expect={self.expect_input_shape}")
@@ -98,7 +98,7 @@ class ZarrSeismicDataset(Dataset):
             "input_file": (str(self._input_file[j]) if self._input_file is not None else ""),
         }
 
-        # ---- 输出 ----
+        # ---- Output ----
         if self.has_output:
             y = self._outputs[j]
             if y.ndim == 3 and y.shape[0] == 1:

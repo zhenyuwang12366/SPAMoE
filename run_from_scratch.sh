@@ -9,31 +9,31 @@ REPO_ROOT="${SCRIPT_DIR}"
 
 usage() {
   cat <<'EOF'
-用法:
-  bash run_from_scratch.sh --data_dir XXX --family FAMILY [选项]
+Usage:
+  bash run_from_scratch.sh --data_dir XXX --family FAMILY [options]
 
-说明:
-  1. data_dir 必须是 OpenFWI 根目录，且其中必须存在 XXX/train_samples
-  2. 脚本先调用 load_to_zarr.sh 转 zarr，再调用 school.sh 或 school_local.sh 启动训练
+Steps:
+  1. data_dir must be an OpenFWI root containing <data_dir>/train_samples
+  2. Runs load_to_zarr.sh, then school.sh or school_local.sh for training
 
-常用选项:
-  --data_dir PATH              原始数据根目录，必须包含 train_samples/
-  --family FAMILY              family 名称，例如 curve_vel_b / style_a
-  --zarr_out PATH              输出 zarr 路径；默认 ./zarr_data/FAMILY.zarr
-  --train_mode MODE            local / sbatch，默认 local
-  --preset NAME                default / preset1 / preset2，默认 default
-  --num_gpus N                 默认 2
-  --num_workers N              默认 10
-  --status_json PATH           默认 ./dataset_status/dataset_status.json
-  --output_dir PATH            训练输出目录
-  --seed N                     默认 0
-  --include_test 0|1           仅单 family 有效，默认 0
-  --remap_single_label 0|1     默认 0
-  --chunks N                   zarr chunk 大小，默认 32
-  --dtype TYPE                 float32 / float16，默认 float32
-  --concat_channels 0|1        默认 1
-  --conda_env NAME             可选，自动激活指定 conda 环境
-  --                           后续参数原样透传给训练脚本
+Common options:
+  --data_dir PATH              raw data root (must contain train_samples/)
+  --family FAMILY              e.g. curve_vel_b / style_a
+  --zarr_out PATH              output Zarr path; default ./zarr_data/FAMILY.zarr
+  --train_mode MODE            local / sbatch, default local
+  --preset NAME                default / preset1 / preset2, default default
+  --num_gpus N                 default 2
+  --num_workers N              default 10
+  --status_json PATH           default ./dataset_status/dataset_status.json
+  --output_dir PATH            training output directory
+  --seed N                     default 0
+  --include_test 0|1           single-family only, default 0
+  --remap_single_label 0|1     default 0
+  --chunks N                   Zarr chunk size, default 32
+  --dtype TYPE                 float32 / float16, default float32
+  --concat_channels 0|1        default 1
+  --conda_env NAME             optional conda env
+  --                           extra args forwarded to the training launcher
 EOF
 }
 
@@ -80,7 +80,7 @@ while [[ $# -gt 0 ]]; do
       break
       ;;
     *)
-      echo "未知参数: $1" >&2
+      echo "Unknown argument: $1" >&2
       usage
       exit 1
       ;;
@@ -88,13 +88,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${DATA_DIR}" || -z "${FAMILY}" ]]; then
-  echo "必须提供 --data_dir 和 --family。" >&2
+  echo "Both --data_dir and --family are required." >&2
   usage
   exit 1
 fi
 
 if [[ ! -d "${DATA_DIR}/train_samples" ]]; then
-  echo "数据目录必须包含 train_samples/: ${DATA_DIR}/train_samples" >&2
+  echo "Data root must contain train_samples/: ${DATA_DIR}/train_samples" >&2
   exit 1
 fi
 
@@ -123,7 +123,7 @@ if [[ -n "${CONDA_ENV_NAME}" ]]; then
   LOAD_CMD+=(--conda_env "${CONDA_ENV_NAME}")
 fi
 
-printf '步骤1/2，转换 zarr:'
+printf 'Step 1/2 (Zarr):'
 printf ' %q' "${LOAD_CMD[@]}"
 printf '\n'
 "${LOAD_CMD[@]}"
@@ -150,23 +150,23 @@ fi
 
 case "${TRAIN_MODE}" in
   local)
-    printf '步骤2/2，本地训练:'
+    printf 'Step 2/2 (local train):'
     printf ' %q' bash "${REPO_ROOT}/school_local.sh" "${TRAIN_CMD[@]}"
     printf '\n'
     bash "${REPO_ROOT}/school_local.sh" "${TRAIN_CMD[@]}"
     ;;
   sbatch)
     if ! command -v sbatch >/dev/null 2>&1; then
-      echo "当前环境没有 sbatch，不能使用 --train_mode sbatch。" >&2
+      echo "sbatch not found; cannot use --train_mode sbatch." >&2
       exit 1
     fi
-    printf '步骤2/2，提交 sbatch:'
+    printf 'Step 2/2 (sbatch):'
     printf ' %q' sbatch "${REPO_ROOT}/school.sh" "${TRAIN_CMD[@]}"
     printf '\n'
     sbatch "${REPO_ROOT}/school.sh" "${TRAIN_CMD[@]}"
     ;;
   *)
-    echo "不支持的 --train_mode: ${TRAIN_MODE}，可选 local / sbatch" >&2
+    echo "Unsupported --train_mode: ${TRAIN_MODE} (use local or sbatch)" >&2
     exit 1
     ;;
 esac

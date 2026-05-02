@@ -3,7 +3,7 @@
 """
 Eval-only script for PDEBench-style datasets (burgers1d/navier2d/darcy2d/pipe/airfoil/plasticity).
 Loads a trained checkpoint, runs metrics on val/test split, and optionally saves visualizations.
-训练阶段的日志/可视化留给 train_pde.py，这里只输出关键指标并落盘为 JSON。
+Training-time logging and visualization live in train_pde.py; this script only prints key metrics and writes them to JSON.
 """
 
 import argparse
@@ -20,13 +20,13 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.transforms import Compose
 
-# ========= 仓库内路径 =========
+# ========= In-repo path setup =========
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import neuralop.mpu.comm as comm
 from neuralop.training import setup
 import scripts.transforms as T
 from neuralop.data.datasets.pde_dataset import PDEBenchDataset
-from neuralop.models.afreqmoe import AdaptiveFreqMoE  # noqa: F401  # 确保模块可用
+from neuralop.models.afreqmoe import AdaptiveFreqMoE  # noqa: F401  # keep import available
 from neuralop.layers.spectral_convolution import SpectralConv
 from config.distributed import DistributedConfig
 
@@ -51,7 +51,7 @@ from utils.plot_fig import (
     visualize_expert_freq_preference_from_router,
 )
 
-# 兼容 SpectralConv 的 patch
+# SpectralConv forward patch for compatibility
 patch_spectral_conv_forward(SpectralConv)
 
 
@@ -121,28 +121,28 @@ def build_argparser():
         "--band_sharpness",
         type=float,
         default=None,
-        help="AFreqMoE 软频带锐度（None 表示使用 checkpoint 配置）",
+        help="AFreqMoE soft band sharpness (None = use checkpoint config).",
     )
     parser.add_argument(
         "--freq_affinity_sharpness",
         type=float,
         default=None,
-        help="AFreqMoE 频率偏好匹配锐度（None 表示使用 checkpoint 配置）",
+        help="AFreqMoE frequency-preference match sharpness (None = use checkpoint config).",
     )
     parser.add_argument(
         "--disable_soft_bands",
         action="store_true",
-        help="消融：禁用软频带，使用硬分段",
+        help="Ablation: disable soft bands; use hard segmentation.",
     )
     parser.add_argument(
         "--disable_freq_attn",
         action="store_true",
-        help="消融：禁用频域自注意力",
+        help="Ablation: disable frequency-domain self-attention.",
     )
     parser.add_argument(
         "--disable_band_mixing",
         action="store_true",
-        help="消融：禁用频带混合输入（专家=对应频带）",
+        help="Ablation: disable band-mixed inputs (each expert sees its band only).",
     )
     parser.add_argument(
         "--save_dir",
@@ -175,7 +175,7 @@ def build_argparser():
 
 
 # ===========================================================
-# 2. 构建 DataLoader（只需要 val/test 一个 split）
+# 2. Build DataLoader (single val/test split)
 # ===========================================================
 
 def build_eval_loader(cfg: PDEBenchConfig, args):
@@ -186,8 +186,8 @@ def build_eval_loader(cfg: PDEBenchConfig, args):
     status_path = Path(args.status_json).expanduser()
     if not status_path.exists():
         raise FileNotFoundError(
-            f"PDEBench 归一化统计文件不存在: {status_path}. "
-            "请先通过 convert_pdebench_to_emo_format.py 生成 *_stats.json。"
+            f"PDEBench normalization stats file not found: {status_path}. "
+            "Generate *_stats.json first via convert_pdebench_to_emo_format.py."
         )
 
     with open(status_path, "r", encoding="utf-8") as f:
@@ -257,14 +257,14 @@ def build_eval_loader(cfg: PDEBenchConfig, args):
 
 
 # ===========================================================
-# 3. 主函数
+# 3. main
 # ===========================================================
 
 def main():
     parser = build_argparser()
     args = parser.parse_args()
 
-    # --- 基本随机种子 & TF32 ---
+    # --- Basic RNG seeds & TF32 ---
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     if torch.cuda.is_available():
@@ -273,25 +273,25 @@ def main():
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
 
-    # === 从 checkpoint 读取 config，并安全恢复 PDEBenchConfig ===
+    # === Load config from checkpoint and restore PDEBenchConfig safely ===
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     ckpt_cfg = ckpt.get("config", {}) or {}
 
     print(f"Loaded ckpt from {args.checkpoint}, epoch={ckpt.get('epoch')}, "
       f"best_mse={ckpt.get('best_mse')}, best_l2r={ckpt.get('best_l2r')}")
     
-    # 1) 先用默认值实例化，再用 ckpt 中的字段覆盖，避免 distributed 变为 dict
+    # 1) Start from defaults, then override from ckpt (avoid raw dict for distributed)
     cfg = PDEBenchConfig()
     for k, v in ckpt_cfg.items():
         if not hasattr(cfg, k):
             continue
         if k == "distributed" and isinstance(v, dict):
-            # 从 dict 安全恢复 DistributedConfig
+            # Restore DistributedConfig safely from dict
             cfg.distributed = DistributedConfig(**v)
         else:
             setattr(cfg, k, v)
 
-    # 2) 覆盖运行时必要配置（任务/数据/批大小/AMP/路径等）
+    # 2) Override runtime fields (task, data, batch, AMP, paths, etc.)
     cfg.task = args.task
     cfg.data_root = str(args.data_root)
     cfg.batch_size = args.batch_size
@@ -301,7 +301,7 @@ def main():
     cfg.save_dir = str(args.save_dir)
     cfg.num_workers = args.num_workers
     cfg.distributed.seed = args.seed
-    # 覆盖 AFreqMoE 消融配置（若命令行给出）
+    # Override AFreqMoE ablation flags when provided on CLI
     if args.band_sharpness is not None:
         cfg.band_sharpness = args.band_sharpness
     if args.freq_affinity_sharpness is not None:
@@ -312,19 +312,19 @@ def main():
         cfg.enable_freq_attn = False
     if args.disable_band_mixing:
         cfg.enable_band_mixing = False
-    # 覆盖可视化频率，测试阶段开启；避免训练阶段保存的 0 设置导致无法可视化
+    # Override vis_every for testing; avoid train-saved 0 blocking visualization
     cfg.vis_every = args.vis_every
-    # 保证 evaluate(epoch=0) 时 cfg.epochs 至少为 1，便于后续逻辑复用（即使当前没用到）
+    # Ensure cfg.epochs >= 1 for evaluate(epoch=0) reuse (even if unused here)
     if cfg.epochs <= 0:
         cfg.epochs = 1
 
-    # === 初始化分布式/设备，与 train 保持一致 ===
+    # === Init distributed/device, aligned with train ===
     if args.distributed:
         cfg.distributed.use_distributed = True
     device, is_logger = setup(cfg)
     cfg.is_logger = is_logger
 
-    # 同步 rank/world_size/local_rank
+    # Sync rank / world_size / local_rank
     args.rank = comm.get_global_rank()
     args.world_size = comm.get_world_size()
     args.local_rank = comm.get_local_rank()
@@ -335,7 +335,7 @@ def main():
     # === Data ===
     val_loader = build_eval_loader(cfg, args)
 
-    # 先从一个样本推断通道数和空间尺寸
+    # Infer channel count and spatial size from one sample
     try:
         sample = val_loader.dataset[0]
     except Exception:
@@ -353,8 +353,7 @@ def main():
     if cfg.use_amp and cfg.has_complex_params and is_main_process(cfg):
         print("[AMP] Detected complex parameters (e.g., Fourier-domain weights); disabling AMP/GradScaler.")
 
-    # 这里理论上可以不再包 DDP，因为 evaluate 自带 all_reduce；
-    # 如果你想完全复用 train 的模式，也可以保留，但后面我们会 unwrap 再 eval。
+    # DDP is optional: evaluate already all_reduces; mirror train if desired, then unwrap for eval.
     if args.distributed and args.world_size > 1:
         emo = nn.parallel.DistributedDataParallel(
             emo,
@@ -365,10 +364,10 @@ def main():
             gradient_as_bucket_view=True,
         )
 
-    # === 从 ckpt 中读取权重 ===
+    # === Load weights from checkpoint ===
     model_state = ckpt.get("model_state_dict", None)
     if model_state is None:
-        raise RuntimeError("Checkpoint 中没有 'model_state_dict' 字段！")
+        raise RuntimeError("Checkpoint has no 'model_state_dict' key.")
 
     target_emo = emo.module if hasattr(emo, "module") else emo
     missing, unexpected = target_emo.load_state_dict(model_state, strict=False)
@@ -398,7 +397,7 @@ def main():
         "split": args.split,
     }
 
-    # === 可视化 ===
+    # === Visualization ===
     if is_main_process(cfg):
         vis_dir = args.save_dir / "vis"
         vis_dir.mkdir(parents=True, exist_ok=True)
@@ -408,7 +407,7 @@ def main():
         preds = vis_sample.get("preds")
         encoded = vis_sample.get("encoded")
 
-        # 反归一化 + 基础可视化
+        # Denormalize + baseline visualization
         if inputs is not None and targets is not None and preds is not None:
             inv_in = getattr(cfg, "input_inverse_transform", None)
             inv_out = getattr(cfg, "output_inverse_transform", None)
@@ -448,7 +447,7 @@ def main():
                 task=cfg.task,
             )
             
-        # 编码特征可视化
+        # Encoded-feature visualization
         if encoded is not None:
             visualize_encoded(
                 encoded,
@@ -457,7 +456,7 @@ def main():
                 selection="l2",
             )
 
-        # Router / 频带可视化（仅在 AF-MoE 时启用）
+        # Router / band visualization (AF-MoE only)
         base_emo = target_emo
 
         if isinstance(base_emo.moe, AdaptiveFreqMoE):
@@ -465,7 +464,7 @@ def main():
             router_vis_dir.mkdir(parents=True, exist_ok=True)
 
             router_stats = None
-            # 1) router 选择统计
+            # 1) Router selection stats
             try:
                 router_stats = base_emo.moe.get_router_stats()
                 visualize_router_selection_from_stats(
@@ -478,9 +477,9 @@ def main():
                     global_step=None,
                 )
             except Exception as e:
-                print(f"[RouterVis] 频段/专家选择可视化失败: {e}")
+                print(f"[RouterVis] Band/expert selection visualization failed: {e}")
 
-            # 2) 每个频带的路由结果
+            # 2) Per-band routed outputs
             try:
                 routed_bands = base_emo.moe.get_last_routed_bands()
                 if routed_bands is not None:
@@ -496,8 +495,8 @@ def main():
                         global_step=None,
                     )
             except Exception as e:
-                print(f"[RouterVis] routed_bands 可视化失败: {e}")
-            # 3) 各专家频率偏好可视化
+                print(f"[RouterVis] routed_bands visualization failed: {e}")
+            # 3) Per-expert frequency preference
             try:
                 visualize_expert_freq_preference_from_router(
                     base_emo.moe.router,
@@ -508,14 +507,14 @@ def main():
                     global_step=None,
                 )
             except Exception as e:
-                print(f"[RouterVis] 专家频率偏好可视化失败: {e}")
+                print(f"[RouterVis] Expert frequency-preference visualization failed: {e}")
                 
-        # 保存指标到 JSON
+        # Save metrics to JSON
         metrics_path = args.save_dir / "metrics.json"
         with open(metrics_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2)
 
-        # 终端打印一份
+        # Also print to terminal
         print(json.dumps(results, indent=2))
 
     if args.distributed:

@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from ..sampler.chunk_sampler import ChunkDistributedSampler
 
 def worker_init_reopen_zarr(_):
-    # 可在 Dataset.__getitem__ 内做懒加载 zarr；这里设置 blosc 线程等
+    # Zarr may be lazily opened in Dataset.__getitem__; here tune blosc threads, etc.
     try:
         import numcodecs.blosc as blosc
         blosc.set_nthreads(max(1, os.cpu_count() // 2))
@@ -27,7 +27,7 @@ def build_loaders(
         if train_dataset_with_transform is not None:
             train_num_workers = max(0, args.num_workers // 2)
 
-            # —— 训练：按块的分布式采样器（批内不跨块）
+            # Training: chunk-wise distributed sampler (batches stay within one chunk)
             train_chunk = chunks
             print(f"[DEBUG] zarr use chunk: {train_chunk}")
             train_sampler = ChunkDistributedSampler(
@@ -44,7 +44,7 @@ def build_loaders(
             train_loader = DataLoader(
                 train_dataset_with_transform,
                 sampler=train_sampler,
-                batch_size=per_rank_bs,           # 与 sampler 的 batch_size 一致（per-rank）
+                batch_size=per_rank_bs,           # Must match sampler batch_size (per-rank)
                 shuffle=False,
                 num_workers=train_num_workers,
                 pin_memory=True,
@@ -54,7 +54,7 @@ def build_loaders(
                 multiprocessing_context="forkserver",
             )
 
-        # —— 验证：分布式顺序采样（也可以换成 ChunkDistributedSampler(shuffle=False) 以减少抖动）
+        # Validation: sequential distributed sampling (ChunkDistributedSampler(shuffle=False) is another option)
         val_num_workers = train_num_workers if train_dataset_with_transform is not None else max(0, args.num_workers)
         val_sampler = DistributedSampler(
             val_dataset_with_transform,
@@ -77,7 +77,7 @@ def build_loaders(
         )
         return train_loader, val_loader, train_sampler, val_sampler
     else:
-        # —— 单机：也用 chunk 采样（更省 I/O），保持训练随机性
+        # Single process: still use chunk sampling (less I/O) while keeping training randomness
         train_num_workers = max(0, args.num_workers)
         train_chunk = chunks
 

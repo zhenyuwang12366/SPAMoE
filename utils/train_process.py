@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 utils/train_process.py
-稳定性与显存友好增强版：
-- 训练循环中更彻底地释放 GPU 引用
-- 可视化/保存仅传 CPU 对象，且在 inference_mode 下执行
-- 兼容 DeepSpeed/DDP 的原有逻辑保持不变
+Stability- and memory-friendly training loop:
+- Release GPU references more aggressively during training
+- Visualization/saving uses CPU tensors only, under inference_mode
+- DeepSpeed/DDP behavior unchanged
 """
 import os
 import gc
@@ -111,7 +111,7 @@ def _evaluate_one_epoch(
         else:
             loss_dict = criterion(preds, targets)
 
-        # 这里用 criterion 的 float 键做累计
+        # Accumulate using criterion float keys
         val_loss += float(loss_dict["loss"])
         mse_sum  += float(loss_dict["l2"])
         mae_sum  += float(loss_dict["l1"])
@@ -205,7 +205,7 @@ def train_one_epoch(
     **kwargs,
 ):
     def mem():
-        """打印当前 GPU 显存状态（调试用）"""
+        """Print current GPU memory (debug)."""
         torch.cuda.synchronize()
         allocated = torch.cuda.memory_allocated(device) / 1e9
         reserved  = torch.cuda.memory_reserved(device)  / 1e9
@@ -229,7 +229,7 @@ def train_one_epoch(
     nan_detected = False
     use_amp = bool(amp_enabled)
 
-    # Router 相关
+    # Router-related
     router_type = model.module.moe.router_type if hasattr(model, "module") else model.moe.router_type
     if "adamv" == router_type:
         router = model.module.moe.router if hasattr(model, "module") else model.moe.router
@@ -238,19 +238,19 @@ def train_one_epoch(
     is_ddp_like = hasattr(model, "no_sync")
     num_steps = len(train_loader)
 
-    # 分布式 Sampler 设 epoch
+    # Set epoch on distributed Sampler
     if getattr(config, "distributed", None) and getattr(config.distributed, "use_distributed", False):
         if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
             train_loader.sampler.set_epoch(epoch)
 
-    # 清梯度
+    # Zero gradients
     if use_deepspeed:
         engine.zero_grad()
     else:
         if optimizer is not None:
             optimizer.zero_grad(set_to_none=True)
 
-    # 进度条
+    # Progress bar
     pbar_iter = train_loader
     if tqdm is not None:
         pbar_iter = tqdm(
@@ -260,11 +260,11 @@ def train_one_epoch(
             disable=not _is_main_process(is_logger, engine),
         )
 
-    # 显存观测（可选）
+    # Optional GPU memory probe
     if _is_main_process(is_logger, engine):
         mem()
 
-    # ====== 训练循环 ======
+    # ====== Training loop ======
     for step, batch in enumerate(pbar_iter):
         global_step = epoch * num_steps + step
         inputs = batch['input'].to(device, non_blocking=True)
@@ -289,19 +289,19 @@ def train_one_epoch(
             else:
                 loss_dict = criterion(preds, targets)
 
-            # —— 采样一次权重直方图（日志用 float，不保留计算图） —— #
+            # Sample weight histogram once for logging (float, no graph)
             if tb_active and type_weight_hist_sample is None and (weights is not None):
                 flat_weights = weights.detach().float().cpu().reshape(-1)
                 if flat_weights.numel() > max_type_weight_hist_samples:
                     flat_weights = flat_weights[:max_type_weight_hist_samples]
-                type_weight_hist_sample = flat_weights  # 只在首次设置
+                type_weight_hist_sample = flat_weights  # Set on first time only
 
-            # ------- 关键修复：全部使用 Tensor 路径做反传 ------- #
+            # Keep full Tensor path for backward
             aux_term_t = aux_loss.detach() if aux_loss is not None else preds.new_zeros(())
-            # loss_dict["loss_t"] 是 Tensor；coef * aux_term_t 也是 Tensor
+            # loss_dict["loss_t"] is Tensor; coef * aux_term_t is also Tensor
             loss_raw_t = loss_dict["loss_t"] + coef * aux_term_t
 
-            # 有限性检查（Tensor）
+            # Finiteness check (Tensor)
             if not torch.isfinite(loss_raw_t).all().item():
                 step_has_nan = True
                 nan_detected = True
@@ -314,7 +314,7 @@ def train_one_epoch(
                 else:
                     loss_for_backward.backward()
 
-                # 日志累计用 float（无计算图）
+                # Log aggregation as float (no graph)
                 running_train_loss += float(loss_dict["loss"])
                 running_aux_loss   += float(aux_term_t.detach().item())
                 micro_count += 1
@@ -327,7 +327,7 @@ def train_one_epoch(
                     optimizer.zero_grad(set_to_none=True)
             if _is_main_process(is_logger, engine):
                 print(f"[NaN Detected] loss became NaN at step {step + 1}, aborting epoch early.")
-            # 释放 step 内持有的引用
+            # Drop per-step references
             del preds, aux_term_t, loss_raw_t, weights, inputs, targets, loss_dict
             if train_encoder:
                 del labels
@@ -350,18 +350,18 @@ def train_one_epoch(
                 tb_writer.add_scalar("train/learning_rate", current_lr, global_step)
 
         if _is_main_process(is_logger, engine) and tqdm is not None:
-            # 只显示 float，不保留图
+            # Show float only, no graph retained
             pbar_iter.set_postfix({"train_loss": f"{float(loss_raw_t.detach().item()):.6f}"})
 
-        # —— 训练步末尾：彻底释放显存相关引用 —— #
+        # End of step: release GPU-related refs
         del preds, aux_term_t, loss_raw_t, weights, inputs, targets, loss_dict
         if train_encoder:
             del labels
-        # 若确实显存紧张才打开；默认注释掉避免频繁 sync
+        # Enable only under memory pressure; default off to avoid frequent sync
         if global_step % 500 == 0:
             torch.cuda.empty_cache()
 
-    # ====== 统计训练损失 ======
+    # ====== Aggregate train loss ======
     if nan_detected and micro_count == 0:
         avg_train_loss = float("nan")
         avg_aux_loss = float("nan")
@@ -374,7 +374,7 @@ def train_one_epoch(
         tb_writer.add_scalar("train/epoch_loss", avg_train_loss, epoch_step)
         tb_writer.add_scalar("train/epoch_aux_loss", avg_aux_loss, epoch_step)
 
-    # ====== 验证 ======
+    # ====== Validation ======
     if nan_detected:
         val_stats = {
             "val_loss": float("inf"),
@@ -419,7 +419,7 @@ def train_one_epoch(
         if train_encoder:
             tb_writer.add_scalar("val/ce", val_stats.get("ce", float("nan")), epoch_step)
 
-    # ====== Router 控制 ======
+    # ====== Router control ======
     if router_type == 'adamv':
         signal = router.step_validation(val_loss)
         if is_ddp_like and not use_deepspeed:
@@ -439,7 +439,7 @@ def train_one_epoch(
             if _is_main_process(is_logger, engine):
                 print(f'epoch: {epoch} AES probe failed -> fix top_k = {router.k}')
 
-    # ====== 文本日志 / W&B ======
+    # ====== Text log / W&B ======
     if _is_main_process(is_logger, engine) and (log_file is not None):
         cols = [
             f"    {epoch+1}",
@@ -476,7 +476,7 @@ def train_one_epoch(
     if tb_active and type_weight_hist_sample is not None:
         tb_writer.add_histogram("encoder/type_weights", type_weight_hist_sample, epoch_step)
 
-    # ====== 保存（最佳 / 最新） ======
+    # ====== Save (best / latest) ======
     def _save_checkpoints(tag_path: Optional[str], best: bool):
         if not _is_main_process(is_logger, engine):
             return
@@ -551,9 +551,9 @@ def train_one_epoch(
         print(f"  Train Loss: {avg_train_loss:.6f}")
         print(f"  Val   Loss: {val_loss:.6f}")
 
-    # ====== 可视化（rank0，显存友好） ======
+    # ====== Visualization (rank0, memory-friendly) ======
     if _is_main_process(is_logger, engine) and vis_now and (visualize_results is not None):
-        # 兼容 Path/str
+        # Accept Path or str
         if isinstance(results_dir, Path):
             save_dir_vis = results_dir / f"vis_epoch_{epoch+1}"
             save_dir_fft = results_dir / f"fourier_analysis_epoch_{epoch+1}"
@@ -562,7 +562,7 @@ def train_one_epoch(
             save_dir_fft = os.path.join(results_dir, f"fourier_analysis_epoch_{epoch+1}")
 
         with torch.inference_mode():
-            # 只取一个 batch 用于展示
+            # One batch for display only
             try:
                 vis_batch = next(iter(val_loader))
             except StopIteration:
@@ -622,13 +622,13 @@ def train_one_epoch(
                     global_step=epoch,
                 )
 
-                # 彻底断引用，避免 rank0 显存累积
+                # Drop refs to avoid rank0 GPU memory creep
                 del inputs, targets, preds, vis_weights, inputs_v, targets_v, preds_v, vis_batch
                 gc.collect()
-                # 若你希望进一步降低 reserved 峰值，可临时启用
+                # Uncomment to lower reserved peak if needed
                 # torch.cuda.empty_cache()
 
-    # ====== Early Stop / 同步 ======
+    # ====== Early stop / sync ======
     stop_flag = 0
     if getattr(config, "early_stop", False):
         if _is_main_process(is_logger, engine) and (early_stopper is not None) and (not nan_detected):

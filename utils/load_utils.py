@@ -30,7 +30,7 @@ _EXPERT_FILE_PATTERN = re.compile(
 
 
 def _strip_prefixes(key: str, prefixes: Iterable[str]) -> str:
-    """剥离类似 'module.' 的前缀。"""
+    """Strip prefixes like 'module.'."""
     for p in prefixes:
         if key.startswith(p):
             return key[len(p):]
@@ -47,18 +47,20 @@ def _extract_encoder_state_dict(
     strip_prefixes: Iterable[str] = ("module.",),
 ) -> Dict[str, torch.Tensor]:
     """
-    从任意形式的 checkpoint 中解析 encoder 的 state_dict。
-    支持多种常见存储格式：
-      - 直接是 state_dict
+    Parse encoder state_dict from any checkpoint layout.
+    Supported formats:
+      - bare state_dict
       - {'encoder_state_dict': state_dict}
       - {'state_dict': state_dict}
-    并自动剥离 DDP 保存时的 ``module.`` 等前缀。
+    Also strips DDP prefixes such as ``module.``.
     """
     if source is None:
-        raise ValueError("encoder checkpoint 为空，无法加载。")
+        raise ValueError("encoder checkpoint is empty; cannot load.")
 
     if not isinstance(source, dict):
-        raise TypeError(f"无法解析类型为 {type(source)} 的 encoder checkpoint。期望字典或 state_dict。")
+        raise TypeError(
+            f"Cannot parse encoder checkpoint of type {type(source)}. Expected dict or state_dict."
+        )
 
     if "encoder_state_dict" in source:
         state_dict = source["encoder_state_dict"]
@@ -68,7 +70,7 @@ def _extract_encoder_state_dict(
         state_dict = source
 
     if not isinstance(state_dict, dict):
-        raise ValueError("encoder checkpoint 中缺少有效的 state_dict。")
+        raise ValueError("encoder checkpoint has no valid state_dict.")
 
     cleaned: Dict[str, torch.Tensor] = {}
     for key, tensor in state_dict.items():
@@ -78,7 +80,7 @@ def _extract_encoder_state_dict(
         cleaned[new_key] = tensor
 
     if not cleaned:
-        raise ValueError("encoder state_dict 解析为空，请检查保存格式。")
+        raise ValueError("encoder state_dict parsed empty; check save format.")
 
     return cleaned
 
@@ -90,26 +92,26 @@ def load_encoder_weights(
     map_location: Union[str, torch.device] = "cpu",
     strict: bool = False,
     strip_prefixes: Iterable[str] = ("module.",),
-    drop_prefixes: Iterable[str] = ("type_head.",),   # <- 新增：要跳过的 head 前缀
-    drop_if_contains: Iterable[str] = (),              # <- 可选：按关键字丢弃
+    drop_prefixes: Iterable[str] = ("type_head.",),   # head keys to skip
+    drop_if_contains: Iterable[str] = (),              # optional substring drop
 ) -> Tuple[List[str], List[str]]:
     """
-    将 encoder checkpoint 加载到给定模型中。
-    返回 (missing_keys, unexpected_keys)。
+    Load encoder weights into the given module.
+    Returns (missing_keys, unexpected_keys).
     """
     if checkpoint is None:
         return [], []
 
     if isinstance(checkpoint, str):
         if not os.path.exists(checkpoint):
-            raise FileNotFoundError(f"Encoder checkpoint 不存在: {checkpoint}")
+            raise FileNotFoundError(f"Encoder checkpoint not found: {checkpoint}")
         loaded = torch.load(checkpoint, map_location=map_location)
     else:
         loaded = checkpoint
 
     state_dict = _extract_encoder_state_dict(loaded, strip_prefixes=strip_prefixes)
 
-    # --------- 1) 显式丢弃 head / 指定前缀 ----------
+    # --------- 1) Drop head / prefix keys explicitly ----------
     if drop_prefixes or drop_if_contains:
         filtered = {}
         dropped = []
@@ -136,9 +138,9 @@ def get_expert_dict(
     ddp_prefixes: Iterable[str] = ("module.",),
     expert_prefix: str = "experts.0.",
 ) -> Dict[str, torch.Tensor]:
-    """从 state_dict 或保存的专家字典中提取第一个专家权重。
-    - 支持单卡/多卡保存（自动剥离 ``module.`` 前缀）。
-    - 若存在 ``experts.0.`` 前缀，仅保留其下的键并剥离该前缀。
+    """Extract first-expert weights from a state_dict or saved expert dict.
+    - Single-/multi-GPU saves (``module.`` prefix stripped automatically).
+    - If ``experts.0.`` prefix exists, keep only those keys and strip it.
     """
     raw_sd: Optional[Dict[str, Any]] = None
     if isinstance(ckpt, dict):
@@ -148,13 +150,13 @@ def get_expert_dict(
                 raw_sd = maybe_sd
                 break
         if raw_sd is None and all(isinstance(k, str) for k in ckpt.keys()):
-            raw_sd = ckpt  # 直接就是 state_dict
+            raw_sd = ckpt  # already a state_dict
 
     if raw_sd is None:
-        raise TypeError("无法从 checkpoint 中提取 state_dict，检查保存格式是否符合保存逻辑。")
+        raise TypeError("Cannot extract state_dict from checkpoint; check save format.")
 
     if not isinstance(raw_sd, dict):
-        raise TypeError("state_dict 应为字典，无法解析专家权重。")
+        raise TypeError("state_dict must be a dict; cannot parse expert weights.")
 
     cleaned = OrderedDict()
     has_expert_prefix = False
@@ -172,17 +174,17 @@ def get_expert_dict(
 
     if has_expert_prefix:
         if not cleaned:
-            raise ValueError(f"未能解析出 '{expert_prefix}' 下的专家参数，请确认文件来源。")
+            raise ValueError(f"No expert parameters under '{expert_prefix}'; verify checkpoint source.")
         return cleaned
 
     if not cleaned:
-        raise ValueError("state_dict 中没有可用的专家参数键。")
+        raise ValueError("state_dict has no usable expert parameter keys.")
 
     return cleaned
 
 
 def _extract_expert_module(ckpt: Any) -> Optional[nn.Module]:
-    """尝试从已反序列化对象中直接拿到单个专家模块。"""
+    """Try to obtain a single expert module from a deserialized object."""
     def _maybe_from_container(module_obj: nn.Module) -> Optional[nn.Module]:
         experts = getattr(module_obj, "experts", None)
         if isinstance(experts, (nn.ModuleList, list, tuple)) and len(experts) > 0:
@@ -222,7 +224,7 @@ def load_factory(
     hidden_channels: int,
     model_dict: OrderedDict,
 ) -> List[nn.Module]:
-    """专家工厂（方案A：按 expert_id → v_type 升序装载）。"""
+    """Expert factory (plan A: load by expert_id, v_type ascending)."""
     experts: List[nn.Module] = []
 
     for k, v in model_dict.items():
@@ -231,27 +233,27 @@ def load_factory(
         try:
             expert_id = int(k)
         except Exception:
-            raise ValueError(f"expert_id 非整数: {k}")
+            raise ValueError(f"expert_id is not integer: {k}")
 
         if not (0 <= expert_id < len(experts_config)):
-            raise IndexError(f"experts_config 下标越界: {expert_id}")
+            raise IndexError(f"experts_config index out of range: {expert_id}")
 
         expert_config_group = experts_config[expert_id]
 
-        # 按 v_type 升序
+        # Sort by v_type ascending
         try:
             sorted_dict_list = sorted(v, key=lambda d: next(iter(d.keys())))
         except Exception as e:
-            raise RuntimeError(f"对 v_type 列表排序失败 (可能有 None 键): {e}")
+            raise RuntimeError(f"Failed to sort v_type list (possible None key): {e}")
 
         for type_expert_sd in sorted_dict_list:
             v_type_id, expert_sd = next(iter(type_expert_sd.items()))
 
-            # 解析 config_for_type → config_list
+            # Resolve config_for_type -> config_list
             if isinstance(expert_config_group, dict) and all(isinstance(key, int) for key in expert_config_group.keys()):
                 config_for_type = expert_config_group.get(v_type_id)
                 if config_for_type is None:
-                    raise KeyError(f"expert {expert_id} 缺少 v_type={v_type_id} 的配置")
+                    raise KeyError(f"expert {expert_id} missing config for v_type={v_type_id}")
             else:
                 config_for_type = expert_config_group
 
@@ -260,11 +262,11 @@ def load_factory(
             else:
                 if not isinstance(config_for_type, dict):
                     raise TypeError(
-                        f"expert_config[{expert_id}] 无法解析到有效的字典配置，收到类型 {type(config_for_type)}"
+                        f"expert_config[{expert_id}] is not a valid dict config; got type {type(config_for_type)}"
                     )
                 config_list = [config_for_type]
 
-            # 两条分支：已有模块 vs 仅权重
+            # Branch: full module vs weights only
             if isinstance(expert_sd, nn.Module):
                 expert_raw_model = expert_sd
             else:
@@ -286,7 +288,7 @@ def load_factory(
 
             experts.append(expert_raw_model)
 
-    return experts  # 形如 [FNO0.., WNO.., MNO.., LNO..]
+    return experts  # e.g. [FNO0.., WNO.., MNO.., LNO..]
 
 
 # =========================
@@ -301,10 +303,10 @@ def load_factory_interleaved(
     interleaved: List[Tuple[str, int, Any]],
 ) -> List[nn.Module]:
     """
-    方案B：按 v_type 优先的交错顺序实例化/装载专家。
+    Plan B: instantiate/load experts in v_type-first interleaved order.
     interleaved: List[(expert_id(str), v_type_id(int), payload)]
-      - payload 要么是 nn.Module，要么是 state_dict
-    返回值即为“按 v_type 交错顺序”排好的一维专家列表。
+      - payload is either nn.Module or state_dict
+    Returns a flat expert list in v_type-interleaved order.
     """
     experts: List[nn.Module] = []
 
@@ -312,18 +314,18 @@ def load_factory_interleaved(
         try:
             expert_id = int(eid_str)
         except Exception:
-            raise ValueError(f"expert_id 非整数: {eid_str}")
+            raise ValueError(f"expert_id is not integer: {eid_str}")
 
         if not (0 <= expert_id < len(experts_config)):
-            raise IndexError(f"experts_config 下标越界: {expert_id}")
+            raise IndexError(f"experts_config index out of range: {expert_id}")
 
         expert_config_group = experts_config[expert_id]
 
-        # 解析 config_for_type → config_list
+        # Resolve config_for_type -> config_list
         if isinstance(expert_config_group, dict) and all(isinstance(key, int) for key in expert_config_group.keys()):
             config_for_type = expert_config_group.get(v_type_id)
             if config_for_type is None:
-                raise KeyError(f"expert {expert_id} 缺少 v_type={v_type_id} 的配置")
+                raise KeyError(f"expert {expert_id} missing config for v_type={v_type_id}")
         else:
             config_for_type = expert_config_group
 
@@ -332,11 +334,11 @@ def load_factory_interleaved(
         else:
             if not isinstance(config_for_type, dict):
                 raise TypeError(
-                    f"expert_config[{expert_id}] 无法解析到有效的字典配置，收到类型 {type(config_for_type)}"
+                    f"expert_config[{expert_id}] is not a valid dict config; got type {type(config_for_type)}"
                 )
             config_list = [config_for_type]
 
-        # 两条分支：已有模块 vs 仅权重
+        # Branch: full module vs weights only
         if isinstance(expert_sd, nn.Module):
             expert_raw_model = expert_sd
         else:
@@ -367,11 +369,11 @@ def load_factory_interleaved(
 
 def _resolve_specific_label(raw_label: str, id_map: Dict[str, int]) -> Optional[str]:
     """
-    将 checkpoint 文件名中的标签映射到 `type_dict['specific']` 的键。
-    支持以下格式：
-      - 精确的细分类名（curve_vel_a）
-      - 基础类别名（curve_vel），默认映射到 variants[0]
-      - 旧格式组合（curve_vel 等），或前缀组合（curve_vel_xx）
+    Map a checkpoint filename label to a key in ``type_dict['specific']``.
+    Supported forms:
+      - exact subtype name (curve_vel_a)
+      - base category (curve_vel), default maps to variants[0]
+      - legacy combos (curve_vel etc.) or prefix combos (curve_vel_xx)
     """
     if raw_label in id_map:
         return raw_label
@@ -382,7 +384,7 @@ def _resolve_specific_label(raw_label: str, id_map: Dict[str, int]) -> Optional[
                 return variant
 
     if raw_label in _SPECIFIC_VARIANT_TO_BASE:
-        # 原始标签可能是已知的细分类，但 type_dict 尚未覆盖；尝试返回同名或基础默认
+        # Label may be a known subtype while type_dict is incomplete; try same name or base default
         if raw_label in id_map:
             return raw_label
         base = _SPECIFIC_VARIANT_TO_BASE[raw_label]
@@ -417,39 +419,39 @@ def load_moe_experts(
     moe_mode: str,
 ) -> List[nn.Module]:
     """
-    读取融合专家参数。
-    - 当 moe_mode == "velocity_type" 时，使用方案B：按 v_type 交错的顺序返回专家列表；
-    - 否则使用方案A：按 expert_id 排序，每个 expert 内按 v_type 升序返回。
+    Load fused expert weights.
+    - If moe_mode == "velocity_type", use plan B: return experts in v_type-interleaved order.
+    - Else plan A: sort by expert_id, within each expert sort by ascending v_type.
     """
     if not os.path.isdir(model_path):
-        raise ValueError(f"{model_path}不是有效路径")
+        raise ValueError(f"{model_path} is not a valid directory path")
 
-    # 只取 .pt
+    # Keep .pt files only
     experts_file = sorted(f for f in os.listdir(model_path) if f.endswith('.pt'))
 
-    # 组装: expert_id -> List[{v_type_id: payload}]
+    # Build: expert_id -> List[{v_type_id: payload}]
     grouped: Dict[str, List[Dict[int, Any]]] = defaultdict(list)
 
-    # -------- 扫描与解析 checkpoint --------
+    # -------- Scan and parse checkpoints --------
     if is_specific:
         id_map = type_dict.get('specific', {})
         if not id_map:
-            raise ValueError("type_dict['specific'] 为空，无法映射细分类别。")
+            raise ValueError("type_dict['specific'] is empty; cannot map specific subtypes.")
 
         for f in experts_file:
             m = _EXPERT_FILE_PATTERN.match(f)
             if not m:
-                print(f"[WARN] 文件名不匹配细化专家模式, 跳过: {f}")
+                print(f"[WARN] Filename does not match specific-expert pattern, skip: {f}")
                 continue
 
             expert_id = m.group('i')
             raw_label = m.group('label')
             mapped_label = _resolve_specific_label(raw_label, id_map)
             if mapped_label is None:
-                print(f"[WARN] specific 类型映射缺失 {raw_label}, 跳过: {f}")
+                print(f"[WARN] No specific mapping for {raw_label}, skip: {f}")
                 continue
             if mapped_label != raw_label and raw_label not in id_map:
-                print(f"[INFO] 将细化标签 {raw_label} 映射为 {mapped_label}（使用默认匹配）。")
+                print(f"[INFO] Mapped subtype label {raw_label} -> {mapped_label} (default match).")
 
             v_type = id_map[mapped_label]
 
@@ -468,19 +470,19 @@ def load_moe_experts(
     else:
         id_map = type_dict.get('normal', {})
         if not id_map:
-            raise ValueError("type_dict['normal'] 为空，无法映射普通类别。")
+            raise ValueError("type_dict['normal'] is empty; cannot map normal categories.")
 
         for f in experts_file:
             stem = Path(f).stem
             m = _EXPERT_FILE_PATTERN.match(stem)
             if not m:
-                print(f"[WARN] 文件名不匹配普通专家模式，跳过：{f}")
+                print(f"[WARN] Filename does not match normal-expert pattern, skip: {f}")
                 continue
 
             expert_id = m.group('i')
             label = m.group('label')
             if label not in id_map:
-                print(f"[WARN] normal 类型映射缺失 {label}，跳过：{f}")
+                print(f"[WARN] No normal mapping for label {label}, skip: {f}")
                 continue
 
             v_type = id_map[label]
@@ -497,10 +499,10 @@ def load_moe_experts(
                 expert_sd = get_expert_dict(ckpt)
                 grouped[expert_id].append({v_type: expert_sd})
 
-    # -------- 两种输出顺序 --------
+    # -------- Two output orderings --------
     if moe_mode == "velocity_type":
-        # 方案B：按 v_type 交错顺序输出
-        # 1) 将每个 expert 的列表转 dict，便于快速访问
+        # Plan B: interleave by v_type
+        # 1) Turn each expert's list into a dict for fast lookup
         grouped_map: Dict[str, Dict[int, Any]] = {}
         for eid, vlist in grouped.items():
             vt_map: Dict[int, Any] = {}
@@ -510,16 +512,16 @@ def load_moe_experts(
                     vt_map[int(vt)] = payload
             grouped_map[eid] = vt_map
 
-        # 2) 收集所有 v_type（升序）
+        # 2) Collect all v_types (sorted)
         all_vtypes = sorted({vt for vt_map in grouped_map.values() for vt in vt_map.keys()})
 
-        # 3) expert_id 按数字序（同一 v_type 内部的专家遍历顺序）
+        # 3) Numeric sort of expert_id (iteration order within one v_type)
         try:
             expert_ids_sorted = sorted(grouped_map.keys(), key=lambda k: int(k))
         except (ValueError, TypeError):
             expert_ids_sorted = sorted(grouped_map.keys())
 
-        # 4) 交错展开：(v_type 外层) × (expert_id 内层)
+        # 4) Interleave: outer v_type, inner expert_id
         interleaved: List[Tuple[str, int, Any]] = []
         for vt in all_vtypes:
             for eid in expert_ids_sorted:
@@ -527,7 +529,7 @@ def load_moe_experts(
                 if vt in vt_map:
                     interleaved.append((eid, vt, vt_map[vt]))
 
-        # 5) 按交错顺序实例化/装载
+        # 5) Instantiate/load in interleaved order
         loaded_experts = load_factory_interleaved(
             experts_config,
             in_channels,
@@ -537,7 +539,7 @@ def load_moe_experts(
         )
 
     else:
-        # 方案A：按 expert_id 排序，随后在 load_factory 内部按 v_type 升序装载
+        # Plan A: sort by expert_id, then load_factory sorts v_type ascending
         try:
             ordered = OrderedDict(sorted(grouped.items(), key=lambda kv: int(kv[0])))
         except (ValueError, TypeError):
@@ -551,24 +553,24 @@ def load_moe_experts(
             ordered,
         )
 
-    print(f"成功读取专家，专家数: {len(loaded_experts)}")
+    print(f"Loaded experts successfully, count: {len(loaded_experts)}")
 
-    # ====== 打印每个专家的详细信息 ======
-    print("\n==== 已加载专家信息 ====")
+    # ====== Print per-expert details ======
+    print("\n==== Loaded expert summary ====")
     for idx, expert in enumerate(loaded_experts):
         num_params = sum(p.numel() for p in expert.parameters())
         trainable_params = sum(p.numel() for p in expert.parameters() if p.requires_grad)
         expert_class = expert.__class__.__name__
         expert_shape_info = ""
         try:
-            # 尝试提取模型的核心层结构
+            # Try to show first module type
             first_layer = next(expert.modules())
             expert_shape_info = f"({type(first_layer).__name__})"
         except Exception:
             pass
         print(f"[{idx:02d}] {expert_class:<25} "
-              f"参数总数: {num_params:<10} 可训练: {trainable_params:<10} {expert_shape_info}")
+              f"params: {num_params:<10} trainable: {trainable_params:<10} {expert_shape_info}")
 
-    print("==== 专家加载完毕 ====\n")
+    print("==== Expert load complete ====\n")
 
     return loaded_experts

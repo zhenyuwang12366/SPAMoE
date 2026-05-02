@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import timm
 
-# ===== 可选依赖：safetensors =====
+# ===== Optional: safetensors =====
 _HAS_SAFE = False
 try:
     from safetensors.torch import load_file as safe_load_file
@@ -15,7 +15,7 @@ try:
 except Exception:
     _HAS_SAFE = False
 
-# ===== 可选：timm 的 pos_embed 插值工具（优先用官方） =====
+# ===== Optional: timm resize_pos_embed (prefer official) =====
 _timm_resize_pos_embed = None
 try:
     from timm.models.vision_transformer import resize_pos_embed as _timm_resize_pos_embed
@@ -24,12 +24,12 @@ except Exception:
 
 
 # =========================
-# 工具函数（通用）
+# Shared helpers
 # =========================
 
 def _strip_prefix(sd: Dict[str, torch.Tensor],
                   prefixes=('module.', 'backbone.', 'model.', 'encoder.')) -> Dict[str, torch.Tensor]:
-    """去除常见的 state_dict 键名前缀"""
+    """Strip common prefixes from state_dict keys."""
     out = {}
     for k, v in sd.items():
         nk = k
@@ -42,7 +42,7 @@ def _strip_prefix(sd: Dict[str, torch.Tensor],
 
 def _drop_head(sd: Dict[str, torch.Tensor],
                drops=('head.', 'fc.', 'fc_norm.', 'classifier.')) -> Dict[str, torch.Tensor]:
-    """去除分类头等下游层权重"""
+    """Drop classifier head and other downstream weights."""
     return {k: v for k, v in sd.items() if not any(k.startswith(d) for d in drops)}
 
 
@@ -50,8 +50,8 @@ def _naive_resize_pos_embed(src: torch.Tensor,
                             dst_shape: torch.Size,
                             num_tokens: int = 1) -> torch.Tensor:
     """
-    兜底版 pos_embed 插值：src, dst 形状均为 [1, N, D]
-    仅在 timm 官方函数不可用时调用。
+    Fallback pos_embed resize; src and dst shapes are [1, N, D].
+    Used only when timm's helper is unavailable.
     """
     assert src.dim() == 3 and dst_shape[0] == 1 and src.size(-1) == dst_shape[-1], \
         f"pos_embed shape mismatch: src={tuple(src.shape)}, dst={tuple(dst_shape)}"
@@ -63,14 +63,14 @@ def _naive_resize_pos_embed(src: torch.Tensor,
     if N_src == N_dst:
         return src
 
-    # 将前 num_tokens（通常是 CLS）剥离，其余当作网格插值
+    # Strip leading num_tokens (usually CLS); interpolate the grid part
     tok_src = src[:, :num_tokens] if num_tokens > 0 else None
     grid_src = src[:, num_tokens:] if num_tokens > 0 else src
 
     tok_dst = torch.empty((1, num_tokens, D), device=src.device, dtype=src.dtype) if num_tokens > 0 else None
     grid_dst_len = N_dst - num_tokens
 
-    # 尝试从长度近似方形恢复网格
+    # Recover a near-square grid from token count
     gsrc = grid_src.shape[1]
     hsrc = int(round(gsrc ** 0.5))
     wsrc = gsrc // hsrc
@@ -79,7 +79,7 @@ def _naive_resize_pos_embed(src: torch.Tensor,
             grid_src.transpose(1, 2), size=grid_dst_len, mode='linear', align_corners=False
         ).transpose(1, 2)
     else:
-        # 目标网格（根据长度开方）
+        # Target grid from sqrt of length
         hdst = int(round(grid_dst_len ** 0.5))
         wdst = grid_dst_len // hdst
         if hdst * wdst != grid_dst_len:
@@ -103,7 +103,7 @@ def _naive_resize_pos_embed(src: torch.Tensor,
 
 def resize_pos_embed(src: torch.Tensor, dst_like: torch.Tensor, num_tokens: int = 1) -> torch.Tensor:
     """
-    统一入口：优先用 timm 官方的 resize_pos_embed，失败时用兜底版。
+    Prefer timm resize_pos_embed; fall back to _naive_resize_pos_embed.
     """
     if _timm_resize_pos_embed is not None:
         try:
@@ -114,14 +114,14 @@ def resize_pos_embed(src: torch.Tensor, dst_like: torch.Tensor, num_tokens: int 
 
 
 def _maybe_resize_pos_embed(model: nn.Module, sd: Dict[str, torch.Tensor]):
-    """pos_embed 形状不匹配时进行插值（ViT 专用）"""
+    """Interpolate pos_embed when shapes disagree (ViT)."""
     if 'pos_embed' in sd and hasattr(model, 'pos_embed'):
         if sd['pos_embed'].shape != model.pos_embed.shape:
             sd['pos_embed'] = resize_pos_embed(sd['pos_embed'], model.pos_embed, num_tokens=1)
 
 
 def _unfreeze_last_n_layers(module: nn.Module, n: int = 2) -> None:
-    """允许微调 backbone 的最后 n 层（ViT 常见为 blocks 的最后几层与 norm）。"""
+    """Unfreeze the last n backbone blocks (and norm), typical ViT fine-tuning."""
     if n <= 0:
         return
     blocks = getattr(module, "blocks", None)
@@ -139,13 +139,13 @@ def _unfreeze_last_n_layers(module: nn.Module, n: int = 2) -> None:
 
 
 # =========================
-# 轻量稳定层：通道 RMS 归一化（用于 ConvNeXt→MoE 对接）
+# Light stability: channel RMS norm (ConvNeXt -> MoE)
 # =========================
 
 class ChannelRMSNorm2d(nn.Module):
     """
-    对 [B, C, H, W] 做每通道 RMSNorm：y = x / sqrt(mean(x^2)+eps)
-    不含仿射参数；可选 clamp 限幅，防止进入 MoE 时数值过大。
+    Per-channel RMSNorm on [B, C, H, W]: y = x / sqrt(mean(x^2)+eps).
+    No affine; optional clamp before MoE for stability.
     """
     def __init__(self, eps: float = 1e-6, clamp_value: Optional[float] = None):
         super().__init__()
@@ -162,11 +162,11 @@ class ChannelRMSNorm2d(nn.Module):
 
 
 # =========================
-# ViT（DINOv3）专用适配
+# ViT (DINOv3) adapters
 # =========================
 
 def _adapt_in_chans_vit(model: nn.Module, in_chans: int):
-    """把 ViT 的 patch_embed 卷积输入通道适配为 in_chans（常见从 3→1 或 3→k）"""
+    """Adapt ViT patch_embed conv input channels to in_chans (e.g. 3 -> 1 or 3 -> k)."""
     if hasattr(model, 'patch_embed') and hasattr(model.patch_embed, 'proj'):
         proj = model.patch_embed.proj
         if isinstance(proj, nn.Conv2d) and proj.in_channels != in_chans:
@@ -175,7 +175,7 @@ def _adapt_in_chans_vit(model: nn.Module, in_chans: int):
             with torch.no_grad():
                 w = proj.weight  # [out, Cin_old, kh, kw]
                 if in_chans == 1:
-                    w = w.mean(dim=1, keepdim=True)  # RGB → 灰度均值
+                    w = w.mean(dim=1, keepdim=True)  # RGB to grayscale mean
                 else:
                     w = w.mean(dim=1, keepdim=True).repeat(1, in_chans, 1, 1)
                 new_proj.weight.copy_(w)
@@ -185,7 +185,7 @@ def _adapt_in_chans_vit(model: nn.Module, in_chans: int):
 def remap_rgb_to_gray(state_dict: Dict[str, torch.Tensor],
                       key: str = "patch_embed.proj.weight",
                       in_chans: int = 1) -> Dict[str, torch.Tensor]:
-    """将权重中的 RGB 卷积核 (3通道) 映射为灰度卷积核 (1通道) 或扩展到任意通道数"""
+    """Map RGB conv weights (3 ch) to grayscale (1 ch) or repeat to in_chans."""
     if key not in state_dict:
         return state_dict
     w = state_dict[key]
@@ -204,16 +204,16 @@ def remap_rgb_to_gray(state_dict: Dict[str, torch.Tensor],
 
 def _load_local_weights_into_timm_vit(model_name: str, ckpt_path: str, in_chans: int) -> nn.Module:
     """
-    加载本地 ViT-DINOv3 权重（支持 .safetensors/.pth），并自动做：
-    - 去头/去前缀
-    - RGB→灰度/多通道映射
-    - pos_embed 插值
-    - 某些 dinov3 qkv 变体 fallback（例如 vit_base_patch16_dinov3_qkvb）
+    Load local ViT-DINOv3 weights (.safetensors/.pth) with:
+    - head/prefix stripping
+    - RGB to gray / multi-channel remap
+    - pos_embed resize fallback
+    - dinov3 qkv variants (e.g. vit_base_patch16_dinov3_qkvb)
     """
     assert os.path.isfile(ckpt_path), f"checkpoint not found: {ckpt_path}"
 
     if ckpt_path.endswith('.safetensors'):
-        assert _HAS_SAFE, "需要 pip install safetensors"
+        assert _HAS_SAFE, "pip install safetensors is required"
         raw = safe_load_file(ckpt_path)  # Dict[str, Tensor]
     else:
         raw = torch.load(ckpt_path, map_location='cpu')
@@ -222,7 +222,7 @@ def _load_local_weights_into_timm_vit(model_name: str, ckpt_path: str, in_chans:
     sd = remap_rgb_to_gray(sd, key="patch_embed.proj.weight", in_chans=in_chans)
 
     candidates = [model_name]
-    # 常见 qkvb 变体兜底
+    # Common qkvb variant fallback
     if model_name.startswith('vit_base_patch16_dinov3'):
         candidates.append('vit_base_patch16_dinov3_qkvb')
     if model_name.startswith('vit_small_patch16_dinov3'):
@@ -251,19 +251,19 @@ def _load_local_weights_into_timm_vit(model_name: str, ckpt_path: str, in_chans:
 
 
 # =========================
-# ConvNeXt（DINOv3）专用适配
+# ConvNeXt (DINOv3) adapters
 # =========================
 
 def _remap_convnext_stem_weight(sd: Dict[str, torch.Tensor], in_chans: int) -> Dict[str, torch.Tensor]:
     """
-    将 state_dict 中 ConvNeXt 的 stem.0.weight 从 3 通道映射到 in_chans 通道：
-      - in_chans == 1: 对输入通道做均值 -> [out,1,kh,kw]
-      - in_chans  > 1: 先均值到 1 再 repeat 到 in_chans
+    Map ConvNeXt stem.0.weight in state_dict from 3 channels to in_chans:
+      - in_chans == 1: channel mean -> [out,1,kh,kw]
+      - in_chans  > 1: mean to 1 then repeat -> in_chans
     """
     key = "stem.0.weight"
     if key not in sd:
         return sd
-    w = sd[key]  # [out, Cin, kh, kw]（通常 Cin=3）
+    w = sd[key]  # [out, Cin, kh, kw] (typically Cin=3)
     if not isinstance(w, torch.Tensor):
         w = torch.tensor(w)
     Cin = w.shape[1]
@@ -279,9 +279,7 @@ def _remap_convnext_stem_weight(sd: Dict[str, torch.Tensor], in_chans: int) -> D
     return sd
 
 def _adapt_stem_in_chans_convnext(model: nn.Module, in_chans: int):
-    """
-    运行时把 ConvNeXt 的 stem 卷积从 3 通道适配到 in_chans。
-    """
+    """At runtime adapt ConvNeXt stem conv from 3 channels to in_chans."""
     conv = None
     if hasattr(model, 'stem'):
         if isinstance(model.stem, nn.Sequential) and len(model.stem) > 0 and isinstance(model.stem[0], nn.Conv2d):
@@ -310,28 +308,28 @@ def _adapt_stem_in_chans_convnext(model: nn.Module, in_chans: int):
 
 def _load_local_weights_into_timm_convnext(model_name: str, ckpt_path: str, in_chans: int) -> nn.Module:
     """
-    加载本地 ConvNeXt-DINOv3 权重（.safetensors/.pth）并解决 in_chans 不匹配导致的 size mismatch。
-    步骤：
-      1) 读取 ckpt，去头/去前缀；
-      2) 先对 sd 的 stem.0.weight 做 3→in_chans 通道映射；
-      3) 构建模型(in_chans=in_chans) 并直接 load；
-      4) 若仍异常，则退化为：in_chans=3 构建→load→再把 stem 改成 in_chans。
+    Load local ConvNeXt-DINOv3 weights; fix in_chans mismatches (size mismatch).
+    Steps:
+      1) read ckpt, strip head/prefix
+      2) remap stem.0.weight 3 -> in_chans
+      3) build with in_chans and load
+      4) on failure: build in_chans=3, load, then adapt stem to in_chans
     """
     assert os.path.isfile(ckpt_path), f"checkpoint not found: {ckpt_path}"
 
-    # 1) 读权重
+    # 1) load checkpoint
     if ckpt_path.endswith('.safetensors'):
-        assert _HAS_SAFE, "需要 pip install safetensors"
+        assert _HAS_SAFE, "pip install safetensors is required"
         raw = safe_load_file(ckpt_path)  # Dict[str, Tensor]
     else:
         raw = torch.load(ckpt_path, map_location='cpu')
 
     sd = _drop_head(_strip_prefix(raw))
 
-    # 2) 预先把 stem.0.weight 映射到 in_chans，避免 size mismatch
+    # 2) remap stem.0.weight early to avoid size mismatch
     sd = _remap_convnext_stem_weight(sd, in_chans=in_chans)
 
-    # 3) 直接按 in_chans 构建并加载
+    # 3) build with in_chans and load
     try:
         model = timm.create_model(
             model_name,
@@ -345,7 +343,7 @@ def _load_local_weights_into_timm_convnext(model_name: str, ckpt_path: str, in_c
         return model
 
     except RuntimeError as e:
-        # 4) 兜底：先按 3 通道构建并加载，再把 stem 改到 in_chans
+        # 4) fallback: build with 3 ch, load, adapt stem to in_chans
         print(f"[Encoder_ConvNeXt] fallback due to: {e}")
         model = timm.create_model(
             model_name,
@@ -361,14 +359,14 @@ def _load_local_weights_into_timm_convnext(model_name: str, ckpt_path: str, in_c
 
 
 # =========================
-# 编码器实现（ViT / ConvNeXt）
+# Encoders (ViT / ConvNeXt)
 # =========================
 
 class Encoder_Dino(nn.Module):
     """
-    ViT（DINOv3）编码器
-    输入:  x [B, in_chans, H, W]（可非方形）
-    输出:
+    ViT (DINOv3) encoder.
+    Inputs:  x [B, in_chans, H, W] (H/W need not match)
+    Outputs:
       - latent_map:  [B, out_channels, 70, 70]
       - type_weight: [B, num_types]
       - global_repr: [B, D] (CLS + REG-mean)
@@ -377,7 +375,7 @@ class Encoder_Dino(nn.Module):
         self,
         model_name: str = "vit_small_patch16_dinov3.lvd1689m",
         pretrained: bool = True,
-        checkpoint_path: Optional[str] = None,  # 若提供本地权重则优先使用
+        checkpoint_path: Optional[str] = None,  # if set, load local weights first
         in_chans: int = 1,
         out_channels: int = 64,
         num_types: int = 3,
@@ -409,12 +407,12 @@ class Encoder_Dino(nn.Module):
 
         self.embed_dim = getattr(self.backbone, "num_features", None) or getattr(self.backbone, "embed_dim", None)
         if self.embed_dim is None:
-            raise RuntimeError("无法从 ViT backbone 获取 embedding 维度。")
+            raise RuntimeError("Cannot infer embedding dim from ViT backbone.")
 
-        # 2) D→C 的 1×1 投影（把 token 网格投影到所需通道）
+        # 2) 1x1 D->C projection (token grid to target channels)
         self.proj = nn.Conv2d(self.embed_dim, out_channels, kernel_size=1, bias=False)
 
-        # 3) 类型预测头（基于 CLS+REG-mean 的全局表征）
+        # 3) type head on global repr (CLS + REG mean)
         self.type_head = nn.Linear(self.embed_dim, num_types)
         if type_act == "softmax":
             self.type_act = nn.Softmax(dim=-1)
@@ -436,7 +434,7 @@ class Encoder_Dino(nn.Module):
             x_resized = F.interpolate(x, size=(Ht, Wt), mode="bilinear", align_corners=False)
             return x_resized, self.target_h, self.target_w
 
-        # pad 到 patch_size 的倍数（不拉伸）
+        # pad to multiple of patch_size (no stretch)
         H_pad = (H + self.patch_size - 1) // self.patch_size * self.patch_size
         W_pad = (W + self.patch_size - 1) // self.patch_size * self.patch_size
         pad_h, pad_w = H_pad - H, W_pad - W
@@ -447,32 +445,32 @@ class Encoder_Dino(nn.Module):
     def forward(self, x: torch.Tensor):
         B = x.size(0)
 
-        # 1) 预处理到 ViT 几何
+        # 1) preprocess for ViT geometry
         x_proc, Hg, Wg = self._preprocess(x)
 
-        # 2) 提取 tokens
+        # 2) extract tokens
         feats = self.backbone.forward_features(x_proc)
 
-        # 兼容 timm 的不同返回形式
+        # timm may return dict or tensor
         if isinstance(feats, dict):
             tokens_full = feats.get("tokens", None)
             if tokens_full is not None:
                 # [B, 1+num_reg+num_patch, D]
                 cls_token = tokens_full[:, 0]       # [B, D]
-                patch_tokens = tokens_full[:, 1:]   # 可能含 REG
+                patch_tokens = tokens_full[:, 1:]   # may include REG tokens
             else:
                 patch_tokens = feats.get("x_norm_patchtokens", None)
                 if patch_tokens is None:
-                    raise RuntimeError("未找到 patch tokens。")
+                    raise RuntimeError("patch tokens not found.")
                 cls_token = feats.get("x_norm_clstoken", None)
                 if cls_token is None:
-                    raise RuntimeError("未找到 cls token。")
+                    raise RuntimeError("cls token not found.")
         else:
             tokens = feats                           # [B, 1+N', D]
             cls_token = tokens[:, 0]
             patch_tokens = tokens[:, 1:]
 
-        # 2.1) 识别 & 切除 REG tokens（常见 dinov3/EVA 在末尾追加）
+        # 2.1) detect and strip REG tokens (often appended in dinov3/EVA)
         N, D = patch_tokens.size(1), patch_tokens.size(2)
         HgWg = Hg * Wg
 
@@ -488,13 +486,13 @@ class Encoder_Dino(nn.Module):
             patch_tokens = patch_tokens[:, :HgWg, :]   # [B, HgWg, D]
             N = patch_tokens.size(1)
 
-        # 2.2) CLS + REG-mean 融合（全局表征）
+        # 2.2) CLS + mean(REG) global representation
         if reg_tokens is not None:
             global_repr = torch.cat([cls_token.unsqueeze(1), reg_tokens], dim=1).mean(dim=1)  # [B, D]
         else:
-            global_repr = cls_token  # 无 REG 时退化为 CLS-only
+            global_repr = cls_token  # no REG: CLS-only
 
-        # 3) 还原 patch 网格 → [B, D, Ht, Wt]
+        # 3) patch grid -> [B, D, Ht, Wt]
         if N != HgWg:
             W_try = int(round(N / Hg))
             if Hg * W_try == N:
@@ -503,13 +501,13 @@ class Encoder_Dino(nn.Module):
                 Wg_eff = int(round(N ** 0.5))
                 Hg_eff = N // Wg_eff
                 if Hg_eff * Wg_eff != N:
-                    raise RuntimeError(f"N={N} 不能 reshape 为网格 (Hg={Hg}, Wg={Wg}).")
+                    raise RuntimeError(f"N={N} cannot reshape to grid (Hg={Hg}, Wg={Wg}).")
         else:
             Hg_eff, Wg_eff = Hg, Wg
 
         feat_grid = patch_tokens.view(B, Hg_eff, Wg_eff, D).permute(0, 3, 1, 2).contiguous()  # [B, D, Ht, Wt]
 
-        # 4) D→C，必要时插值到 70×70
+        # 4) D->C; interpolate to 70x70 if needed
         feat_proj = self.proj(feat_grid)  # [B, C, Ht, Wt]
         if (Hg_eff, Wg_eff) != (self.target_h, self.target_w):
             latent_map = F.interpolate(feat_proj, size=(self.target_h, self.target_w),
@@ -517,19 +515,19 @@ class Encoder_Dino(nn.Module):
         else:
             latent_map = feat_proj
 
-        # 5) 全局表征 → 类型权重
+        # 5) global repr -> type weights
         type_weight = self.type_act(self.type_head(global_repr))  # [B, num_types]
         return latent_map, type_weight, global_repr
 
 
 class Encoder_ConvNeXt(nn.Module):
     """
-    ConvNeXt（DINOv3）编码器（使用 timm 的 forward_head 得到分类 logits）
-    输入:  x [B, in_chans, H, W]
-    输出:
-      - latent_map:  [B, out_channels, 70, 70]     # 由最后stage特征投影+插值得到
-      - type_weight: [B, num_types]                # 由 timm.forward_head 计算出的 logits → 激活
-      - global_repr: [B, D_last]                   # GAP 后的全局向量（pre_logits）
+    ConvNeXt (DINOv3) encoder; uses timm forward_head for classification logits.
+    Input:  x [B, in_chans, H, W]
+    Outputs:
+      - latent_map:  [B, out_channels, 70, 70]     # last-stage features, proj + interp
+      - type_weight: [B, num_types]                # logits from timm.forward_head -> activation
+      - global_repr: [B, D_last]                   # GAP / pre_logits vector
     """
     def __init__(
         self,
@@ -541,7 +539,7 @@ class Encoder_ConvNeXt(nn.Module):
         num_types: int = 3,
         img_size: int = 70,
         type_act: str = "softmax",   # "softmax" | "sigmoid" | "identity"
-        use_timm_head: bool = True,  # 关键：走 timm 的 forward_head 产出分类 logits
+        use_timm_head: bool = True,  # use timm forward_head for class logits
     ):
         super().__init__()
         self.out_channels = out_channels
@@ -549,7 +547,7 @@ class Encoder_ConvNeXt(nn.Module):
         self.target_h = self.target_w = int(img_size)
         self.use_timm_head = use_timm_head and (num_types is not None) and (num_types > 0)
 
-        # 1) backbone：若要用 timm 的 head，就让 timm 知道 num_classes & global_pool
+        # 1) backbone: for timm head, pass num_classes & global_pool
         if checkpoint_path:
             self.backbone = _load_local_weights_into_timm_convnext(
                 model_name, checkpoint_path, in_chans
@@ -564,16 +562,16 @@ class Encoder_ConvNeXt(nn.Module):
             )
             _adapt_stem_in_chans_convnext(self.backbone, in_chans)
 
-        # 通道数（最后stage）
+        # channels at last stage
         self.embed_dim = getattr(self.backbone, "num_features", None) \
                          or getattr(self.backbone, "num_classes", None)
         if self.embed_dim is None:
-            raise RuntimeError("无法从 ConvNeXt backbone 获取 embedding 维度。")
+            raise RuntimeError("Cannot infer embedding dim from ConvNeXt backbone.")
 
-        # 2) D→C 投影给下游
+        # 2) D->C projection downstream
         self.proj = nn.Conv2d(self.embed_dim, out_channels, kernel_size=1, bias=False)
 
-        # 3) 激活函数（timm 的 forward_head 给 logits，这里再变成权重）
+        # 3) activation on logits from timm head -> weights
         if type_act == "softmax":
             self.type_act = nn.Softmax(dim=-1)
         elif type_act == "sigmoid":
@@ -583,29 +581,28 @@ class Encoder_ConvNeXt(nn.Module):
         else:
             raise ValueError(f"Unsupported type_act: {type_act}")
 
-        # ========== 新增：稳定对接 MoE 的关键模块 ==========
-        # 对投影后的 [B,C,H,W] 做通道 RMS 归一化 + 限幅（避免频域/小波算子被大幅值击穿）
+        # MoE stability: channel RMS + clamp after projection
         self.post_norm = ChannelRMSNorm2d(eps=1e-5, clamp_value=5.0)
-        # 路由温度缩放（降低/提升 logits 尖锐度；<1 更尖锐，>1 更平坦）
+        # router temperature on logits (<1 sharper, >1 flatter)
         self.router_temp = nn.Parameter(torch.tensor(0.7), requires_grad=False)
-        # 在 AMP 下把进入 MoE 的 latent_map 铸为 fp32，避免 BF16/FP16 造成的路由/算子数值不稳
+        # cast latent_map to fp32 before MoE under AMP (BF16/FP16 stability)
         self.cast_to_fp32_for_moe = True
 
-        # 如果你不走 timm 头，也给一个无参 GAP 以便导出 global_repr
+        # parameter-free GAP for global_repr when timm head is off
         self._gap = nn.AdaptiveAvgPool2d((1, 1))
 
     def forward(self, x: torch.Tensor):
-        # A) 最后 stage 特征（/32），形状 [B, C=embed_dim, H32, W32]
+        # A) last stage (/32), [B, C=embed_dim, H32, W32]
         feat = self.backbone.forward_features(x)
         if isinstance(feat, (list, tuple)):
             feat = feat[-1]
         assert feat.dim() == 4
 
-        # B) 分类分支：走 timm 的 forward_head
+        # B) classification via timm forward_head
         if self.use_timm_head:
             global_repr = self.backbone.forward_head(feat, pre_logits=True)     # [B, D]
             logits = self.backbone.forward_head(feat, pre_logits=False)         # [B, num_types]
-            # === 温度缩放（数值稳定&可控尖锐度） ===
+            # temperature scaling for stability / sharpness
             temp = torch.clamp(self.router_temp, min=0.25, max=4.0)
             logits = logits / temp
             type_weight = self.type_act(logits)
@@ -613,10 +610,10 @@ class Encoder_ConvNeXt(nn.Module):
             global_repr = self._gap(feat).flatten(1)                            # [B, D]
             type_weight = None
 
-        # C) 特征 → latent_map（投影 + 归一化 + 插值到 70×70）
+        # C) latent_map: project, normalize, interp to target size
         feat_proj = self.proj(feat)                                # [B, out_channels, H32, W32]
-        feat_proj = self.post_norm(feat_proj)                      # ★ 关键：RMSNorm + clamp
-        # 可选：再乘一个缩放系数（遇到极端不稳时可打开）
+        feat_proj = self.post_norm(feat_proj)                      # Key: RMSNorm + clamp
+        # Optional: extra scale if still unstable
         # feat_proj = feat_proj * 0.7
 
         if (feat_proj.shape[-2], feat_proj.shape[-1]) != (self.target_h, self.target_w):
@@ -627,7 +624,7 @@ class Encoder_ConvNeXt(nn.Module):
         else:
             latent_map = feat_proj
 
-        # === AMP 安全铸型：只把进 MoE 的 latent_map 转为 fp32 ===
+        # AMP: cast latent_map to fp32 before MoE only
         if self.cast_to_fp32_for_moe and latent_map.dtype != torch.float32:
             latent_map = latent_map.float()
 
@@ -635,7 +632,7 @@ class Encoder_ConvNeXt(nn.Module):
 
 
 # =========================
-# 统一工厂
+# Factory
 # =========================
 
 def get_encoder(
@@ -647,9 +644,9 @@ def get_encoder(
     img_size: tuple = (70,70),
 ) -> nn.Module:
     """
-    统一工厂：
-      - backbone='vit'            -> Encoder_Dino（ViT-S/16 默认）
-      - backbone='convnext_tiny'  -> Encoder_ConvNeXt(tiny)
+    Factory:
+      - backbone='vit'            -> Encoder_Dino (ViT-S/16 default)
+      - backbone='convnext_tiny'  -> Encoder_ConvNeXt (tiny)
     """
     if out_channels is None:
         out_channels = 64
@@ -670,7 +667,7 @@ def get_encoder(
             mode="pad_then_interp",
             type_act=type_act,
         )
-        # 需要微调时可解开：
+        # Uncomment to fine-tune last blocks:
         # _unfreeze_last_n_layers(enc.backbone, n=2)
         return enc
 
@@ -689,11 +686,11 @@ def get_encoder(
             type_act=type_act,
             use_timm_head=True,
         )
-        # 根据需要微调稳定参数
+        # Tune stability hyperparameters if needed
         enc.router_temp.data.fill_(0.7)   
         enc.post_norm.clamp_value = 5.0   
         enc.cast_to_fp32_for_moe = False
-        # 如果想轻微微调最后 stage：
+        # Optional: lightly unfreeze last stage
         # for p in enc.backbone.stages[-1].parameters(): p.requires_grad_(True)
         return enc
     else:

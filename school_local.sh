@@ -11,24 +11,24 @@ REPO_ROOT="${SCRIPT_DIR}"
 
 usage() {
   cat <<'EOF'
-用法:
-  bash school_local.sh --family FAMILY --zarr_path /path/to/data.zarr [选项]
+Usage:
+  bash school_local.sh --family FAMILY --zarr_path /path/to/data.zarr [options]
   bash school_local.sh --config train.json
   bash school_local.sh --args args.json
 
-常用选项:
-  --family FAMILY              family 名称，例如 curve_vel_b / style_a
-  --zarr_path PATH             zarr 数据路径
+Common options:
+  --family FAMILY              e.g. curve_vel_b / style_a
+  --zarr_path PATH             Zarr dataset path
   --preset NAME                default / preset1 / preset2
-  --num_gpus N                 默认 2
-  --num_workers N              默认 10
-  --status_json PATH           默认 ./dataset_status/dataset_status.json
-  --output_dir PATH            训练输出目录
-  --seed N                     默认 0
-  --conda_env NAME             可选，自动激活指定 conda 环境
-  --                           后续参数原样透传给 scripts/run_distributed_seismic_moe.sh
+  --num_gpus N                 default 2
+  --num_workers N              default 10
+  --status_json PATH           default ./dataset_status/dataset_status.json
+  --output_dir PATH            training output directory
+  --seed N                     default 0
+  --conda_env NAME             optional: activate this conda env
+  --                           remaining args forwarded to scripts/run_distributed_seismic_moe.sh
 
-示例:
+Examples:
   bash school_local.sh \
     --family curve_vel_b \
     --zarr_path /data/curve_vel_b.zarr \
@@ -75,7 +75,7 @@ while [[ $# -gt 0 ]]; do
       break
       ;;
     *)
-      echo "未知参数: $1" >&2
+      echo "Unknown argument: $1" >&2
       usage
       exit 1
       ;;
@@ -87,13 +87,13 @@ activate_conda_env "${CONDA_ENV_NAME}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 if [[ -n "${CONFIG_PATH}" && -n "${ARGS_JSON}" ]]; then
-  echo "--config 和 --args 不能同时使用。" >&2
+  echo "--config and --args cannot be used together." >&2
   exit 1
 fi
 
 if [[ -n "${CONFIG_PATH}" || -n "${ARGS_JSON}" ]]; then
   if [[ "${PRESET}" != "default" || -n "${FAMILY}" || -n "${ZARR_PATH}" || ${#EXTRA_ARGS[@]} -gt 0 ]]; then
-    echo "使用 --config/--args 时，训练参数应全部写入 JSON；不要再混用 preset/family/zarr/额外参数。" >&2
+    echo "With --config/--args, put all training settings in JSON; do not mix preset/family/zarr/extra args." >&2
     exit 1
   fi
 
@@ -105,7 +105,7 @@ if [[ -n "${CONFIG_PATH}" || -n "${ARGS_JSON}" ]]; then
   fi
 else
   if [[ -z "${FAMILY}" || -z "${ZARR_PATH}" ]]; then
-    echo "未使用 --config/--args 时，必须提供 --family 和 --zarr_path。" >&2
+    echo "Without --config/--args, both --family and --zarr_path are required." >&2
     usage
     exit 1
   fi
@@ -136,9 +136,9 @@ else
   fi
 fi
 
-echo "当前 Python: $(command -v python)"
-python -c "import torch; print('PyTorch 版本:', torch.__version__)" || true
-printf '启动命令:'
+echo "Python: $(command -v python)"
+python -c "import torch; print('PyTorch:', torch.__version__)" || true
+printf 'Launch:'
 printf ' %q' "${CMD[@]}"
 printf '\n'
 

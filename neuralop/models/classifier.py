@@ -10,7 +10,7 @@ class TimmBackboneClassifier(nn.Module):
         super().__init__()
         self.use_norm = use_zscore_norm
         if self.use_norm:
-            # 建议传入你数据集统计量 (per-channel)
+            # Prefer passing dataset statistics (per-channel)
             assert data_mean is not None and data_std is not None
             mean = torch.tensor(data_mean, dtype=torch.float32)
             std  = torch.tensor(data_std,  dtype=torch.float32)
@@ -24,10 +24,10 @@ class TimmBackboneClassifier(nn.Module):
         self.backbone = timm.create_model(
             model_name,
             pretrained=pretrained,
-            num_classes=0,      # 输出特征
+            num_classes=0,      # backbone features only (no classifier head)
             in_chans=in_chans,
             img_size=img_size,
-            global_pool="token", # 取 [CLS]（或 "avg" 取 patch 平均）
+            global_pool="token", # use [CLS] (or "avg" for mean over patches)
             # checkpoint_path="/data1/home/teacher/teacher_s/t108790/weights/vit_small_patch14_dinov2.lvd142m.safetensors"
         )
         feat_dim = self.backbone.num_features
@@ -50,7 +50,7 @@ def get_classifier(in_channels):
     model = TimmBackboneClassifier(
         model_name="vit_small_patch14_dinov2.lvd142m",
         in_chans=in_channels, num_classes=5, img_size=70,
-        pretrained=False, finetune_backbone=True,   # 若只做权重预测且不微调，可设 False
+        pretrained=False, finetune_backbone=True,   # set False if you only predict weights and do not fine-tune
         use_zscore_norm=False,
     )
     return model

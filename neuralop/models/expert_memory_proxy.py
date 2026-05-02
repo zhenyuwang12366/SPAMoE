@@ -9,10 +9,10 @@ from typing import List, Dict, Any, Optional, Tuple
 
 class ExpertMemoryProxy:
     """
-    透明代理：保证 forward_expert(expert_idx, x, **kwargs) ≡ experts[expert_idx](x, **kwargs)
-    - 不处理任何索引映射；expert_idx 直接就是 experts 列表下标
-    - 专家主权重常驻 CPU（eval + requires_grad=False）
-    - 按需上卡（可半精度），仅前向；LRU 缓存、动态显存判断与 OOM 回退
+    Transparent proxy: ensures forward_expert(expert_idx, x, **kwargs) is equivalent to experts[expert_idx](x, **kwargs).
+    - Does not remap indices; expert_idx is the experts list index directly.
+    - Expert weights stay on CPU (eval + requires_grad=False).
+    - Load to GPU on demand (optional half precision), forward only; LRU cache, dynamic VRAM checks and OOM fallback.
     """
 
     def __init__(
@@ -38,20 +38,20 @@ class ExpertMemoryProxy:
 
         self.training = True
         
-        # ======= 主迁移与释放 =======
+        # ======= Main migration and release =======
         for m in list(experts):
             m_cpu = m.to("cpu", non_blocking=True)
             m_cpu.eval()
             for p in m_cpu.parameters():
                 p.requires_grad_(False)
 
-            # 作为普通属性避免被框架当作 buffer
+            # Ordinary attribute so frameworks do not treat it as a buffer
             if not hasattr(m_cpu, "ds_grads_remaining"):
                 m_cpu.ds_grads_remaining = 0
 
             self.cpu_experts.append(m_cpu)
 
-        # 释放原 experts 的引用（如果希望尽快释放）
+        # Drop references to original experts (optional, to free sooner)
         try:
             experts.clear()
         except Exception:
@@ -68,7 +68,7 @@ class ExpertMemoryProxy:
             f"measure_on_first_use={self.measure_on_first_use}"
         )
 
-    # -------- 内部工具 --------
+    # -------- Internal helpers --------
 
     @staticmethod
     def _null_ctx():
@@ -76,8 +76,8 @@ class ExpertMemoryProxy:
 
     def _amp_ctx(self, dtype: Optional[torch.dtype]):
         """
-        AMP 上下文：仅在 dtype 不为 None 时启用 autocast。
-        device_type 与实际 device 匹配（cuda/cpu）。
+        AMP context: enable autocast only when dtype is not None.
+        device_type matches the actual device (cuda/cpu).
         """
         if dtype is not None:
             return torch.amp.autocast(device_type=self.device.type, dtype=dtype)
@@ -85,9 +85,9 @@ class ExpertMemoryProxy:
 
     def _fw_ctx(self):
         """
-        前向上下文选择：
-        - 训练态（self.training=True 且全局 grad_enabled=True）：允许梯度（nullcontext）
-        - 评估态：使用 inference_mode 提速，避免构图
+        Forward context:
+        - Training (self.training=True and global grad enabled): allow gradients (nullcontext)
+        - Eval: inference_mode for speed, no graph
         """
         if getattr(self, "training", False) and torch.is_grad_enabled():
             return self._null_ctx()
@@ -97,17 +97,17 @@ class ExpertMemoryProxy:
         if self.device.type == "cuda":
             free, total = torch.cuda.mem_get_info(self.device)
             return int(free), int(total)
-        return 1 << 60, 1 << 60  # 非 CUDA：视为“无限”
+        return 1 << 60, 1 << 60  # Non-CUDA: treat as unlimited
 
     def _ensure_idx(self, idx: int) -> int:
         if not isinstance(idx, (int,)):
             try:
                 idx = int(idx)
             except Exception:
-                raise IndexError(f"[ExpertMemoryProxy] idx={idx} 不是可转 int 的索引")
+                raise IndexError(f"[ExpertMemoryProxy] idx={idx} is not convertible to int")
         n = len(self.cpu_experts)
         if not (0 <= idx < n):
-            raise IndexError(f"[ExpertMemoryProxy] idx={idx} 越界（允许 0..{n-1}，实际 experts={n}）")
+            raise IndexError(f"[ExpertMemoryProxy] idx={idx} out of range (allowed 0..{n-1}, num experts={n})")
         return idx
 
     def _clone_to_device(self, m_cpu: torch.nn.Module) -> torch.nn.Module:
@@ -120,7 +120,7 @@ class ExpertMemoryProxy:
         if not hasattr(m_gpu, "ds_grads_remaining"):
             m_gpu.ds_grads_remaining = 0
 
-        # 仅将浮点参数/缓冲转为 amp_dtype（如 fp16/bf16）
+        # Cast floating point params/buffers to amp_dtype (e.g. fp16/bf16)
         if self.amp_dtype is not None and self.convert_param_dtype_on_gpu:
             for p in m_gpu.parameters():
                 if p.is_floating_point():
@@ -184,15 +184,15 @@ class ExpertMemoryProxy:
 
     def _admit(self, idx: int) -> Tuple[torch.nn.Module, bool]:
         """
-        返回 (model_on_gpu, is_cached)
-        - 命中缓存：直接复用
-        - 未命中：判断显存→(缓存 or 临时) 上卡
+        Returns (model_on_gpu, is_cached)
+        - Cache hit: reuse
+        - Miss: check VRAM -> load to cache or temporary GPU
         """
         idx = self._ensure_idx(idx)
 
         if idx in self.gpu_cache:
             m = self.gpu_cache.pop(idx)
-            self.gpu_cache[idx] = m  # LRU 触发“最近使用”
+            self.gpu_cache[idx] = m  # LRU: mark most recently used
             return m, True
 
         est = self._get_est_mem(idx)
@@ -208,16 +208,16 @@ class ExpertMemoryProxy:
                     torch.cuda.empty_cache()
             return m_gpu, True
         else:
-            return m_gpu, False  # 临时加载，用完释放
+            return m_gpu, False  # Temporary load, release after use
 
-    # -------- 对外 API：功能等价调用（训练态允许梯度，评估态 inference） --------
+    # -------- Public API: semantics-preserving forward (training allows grad; eval uses inference) --------
 
     def forward_expert(self, expert_idx: int, x: torch.Tensor, **kwargs) -> torch.Tensor:
         """
-        保证功能等价：experts[expert_idx](x, **kwargs)
-        仅做显存调度，不改索引绑定、不改前向语义
-        - 训练：允许梯度（保持 autograd）
-        - 评估：inference_mode 提速
+        Semantics match experts[expert_idx](x, **kwargs).
+        Only VRAM scheduling; same index binding and forward meaning.
+        - Training: gradients allowed (autograd)
+        - Eval: inference_mode for speed
         """
         expert_idx = self._ensure_idx(expert_idx)
         x = x.to(self.device, non_blocking=True if self.device.type == "cuda" else False)
@@ -227,7 +227,7 @@ class ExpertMemoryProxy:
                 y = m_gpu(x, **kwargs)
         except RuntimeError as e:
             if "CUDA out of memory" in str(e) and self.device.type == "cuda":
-                # OOM 回退：清缓存 + 临时上卡再试一次
+                # OOM fallback: clear cache + temporary GPU load and retry
                 self.clear_gpu_cache()
                 torch.cuda.empty_cache()
                 m_tmp = self._clone_to_device(self.cpu_experts[expert_idx])
@@ -252,41 +252,41 @@ class ExpertMemoryProxy:
         fw_kwargs: Optional[Dict[int, Dict[str, Any]]] = None,
     ) -> Dict[int, torch.Tensor]:
         """
-        批量前向：{expert_idx -> x_sub} → {expert_idx -> y_sub}
-        - 索引即身份，直接使用传入的 expert_idx
-        - fw_kwargs 可为 None 或 {idx: {...}}，逐专家透传
-        - 训练：允许梯度；评估：inference_mode
+        Batched forward: {expert_idx -> x_sub} -> {expert_idx -> y_sub}
+        - Indices are identities; use passed expert_idx as-is
+        - fw_kwargs may be None or {idx: {...}} per expert
+        - Training: gradients allowed; eval: inference_mode
         """
         outs: Dict[int, torch.Tensor] = {}
         kw = fw_kwargs or {}
 
         n = len(self.cpu_experts)
         if n == 0 and (routed or kw):
-            raise IndexError("[ExpertMemoryProxy] 当前没有任何专家，但收到了 routed/fw_kwargs 调用")
+            raise IndexError("[ExpertMemoryProxy] no experts registered but routed/fw_kwargs was called")
 
         bad_keys = [k for k in routed.keys() if not (isinstance(k, int) and 0 <= int(k) < n)]
         if bad_keys:
-            raise IndexError(f"[ExpertMemoryProxy] routed keys 非法: {sorted(bad_keys)}，允许 0..{n-1}")
+            raise IndexError(f"[ExpertMemoryProxy] invalid routed keys: {sorted(bad_keys)}; allowed 0..{n-1}")
         if kw:
             bad_kw = [k for k in kw.keys() if not (isinstance(k, int) and 0 <= int(k) < n)]
             if bad_kw:
-                raise IndexError(f"[ExpertMemoryProxy] fw_kwargs keys 非法: {sorted(bad_kw)}，允许 0..{n-1}")
+                raise IndexError(f"[ExpertMemoryProxy] invalid fw_kwargs keys: {sorted(bad_kw)}; allowed 0..{n-1}")
 
-        # 先跑缓存命中的
+        # Run cache hits first
         pending: List[int] = []
         for idx, x in routed.items():
             idx = self._ensure_idx(idx)
             if idx in self.gpu_cache:
                 m = self.gpu_cache.pop(idx)
-                self.gpu_cache[idx] = m  # LRU: 最近使用
+                self.gpu_cache[idx] = m  # LRU: most recent
                 x_dev = x.to(self.device, non_blocking=True if self.device.type == "cuda" else False)
                 try:
                     with self._fw_ctx(), self._amp_ctx(self.amp_dtype):
                         outs[idx] = m(x_dev, **kw.get(idx, {}))
                 except IndexError as e:
                     raise IndexError(
-                        f"[ExpertMemoryProxy] expert idx={idx} 的前向内部触发 IndexError；"
-                        f"x.shape={tuple(x_dev.shape)}，experts={n}"
+                        f"[ExpertMemoryProxy] expert idx={idx} forward raised IndexError; "
+                        f"x.shape={tuple(x_dev.shape)}, num experts={n}"
                     ) from e
             else:
                 pending.append(idx)
@@ -294,7 +294,7 @@ class ExpertMemoryProxy:
         if not pending:
             return outs
 
-        # 统计待加载专家的显存需求
+        # VRAM needs for experts still to load
         need = [(i, self._get_est_mem(i)) for i in pending]
         i, total = 0, len(need)
 
@@ -306,9 +306,9 @@ class ExpertMemoryProxy:
                 free, _ = self._mem_info()
                 budget = int(free / self.safety_ratio)
                 if budget <= 0:
-                    budget = need[i][1]  # 至少保证单个
+                    budget = need[i][1]  # At least one expert
 
-            # 贪心装一批
+            # Greedy batch packing
             batch_ids: List[int] = []
             used = 0
             j = i
@@ -322,13 +322,13 @@ class ExpertMemoryProxy:
 
             loaded: List[Tuple[int, torch.nn.Module, bool]] = []
             try:
-                # 上卡
+                # Move to GPU
                 for idx in batch_ids:
                     idx = self._ensure_idx(idx)
                     m_gpu, cached = self._admit(idx)
                     loaded.append((idx, m_gpu, cached))
 
-                # 前向
+                # Forward
                 for idx, m_gpu, cached in loaded:
                     x = routed[idx].to(self.device, non_blocking=True if self.device.type == "cuda" else False)
                     try:
@@ -350,11 +350,11 @@ class ExpertMemoryProxy:
                             raise
                     except IndexError as e:
                         raise IndexError(
-                            f"[ExpertMemoryProxy] expert idx={idx} 的前向内部触发 IndexError；"
-                            f"x.shape={tuple(x.shape)}，experts={n}"
+                            f"[ExpertMemoryProxy] expert idx={idx} forward raised IndexError; "
+                            f"x.shape={tuple(x.shape)}, num experts={n}"
                         ) from e
             finally:
-                # 释放临时上卡
+                # Release temporary GPU loads
                 for idx, m_gpu, cached in loaded:
                     if not cached:
                         del m_gpu
@@ -365,7 +365,7 @@ class ExpertMemoryProxy:
 
         return outs
 
-    # -------- 维护 --------
+    # -------- Maintenance --------
     def clear_gpu_cache(self):
         for _, m in self.gpu_cache.items():
             del m
@@ -380,5 +380,5 @@ class ExpertMemoryProxy:
         return len(self.cpu_experts)
 
     def estimated_bytes(self, idx: int) -> int:
-        """返回该专家上卡显存估计（字节），若未测量会触发一次测量/估计。"""
+        """Estimated GPU bytes for this expert; may trigger one measurement/estimate if unknown."""
         return self._get_est_mem(idx)

@@ -3,7 +3,7 @@
 """
 Simple experiment runner for encoder + AFreqMoE EMO.
 
-覆盖当前可转成 BCHW 的 PDE/Mesh 任务与 Seismic 波形反演：
+Covers PDE / mesh tasks that map to BCHW tensors plus seismic waveform inversion:
   - Regular grid: navier2d, darcy2d
   - Structured mesh: pipe, airfoil, plasticity
   - Seismic: curve_vel_a / flat_fault_a / all
@@ -23,8 +23,8 @@ import json
 import sys
 import subprocess
 import re
-import time       # ===== 修改 1：用于轮询监控 TRAIN_DONE =====
-import signal     # ===== 修改 2：用于结束整个进程组，避免 Slurm 下卡住 =====
+import time       # polling for TRAIN_DONE markers
+import signal     # terminate whole process groups on Slurm / multi-worker hangs
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -55,7 +55,7 @@ class Experiment:
     lr: float = 1e-4
     weight_decay: float = 0.0
     aux_loss_weight: float = 0.1
-    section: str = "misc"          # 实验大类标签（e1/e3/abl 等）
+    section: str = "misc"          # experiment bucket (e1/e3/abl, etc.)
     seed: int | None = None
     notes: str = ""
     use_amp: bool = True
@@ -103,7 +103,7 @@ class Experiment:
                 script = SEISMIC_TRAIN_SCRIPT
                 cmd = [
                     sys.executable,
-                    "-u",  # ===== 修改 3：Python 无缓冲输出 =====
+                    "-u",  # unbuffered Python stdout/stderr
                     str(script),
                     "--mode", "train",
                     "--family", self.family,
@@ -121,7 +121,7 @@ class Experiment:
                 ]
 
             if seismic_zarr is not None:
-                # ===== 修改 4：改为 Path 风格拼接，避免 Path 和 os.path.join 混用 =====
+                # join Zarr path with pathlib (avoid str/path mixing)
                 zarr_path = seismic_zarr / f"{self.family}.zarr"
                 cmd.extend(["--zarr_path", str(zarr_path)])
             else:
@@ -163,7 +163,7 @@ class Experiment:
             script = PDE_TRAIN_SCRIPT
             cmd = [
                 sys.executable,
-                "-u",  # ===== 修改 5：Python 无缓冲输出 =====
+                "-u",  # unbuffered Python stdout/stderr
                 str(script),
                 "--task", self.task,
                 "--data_root", str(pde_data_root),
@@ -269,7 +269,7 @@ def build_freq_specialization_suite(
                     top_k=1,
                     moe_method="basic",
                     router_type="basic",
-                    notes="单专家 FNO，偏低频",
+                    notes="Single FNO expert (low-frequency bias)",
                     extra=["--choose_experts", "0", "--top_k", "1", "--enable_freq_metrics"],
                 )
             )
@@ -282,7 +282,7 @@ def build_freq_specialization_suite(
                     top_k=1,
                     moe_method="basic",
                     router_type="basic",
-                    notes="单专家 MNO，偏中频",
+                    notes="Single MNO expert (mid-frequency bias)",
                     extra=["--choose_experts", "1", "--top_k", "1", "--enable_freq_metrics"],
                 )
             )
@@ -295,7 +295,7 @@ def build_freq_specialization_suite(
                     top_k=1,
                     moe_method="basic",
                     router_type="basic",
-                    notes="单专家 LNO，偏高频",
+                    notes="Single LNO expert (high-frequency bias)",
                     extra=["--choose_experts", "2", "--top_k", "1", "--enable_freq_metrics"],
                 )
             )
@@ -308,7 +308,7 @@ def build_freq_specialization_suite(
                     top_k=2,
                     moe_method="afmoe",
                     router_type="sar",
-                    notes="FNO+MNO+LNO 互补",
+                    notes="FNO+MNO+LNO complementary mix",
                     extra=[
                         "--choose_experts", "0", "1", "2",
                         "--top_k", "2",
@@ -511,7 +511,7 @@ def parse_args():
     parser.add_argument("--num-gpus", type=int, default=1)
     parser.add_argument("--infer-one", type=int, default=None)
 
-    # ===== 修改 6：新增手动指定 pt 文件路径 =====
+    # Optional explicit checkpoint for inference sweeps
     parser.add_argument(
         "--model-path",
         type=Path,
@@ -609,17 +609,16 @@ def find_deepest_last_checkpoint(exp_dir: Path) -> Path | None:
     return max(candidates, key=_depth_key)
 
 
-# ===== 修改 7：新增 TRAIN_DONE 检索函数，替代 loss_curve.png 作为完成标志 =====
 def find_train_done(exp_dir: Path) -> Path | None:
     """
-    在 exp_dir 下递归查找 TRAIN_DONE。
+    Recursively locate TRAIN_DONE under exp_dir.
 
-    目录形态示例：
+    Typical layout:
       exp_dir=/.../exp/runs/freq_mno_curve_fault_a_s0
       result_dir=/.../freq_mno_curve_fault_a_s0/scale_1/seismic_moe_curve_fault_a/MOE_router-basic_lr..._20260325-080804
-      TRAIN_DONE 位于 result_dir 中
+      TRAIN_DONE lives inside result_dir.
 
-    一个 exp_dir 下可能存在多个 result_dir，因此这里取“更深且更新”的那个。
+    Multiple nested runs may exist; pick the deepest / newest candidate.
     """
     candidates = list(exp_dir.rglob("TRAIN_DONE"))
     if not candidates:
@@ -629,9 +628,9 @@ def find_train_done(exp_dir: Path) -> Path | None:
         rel_parts = path.relative_to(exp_dir).parts
         ts = _parse_timestamp_from_dir(path.parent)
         return (
-            len(rel_parts),                         # 优先更深层
-            ts if ts is not None else -1.0,        # 再优先时间戳目录
-            path.stat().st_mtime,                  # 最后按文件修改时间
+            len(rel_parts),                         # prefer deeper trees
+            ts if ts is not None else -1.0,        # then timestamped folders
+            path.stat().st_mtime,                  # finally mtime tie-break
         )
 
     return max(candidates, key=_rank_key)
@@ -715,7 +714,6 @@ def detect_resume_candidate(exp: Experiment, exp_dir: Path) -> ResumeCandidate |
     )
 
 
-# ===== 修改 8：将 run_command 改为“运行中轮询监控 TRAIN_DONE”的版本 =====
 def run_command(
     cmd: Sequence[str],
     log_file: Path,
@@ -728,17 +726,15 @@ def run_command(
     kill_wait_timeout: float = 15.0,
 ) -> int:
     """
-    运行子进程。
+    Run a subprocess while optionally watching for TRAIN_DONE.
 
-    若 watch_train_done=True，则递归监控 watch_dir 下是否出现 TRAIN_DONE：
-      1. 一旦出现 TRAIN_DONE，先等待 graceful_wait_after_done 秒，给训练脚本自然退出机会
-      2. 若仍未退出，则对整个进程组发送 SIGTERM
-      3. 若仍未退出，再发送 SIGKILL
+    When watch_train_done=True we poll watch_dir for TRAIN_DONE:
+      1. After it appears, wait up to graceful_wait_after_done seconds for a clean exit.
+      2. If the process group is still alive, send SIGTERM to the whole group.
+      3. If needed, escalate to SIGKILL.
 
-    这样可解决：
-      - 训练逻辑已完成
-      - TRAIN_DONE 已写好
-      - 但 bash/torchrun/DDP worker 仍未完全退出，导致外层卡住
+    This covers cases where training finished and TRAIN_DONE was written but torchrun /
+    bash wrappers did not exit, which would otherwise stall the outer driver loop.
     """
     mode = "a" if append else "w"
     with log_file.open(mode, encoding="utf-8") as f:
@@ -752,14 +748,14 @@ def run_command(
             stdout=f,
             stderr=subprocess.STDOUT,
             text=True,
-            start_new_session=True,   # ===== 修改 9：创建新的进程组，便于 killpg 整组结束 =====
+            start_new_session=True,   # new process group so killpg can stop all workers
         )
 
         detected_done: Path | None = None
         done_detect_time: float | None = None
 
         while True:
-            # 先看子进程是否自然退出
+            # Fast path: child exited on its own
             return_code = proc.poll()
             if return_code is not None:
                 f.flush()
@@ -769,7 +765,7 @@ def run_command(
                     pass
                 return int(return_code)
 
-            # 运行中递归监控 TRAIN_DONE
+            # Optional TRAIN_DONE polling while the job is still running
             if watch_train_done and watch_dir is not None:
                 done_file = find_train_done(watch_dir)
                 if done_file is not None:
@@ -796,7 +792,7 @@ def run_command(
                                     os.fsync(f.fileno())
                                 except OSError:
                                     pass
-                                # ===== 修改 10：有 TRAIN_DONE 时，即使是外层强制收尾，也按成功处理 =====
+                                # Treat forced shutdown after TRAIN_DONE as success
                                 return 0
                             time.sleep(1.0)
 
@@ -879,7 +875,7 @@ def main():
 
             infer_cmd = [
                 sys.executable,
-                "-u",  # ===== 修改 11：推理阶段也使用无缓冲输出 =====
+                "-u",  # unbuffered logs during inference
                 str(SEISMIC_TRAIN_SCRIPT),
                 "--mode", "inference",
                 "--setting_path", str(setting_path),
@@ -888,7 +884,7 @@ def main():
                 "--output_dir", str(infer_dir),
             ]
             if args.seis_zarr is not None:
-                # ===== 修改 12：改为 Path 风格拼接 =====
+                # pathlib join for Zarr roots
                 zarr_path = args.seis_zarr / f"{exp.family}.zarr"
                 infer_cmd.extend(["--zarr_path", str(zarr_path)])
             else:
@@ -917,7 +913,7 @@ def main():
             ensure_dir(exp_dir)
             log_file = exp_dir / "train.log"
 
-            # ===== 修改 13：启动前先检查 exp_dir 下是否已有 TRAIN_DONE，若有则直接跳过 =====
+            # Skip if a previous run already wrote TRAIN_DONE under exp_dir
             train_done = find_train_done(exp_dir)
             if train_done is not None:
                 start_time = datetime.now().isoformat(timespec="seconds")
@@ -1005,7 +1001,7 @@ def main():
             if args.dry_run:
                 return_code = 0
             else:
-                # ===== 修改 14：训练时开启对 exp_dir 下 TRAIN_DONE 的运行中监控 =====
+                # Poll exp_dir for TRAIN_DONE while training to avoid hung torchrun trees
                 return_code = run_command(
                     cmd,
                     log_file,
@@ -1019,7 +1015,7 @@ def main():
 
             end_time = datetime.now().isoformat(timespec="seconds")
 
-            # ===== 修改 15：删除训练成功后的自动推理功能 =====
+            # Post-train auto-inference intentionally disabled
             inference_code = None
 
             if return_code != 0:

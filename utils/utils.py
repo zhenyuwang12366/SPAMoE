@@ -4,7 +4,7 @@ def to_snake_lower(s: str) -> str:
     s = s.strip()
     if not s:
         return s
-    # 驼峰 -> 下划线边界
+    # CamelCase -> snake_case boundaries
     s = re.sub(r'([A-Z]+)([A-Z][a-z0-9])', r'\1_\2', s)
     s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s)
     s = re.sub(r'[^A-Za-z0-9]+', '_', s)
@@ -13,7 +13,7 @@ def to_snake_lower(s: str) -> str:
     if not parts:
         return s
     if parts[0] == 'style':
-        # 与原脚本一致：合并 style 子类型，仅区分 a/b
+        # Match legacy script: collapse style subtypes; only distinguish a/b
         suffix = parts[-1] if len(parts) >= 2 else 'a'
         if len(parts) >= 3 and parts[1] == 'style':
             return '_'.join(parts[:3])  # style_style_a/b

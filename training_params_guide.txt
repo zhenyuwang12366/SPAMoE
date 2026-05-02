@@ -1,82 +1,82 @@
-训练重要参数说明
-================
+Key training CLI parameters
+=============================
 
-基础运行相关
-------------
-- `--mode`（默认 `train`）：选择脚本运行模式，可在训练、推理、encoder 预训练之间切换。
-- `--data_dir`：数据根目录；若不指定则使用配置文件中的默认路径。
-- `--family`：数据子集/类型，支持 `vel`、`fault`、`style`、`all` 及细分类别（如 `curve_vel_a`）。
-- `--batch_size` / `--test_batch_size`：训练与验证/测试批次大小；测试不填则回落到配置里的默认值。
-- `--epochs`：总训练轮数；与调度策略和早停逻辑直接相关。
-- `--num_workers`：DataLoader 的加载线程数，需结合机器 IO 和内存调整。
-- `--seed`：随机种子，保证实验可复现。
-- `--resume_path`：恢复训练用 checkpoint，可继续之前的优化状态。
-- `--encoder_path`：单独提供 encoder 权重并在训练时冻结，便于复用已有编码器。
+Basic runtime
+-------------
+- `--mode` (default `train`): train, inference, or encoder-only pretraining.
+- `--data_dir`: dataset root; falls back to config default if omitted.
+- `--family`: subset / geology family (`vel`, `fault`, `style`, `all`, or fine-grained keys such as `curve_vel_a`).
+- `--batch_size` / `--test_batch_size`: train vs eval batch sizes; test batch falls back to config when unset.
+- `--epochs`: total epochs (interacts with schedulers and early stopping).
+- `--num_workers`: DataLoader workers; tune for IO vs CPU.
+- `--seed`: RNG seed for reproducibility.
+- `--resume_path`: checkpoint to resume optimizer + model state.
+- `--encoder_path`: load/freeze a standalone encoder checkpoint.
 
-数据与预处理
-------------
-- `--n_train_samples` / `--n_test_samples`：限制参与训练/测试的样本数，用于快速试验。
-- `--channel_dim`：指定输入 Tensor 的通道维，配合 `--concat_channels` 控制通道展开方式。
-- `--concat_channels` / `--no_concat_channels`：决定是否把多通道地震记录拼接在宽度维，需与模型输入约定匹配。
-- `--k`（来自主脚本参数集）：LogTransform 中的缩放常数，影响输入归一化范围。
+Data & preprocessing
+----------------------
+- `--n_train_samples` / `--n_test_samples`: cap dataset size for smoke tests.
+- `--channel_dim`: which tensor axis counts channels together with `--concat_channels`.
+- `--concat_channels` / `--no_concat_channels`: stack receiver traces along width vs keep separate channels (must match model input).
+- `--k`: `LogTransform` scaling constant affecting normalized dynamic range.
 
-优化器与梯度
-------------
-- `--learning_rate`：基础学习率；若启用梯度累积/多卡训练应按有效 batch 调整。
-- `--weight_decay`：AdamW 的 L2 权重衰减。
-- `--accum_steps`：梯度累积步数，使单卡小显存也能模拟大批次。
-- `--use_amp`：启用 PyTorch AMP 混合精度正向/反向计算。
-- `--mixed_precision`：推理阶段可单独控制混合精度（与 `--use_amp` 区别是作用阶段）。
-- `--use_onecycle` / `--disable_onecycle`：是否启用 OneCycle 学习率策略（覆盖其它调度器）。
+Optimizer & gradients
+---------------------
+- `--learning_rate`: base LR; scale when using grad accumulation or multi-GPU effective batch.
+- `--weight_decay`: AdamW L2-style decay.
+- `--accum_steps`: gradient accumulation to emulate large batches on limited VRAM.
+- `--use_amp`: PyTorch autocast for forward/backward.
+- `--mixed_precision`: optional separate toggle for inference mixed precision.
+- `--use_onecycle` / `--disable_onecycle`: OneCycle LR policy vs other schedulers.
 
-学习率调度
-----------
-- `--lr_warmup_epochs`、`--lr_warmup_factor`、`--lr_warmup_method`：Warmup 设置，决定前若干 epoch 的学习率爬升方式。
-- `--lr_scheduler_type`：选择 `cos_restart`、`cos` 或 `multistep` 调度；不同类型需要搭配下列参数。
-- `--milestones`、`--scheduler_gamma`：MultiStepLR 所需的里程碑与衰减系数。
-- `--lr_cosine_tmax_epochs`、`--lr_cosine_eta_min`：Cosine 调度参数，前者控制周期长度，后者设定最小学习率。
-- `--lr_cosine_restart_t0_epochs`、`--lr_cosine_restart_t_mult`：余弦重启调度的首个周期与倍增系数。
+LR schedule
+-----------
+- `--lr_warmup_epochs`, `--lr_warmup_factor`, `--lr_warmup_method`: warmup schedule.
+- `--lr_scheduler_type`: `cos_restart`, `cos`, or `multistep`.
+- `--milestones`, `--scheduler_gamma`: MultiStepLR knobs.
+- `--lr_cosine_tmax_epochs`, `--lr_cosine_eta_min`: cosine annealing period / floor LR.
+- `--lr_cosine_restart_t0_epochs`, `--lr_cosine_restart_t_mult`: cosine-restart parameters.
 
-早停与监控
-----------
-- `--early_stop`：开启早停功能。
-- `--early_stop_patience`、`--early_stop_min_delta`、`--early_stop_warmup_epochs`：控制早停的容忍次数、最小改进幅度及预热周期。
-- `--eval_interval`：验证间隔，适合耗时较大时降低评估频率。
-- `--profile_timing`：输出训练耗时统计，定位慢点。
+Early stopping & monitoring
+----------------------------
+- `--early_stop`: enable early stopping.
+- `--early_stop_patience`, `--early_stop_min_delta`, `--early_stop_warmup_epochs`: patience, minimum gain, warmup before monitoring.
+- `--eval_interval`: validation frequency (epochs).
+- `--profile_timing`: print timing breakdown for hotspots.
 
-MoE 结构控制
-------------
-- `--use_moe`：是否直接加载预训练专家并冻结，只训练路由器。
-- `--use_experts_path`：专家权重目录，`--use_moe` 生效时必填。
-- `--choose_experts`：选择参与混合的专家索引（对应配置中的 FNO/WNO/MNO/LNO/GeoFNO 等）。
-- `--top_k`：MoE 路由器激活的专家数；需结合显存和负载均衡调参。
-- `--use_encoder` / `--disable_encoder`：控制是否启用 encoder。禁用后原始输入将直接送入 MoE（需确保通道数与专家匹配）。
-- `--moe_mode`：`standard` 代表常规路由融合，`velocity_type` 按速度类型权重合成。
-- `--router_type` / `--router_hidden_dim`：路由器结构，`adamv` 需配合额外的验证回调。
-- `--fusion_type`、`--s_processor_type`、`--w_processor_type`：控制专家间与强/弱组内的融合策略（线性、attention、mean、sum等）。
-- `--enable_noisy_gating` / `--disable_noisy_gating`：是否在路由概率中注入噪声以缓解负载不均。
-- `--beta`：强弱激活平衡系数，越大弱专家权重越高。
-- `--is_specific`：启用细分类型（如 curve/flat/style 子类），会影响数据过滤与专家选择。
-- `--is_classier`：切换到分组专家网络结构。
-- `--v_type_num`：速度类型数量，决定路由头输出维度。
-- `--use_gpu_proxy`：启用专家显存代理，缓解专家数量多时的显存压力。
+MoE structure
+--------------
+- `--use_moe`: load frozen experts and train router only.
+- `--use_experts_path`: directory with per-expert `.pt` weights (required when `--use_moe`).
+- `--choose_experts`: expert indices (FNO/WNO/MNO/LNO mapping follows `parser_utils`).
+- `--top_k`: number of experts activated per forward pass.
+- `--use_encoder` / `--disable_encoder`: toggle encoder; when disabled raw inputs feed MoE (channel counts must match).
+- `--moe_mode`: `standard` vs `velocity_type` fusion semantics.
+- `--router_type`, `--router_hidden_dim`: router architecture (`adamv` needs matching callbacks).
+- `--fusion_type`, `--s_processor_type`, `--w_processor_type`: fusion inside MoE (linear, attention, mean, sum, ...).
+- `--enable_noisy_gating` / `--disable_noisy_gating`: noisy logits for load balancing.
+- `--beta`: strong vs weak expert mixing coefficient.
+- `--is_specific`: enable fine-grained naming / filtering (curve/flat/style splits).
+- `--is_classifier`: enable grouped-expert (GMoE-style) classifier routing.
+- `--v_type_num`: number of velocity-type logits for the router head.
+- `--use_gpu_proxy`: memory proxy for large expert pools.
 
-专家体系参数
-------------
-- `--hidden_channels`：MoE 主干隐藏通道数。
-- `--FNO_*`、`--WNO_*`、`--MNO_*`、`--LNO_*` 系列：分别控制 Fourier/Wavelet/Multiscale/Local 专家的结构（模态数量、层数、尺度等）。
-- `--GeoFNO_*` 系列：几何专家的频域模态、层数、网格尺寸、宽度等参数。
-- `--wavelet_type`、`--dtcwt_type`、`--WNO_pad_mode` 等：针对波域专家的具体实现细节。
-- `--MNO_scale_factors`：多尺度专家采样比例，需保持从大到小的列表形式。
+Expert hyperparameters
+----------------------
+- `--hidden_channels`: trunk width shared by experts.
+- `--FNO_*`, `--WNO_*`, `--MNO_*`, `--LNO_*`: per-expert structural knobs (modes, layers, wavelets, ...).
+- `--GeoFNO_*`: geometric FNO settings when enabled.
+- `--wavelet_type`, `--dtcwt_type`, `--WNO_pad_mode`, ...: wavelet expert details.
+- `--MNO_scale_factors`: descending list of relative resolutions for multiscale experts.
 
-实验便利功能
-------------
-- `--use_wandb`：启用 Weights & Biases 记录。
-- `--vis_freq`：可视化间隔（epoch），用于保存预测结果及频域分析。
-- `--report_every`（在主脚本中解析）：控制训练过程中面向外部调度器的指标打印频率。
+Experiment utilities
+----------------------
+- `--use_wandb`: log metrics/plots to Weights & Biases.
+- `--vis_freq`: how often to dump qualitative predictions / spectra.
+- `--report_every`: stdout cadence for external schedulers (parsed in training script).
 
-实用建议
---------
-1. 先确定 `--family`、`--choose_experts`、`--top_k`、`--use_encoder` 及 `--use_moe` 等结构性参数，再微调学习率与调度。
-2. 当显存不足时优先调整 `--batch_size`、`--accum_steps`、`--top_k` 以及专家数量；必要时启用 `--use_gpu_proxy`。
-3. 如需复现实验，应固定 `--seed`，保存 `--encoder_path` 与 `--resume_path`，并在日志中记录所有 CLI 参数。
+Practical tips
+--------------
+1. Lock structural knobs first (`--family`, `--choose_experts`, `--top_k`, `--use_encoder`, `--use_moe`), then tune LR/schedule.
+2. When OOM: shrink `--batch_size`, increase `--accum_steps`, reduce `--top_k`, or enable `--use_gpu_proxy`.
+3. For reproducible papers: fix `--seed`, archive `--encoder_path` / `--resume_path`, and log the full CLI in experiment notes.
