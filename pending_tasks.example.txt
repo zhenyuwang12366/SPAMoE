@@ -1,0 +1,5 @@
+# 每行一条命令。建议显式绑定 GPU，避免抢卡。
+# 下面只是示例，请替换成你真正的后两个任务。
+
+CUDA_VISIBLE_DEVICES=0,1 nohup bash school_local.sh --family curve_fault_b --zarr_path ../curve_fault_b.zarr --preset preset2 > ../logs/curve_fault_b_2.log 2>&1 &
+CUDA_VISIBLE_DEVICES=2,3 nohup bash school_local.sh --family flat_fault_b --zarr_path ../flat_fault_b.zarr --preset preset2 > ../logs/flat_fault_b_2.log 2>&1 &
