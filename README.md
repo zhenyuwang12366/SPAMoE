@@ -1,4 +1,4 @@
-# FWINO: Full-Waveform Inversion (FWI) and Mixture-of-Experts Neural Operators
+# SPAMoE: Spectrum-Aware Hybrid Operator Framework for Full-Waveform Inversion
 
 This project builds on [NeuralOperator](https://github.com/neuraloperator/neuraloperator) for **velocity model reconstruction** with neural operators on seismic datasets such as **OpenFWI**, and supports training and inference with **AFreqMoE (adaptive frequency-domain mixture of experts)**, DINOv3 **ViT / ConvNeXt** encoders, and related components.
 
